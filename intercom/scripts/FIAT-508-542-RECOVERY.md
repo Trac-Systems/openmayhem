@@ -82,3 +82,28 @@ watermark for a recovery sweep. The signed fence also holds any outstanding 508
 fee preparation, retention attempt and accounting operation, including a fee
 attempt finalized before fencing. The repair leaves 508 open, and the CLI
 holds the overlapping batch before entering the Stripe sender.
+
+## Contract upgrade prerequisites for existing proxy deployments
+
+1. Drain new publications on the current writer and use its normal recovery to
+   resolve queued operations. After stopping its owner, preserve the journal
+   with the rest of the store. Contract 31 can reopen an empty v30 journal for
+   the same writer key, fork, administrator, network and bootstrap keys. A
+   journal with pending entries must finish recovery with its original owner.
+2. At the cutover, read the confirmed registry configuration and policy head at
+   one signed length. For an existing v30 registry, submit one ordinary
+   admin `proxy_policy` action of kind `configure` in the v31 context, with the
+   current head revision plus one. Copy the entire saved configuration and
+   change only `contract_version` to 31. Verify the updated head, registry
+   configuration and catalog network projection from confirmed state. On a
+   lost acknowledgement, retry the identical operation after reading the head.
+3. Align the gateway, provider control, buyer and admission worker network
+   configurations. For the website, align `PROXY_ADMISSION_AUTH_CONTRACT_VERSION`,
+   the network in `PROXY_ADMISSION_ENROLLMENT_CONFIG` and
+   `PROXY_FAMILY_ADMIN_CONTRACT_VERSION`. Verify the versioned store upgrade,
+   replay protection and fresh route evidence before reopening admission.
+   Recheck pending invoices, refunds and permits against their original payment
+   evidence. Existing providers keep their entitlement, market ID and price.
+4. Verify a fresh quote and reservation with v31 terms and reconciliation of a
+   previously accepted v30 request with its original signed terms. Preserve
+   all three payment rails, prior receipt commitments and account watermarks.

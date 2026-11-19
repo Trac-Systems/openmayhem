@@ -218,6 +218,46 @@ test('journal rejects wrong identity, another live writer, mutation and invalid 
   assert.equal(fs.readFileSync(path.join(f.directory, 'pending.json'), 'utf8'), '{broken');
 });
 
+test('contract 31 reopens a drained contract 30 publication journal for the identical writer', async t => {
+  const f = await fixture(t);
+  const directory = path.join(f.root, 'upgrade-journal');
+  const disk = path.join(directory, 'pending.json');
+  const current = { ...f.transport.identity(), contract_version: 31 };
+  const prior = { ...current, contract_version: 30 };
+  const open = identity => ProxyPublicationJournal.open({ directory, identity });
+  const initial = await open(prior);
+  const envelope = await f.create();
+  const key = await proxyRegistryFeatureKey(envelope);
+  const entry = await f.transport.prepare(key, envelope);
+  await initial.put(entry);
+  await initial.close();
+  const pending = fs.readFileSync(disk);
+  await assert.rejects(open(current), /identity/);
+  assert.deepEqual(fs.readFileSync(disk), pending);
+  const draining = await open(prior);
+  assert.deepEqual(draining.get(key), entry);
+  await draining.remove(key);
+  await draining.close();
+  const empty = fs.readFileSync(disk);
+  for (const changed of [
+    { ...current, subnet_bootstrap: 'ab'.repeat(32) },
+    { ...current, writer_fork: current.writer_fork + 1 },
+    { ...current, admin: 'cd'.repeat(32) },
+    { ...current, contract_version: 32 },
+  ]) {
+    await assert.rejects(open(changed), /identity/);
+    assert.deepEqual(fs.readFileSync(disk), empty);
+  }
+  const upgraded = await open(current);
+  assert.deepEqual(upgraded.list(), []);
+  await upgraded.close();
+  assert.deepEqual(JSON.parse(fs.readFileSync(disk)).identity, current);
+  await assert.rejects(open(prior), /identity/);
+  const restarted = await open(current);
+  assert.deepEqual(restarted.list(), []);
+  await restarted.close();
+});
+
 test('unflushed source work cannot be interpreted as permission to append again', async t => {
   const f = await fixture(t);
   const envelope = await f.create(); const key = await proxyRegistryFeatureKey(envelope);

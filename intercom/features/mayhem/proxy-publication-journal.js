@@ -89,6 +89,7 @@ export class ProxyPublicationJournal {
     this.lock = await fs.promises.open(path.join(this.directory, 'publication.lock'), 'a+', 0o600);
     if (!nativeFs.tryLock(this.lock.fd)) fail('another process holds the writer lock');
     let file;
+    let upgradeDrainedJournal = false;
     try { file = await fs.promises.open(this.file, 'r'); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (file) {
@@ -104,8 +105,19 @@ export class ProxyPublicationJournal {
           offset += bytesRead;
         }
         const state = JSON.parse(b4a.toString(bytes));
-        if (state.schema_version !== 1 || stable(state.identity) !== stable(this.identity) ||
-            !Array.isArray(state.entries) || state.entries.length > this.maxEntries) fail('identity/schema mismatch');
+        if (state.schema_version !== 1 || !Array.isArray(state.entries) ||
+            state.entries.length > this.maxEntries) fail('identity/schema mismatch');
+        if (stable(state.identity) !== stable(this.identity)) {
+          // Contract 31 changes FIAT recovery. An empty v30 queue has no
+          // outstanding nonce or receipt to replay. Keep every writer and
+          // network identity field bound while upgrading its local file.
+          if (state.entries.length !== 0 || this.identity.contract_version !== 31 ||
+              !hex(this.identity.writer_key) || !hex(this.identity.admin) ||
+              stable(state.identity) !== stable({ ...this.identity, contract_version: 30 })) {
+            fail('identity/schema mismatch');
+          }
+          upgradeDrainedJournal = true;
+        }
         const scopes = new Set();
         for (const entry of state.entries) {
           validateProxyPendingEntry(entry);
@@ -114,9 +126,8 @@ export class ProxyPublicationJournal {
           this.entries.set(entry.key, clone(entry)); scopes.add(entry.scope);
         }
       } finally { await file.close(); }
-    } else {
-      await this._save(this.entries);
     }
+    if (!file || upgradeDrainedJournal) await this._save(this.entries);
     // A crash before rename cannot have dispatched the not-yet-durable intent.
     // The old pending.json remains authoritative; do not replay a temporary file.
     await fs.promises.unlink(`${this.file}.tmp`).catch(error => { if (error.code !== 'ENOENT') throw error; });

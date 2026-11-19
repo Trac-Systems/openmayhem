@@ -7,7 +7,7 @@ import { ProxyPublicationJournal } from '../features/mayhem/proxy-publication-jo
 
 const check = (condition, message) => { if (!condition) throw new Error(message); };
 const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'mayhem-proxy-journal-bare-'));
-const identity = { admin: 'ab'.repeat(32), subnet: 'ac'.repeat(32) };
+const identity = { admin: 'ab'.repeat(32), subnet_bootstrap: 'ac'.repeat(32), writer_key: 'ad'.repeat(32), contract_version: 30 };
 let journal;
 try {
   journal = await ProxyPublicationJournal.open({ directory, identity });
@@ -28,7 +28,13 @@ try {
   await journal.close();
   journal = await ProxyPublicationJournal.open({ directory, identity });
   check(journal.list().length === 0, 'completed entry reappeared');
-  console.log('Bare publication journal: write, fsync, rename, lock, reopen and deletion passed.');
+  await journal.close();
+  const next = { ...identity, contract_version: 31 };
+  journal = await ProxyPublicationJournal.open({ directory, identity: next });
+  check(journal.list().length === 0, 'completed entry reappeared after upgrade');
+  const upgraded = JSON.parse(await fs.promises.readFile(path.join(directory, 'pending.json'), 'utf8'));
+  check(upgraded.identity.contract_version === 31, 'drained journal upgrade was not persisted');
+  console.log('Bare publication journal: write, fsync, rename, lock, reopen, deletion and drained upgrade passed.');
 } finally {
   await journal?.close();
   await fs.promises.rm(directory, { recursive: true, force: true });
