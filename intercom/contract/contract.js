@@ -5954,15 +5954,16 @@ class MayhemContract extends Contract {
   }
 
   normalizeTargetedPayoutCarry(value, rail) {
-    if (rail === 'fiat' && value?.reason === 'awaiting_processor_terms') {
+    if ((rail === 'fiat' && value?.reason === 'awaiting_processor_terms') ||
+        (value?.role === 'provider' && value.reason === 'awaiting_payout_binding')) {
       const provider = value.role === 'provider';
       const fields = ['role', 'reason', 'liability_au', ...(provider ? ['provider','payout_revision'] : [])];
-      const error = this.validateExactObjectKeys(value, fields, 'deferred fiat payout terms');
+      const error = this.validateExactObjectKeys(value, fields, 'deferred payout');
       if (error) return error;
       if ((!provider && value.role !== 'operator_fee') ||
-          this.normalizeAu(value.liability_au, 'Deferred fiat liability', { allowZero: false }) !== value.liability_au ||
+          this.normalizeAu(value.liability_au, 'Deferred payout liability', { allowZero: false }) !== value.liability_au ||
           (provider && ![value.provider,value.payout_revision].every(v => this.isHexBytes(v,32) && v === v.toLowerCase()))) {
-        return new Error('Invalid deferred fiat liability.');
+        return new Error('Invalid deferred payout liability.');
       }
       return { ...value };
     }
@@ -6237,15 +6238,14 @@ class MayhemContract extends Contract {
           entry.payout_revision
         )
       );
-      if (!binding ||
-          binding.verified !== true ||
+      if (binding != null && (binding.verified !== true ||
           binding.provider !== entry.provider ||
           binding.rail !== value.rail ||
           binding.revision !== entry.payout_revision ||
           binding.activation_epoch > value.epoch ||
           binding.target !== liability.target ||
           (binding.currency ?? null) !== (liability.currency ?? null) ||
-          (binding.chain_id ?? null) !== (liability.chain_id ?? null)) {
+          (binding.chain_id ?? null) !== (liability.chain_id ?? null))) {
         return new Error('Targeted payout indexed liability binding mismatch.');
       }
       const probeGate = await this.probeGateForEarning(
@@ -6314,6 +6314,13 @@ class MayhemContract extends Contract {
         continue;
       }
 
+      if (binding == null) {
+        if (output !== null || carry?.reason !== 'awaiting_payout_binding' || carry.liability_au !== payable) {
+          return new Error('An unbound targeted payout must retain the exact payable liability.');
+        }
+        classified.add(identity);
+        continue;
+      }
       if (output === null && carry?.reason === 'awaiting_processor_terms' && carry.liability_au === payable) {
         classified.add(identity);
         continue;

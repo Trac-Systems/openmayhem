@@ -53642,7 +53642,12 @@ async fn build_tnk_settlement_plan(
             continue;
         }
         match targeted_payout_liability_binding(rpc, &liability, epoch, signed_length).await {
-            Ok(binding) => {
+            Ok(None) => carry.push(json!({
+                "role": "provider", "reason": "awaiting_payout_binding",
+                "provider": liability.provider, "payout_revision": liability.revision,
+                "liability_au": money_au_json(payable_au),
+            })),
+            Ok(Some(binding)) => {
                 let aggregate_paid_cum_au_before = if let Some(cursor) =
                     aggregate_paid_cursors.get(&liability.provider)
                 {
@@ -54585,7 +54590,7 @@ async fn targeted_payout_liability_binding(
     liability: &LedgerPayoutLiability,
     epoch: u64,
     signed_length: u64,
-) -> Result<Value> {
+) -> Result<Option<Value>> {
     ensure!(
         matches!(liability.rail.as_str(), "tap" | "tnk" | "fiat")
             && is_hex_len(&liability.provider, 64)
@@ -54598,9 +54603,9 @@ async fn targeted_payout_liability_binding(
         "payout/binding/{}/{}/{}",
         liability.rail, liability.provider, liability.revision
     );
-    let binding = read_state_value_at(rpc, &key, signed_length)
-        .await?
-        .context("immutable payout binding is missing")?;
+    let Some(binding) = read_state_value_at(rpc, &key, signed_length).await? else {
+        return Ok(None);
+    };
     ensure!(
         binding.get("verified").and_then(Value::as_bool) == Some(true)
             && binding.get("provider").and_then(Value::as_str) == Some(liability.provider.as_str())
@@ -54615,7 +54620,7 @@ async fn targeted_payout_liability_binding(
                 .is_some_and(|activation_epoch| activation_epoch <= epoch),
         "immutable payout binding does not match targeted liability"
     );
-    Ok(binding)
+    Ok(Some(binding))
 }
 
 async fn aggregate_provider_paid_cum_au(
@@ -54771,7 +54776,12 @@ async fn build_fiat_settlement_plan(
             continue;
         }
         match targeted_payout_liability_binding(rpc, &liability, epoch, signed_length).await {
-            Ok(binding)
+            Ok(None) => carry.push(json!({
+                "role": "provider", "reason": "awaiting_payout_binding",
+                "provider": liability.provider, "payout_revision": liability.revision,
+                "liability_au": money_au_json(payable_au),
+            })),
+            Ok(Some(binding))
                 if stripe_payout_binding_currently_ready_at(
                     rpc,
                     &liability.provider,
@@ -54806,7 +54816,7 @@ async fn build_fiat_settlement_plan(
                     liability_au: payable_au,
                 })
             }
-            Ok(_) => carry.push(json!({
+            Ok(Some(_)) => carry.push(json!({
                 "role": "provider", "provider": liability.provider, "payout_revision": liability.revision,
                 "liability_au": money_au_json(payable_au), "reason": "awaiting_processor_terms",
             })),

@@ -432,6 +432,34 @@ test('TNK output progress survives a later failure and closes only when complete
   assert.equal(closed.output_count, 2);
 });
 
+test('an absent payout binding carries exactly the provider debt while a separate output settles', async () => {
+  const ctx = await setup();
+  const [provider, originalFee] = ctx.outputs;
+  const fee = { ...originalFee, output_index: 0 };
+  const carry = { role: 'provider', reason: 'awaiting_payout_binding', provider: provider.provider,
+    payout_revision: provider.payout_revision, liability_au: provider.au };
+  const key = `payout/binding/tnk/${provider.provider}/${provider.payout_revision}`;
+  const original = (await ctx.storage.get(key)).value;
+  const reject = async (outputs, carries) => {
+    const { result } = await buildPlan(ctx, outputs, carries, { expectOk: false });
+    assert.ok(result instanceof Error, 'invalid plan was accepted');
+  };
+  await reject([fee], [carry]);
+  await ctx.storage.put(key, { ...original, verified: false });
+  await reject([fee], [carry]);
+  await ctx.storage.del(key);
+  await reject(ctx.outputs, []);
+  await reject([fee], [{ ...carry, liability_au: '1' }]);
+  const plan = await buildPlan(ctx, [fee], [carry]);
+  const tx = '7'.repeat(64);
+  assert.equal((await prepareOutput(ctx, plan, fee, tx)).ok, true);
+  const settled = await settleOutput(ctx, plan, fee, tx);
+  assert.equal(settled.result.ok, true, settled.result.message);
+  assert.equal((await closeEpoch(ctx, plan)).ok, true);
+  const liabilityKey = ctx.contract.providerPayoutLiabilityKey(provider.provider, 'tnk', provider.payout_revision);
+  assert.equal((await ctx.storage.get(liabilityKey)).value.paid_cum_au, '0');
+});
+
 test('TNK preparation binds the exact signed MSB payload and rejects effect reuse', async () => {
   const ctx = await setup();
   const plan = await buildPlan(ctx, ctx.outputs);
