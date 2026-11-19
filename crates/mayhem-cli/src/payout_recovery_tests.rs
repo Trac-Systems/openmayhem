@@ -184,9 +184,9 @@ fn fiat_funding_wait_preserves_provider_watermark_order_and_original_indices() {
         json!({"provider":"B","aggregate_paid_cum_au_before":"300","paid_au":"10"}),
         json!({"role":"operator_fee"}),
     ];
-    assert_eq!(next_fiat_output_after_funding_wait(&outputs, 0).unwrap(), 2);
-    assert_eq!(next_fiat_output_after_funding_wait(&outputs, 1).unwrap(), 2);
-    assert_eq!(next_fiat_output_after_funding_wait(&outputs, 2).unwrap(), 3);
+    assert_eq!(next_independent_fiat_output(&outputs, 0).unwrap(), 2);
+    assert_eq!(next_independent_fiat_output(&outputs, 1).unwrap(), 2);
+    assert_eq!(next_independent_fiat_output(&outputs, 2).unwrap(), 3);
     assert!(check_fiat_output_aggregate(&outputs[1], 0, None).is_err());
     assert!(check_fiat_output_aggregate(&outputs[1], 27, None).is_ok());
     assert!(check_fiat_output_aggregate(&outputs[2], 300, None).is_ok());
@@ -266,7 +266,8 @@ fn fiat_transfer_recovery_blocks_ambiguous_pre_targeted_effects() {
 
 #[tokio::test]
 async fn funding_then_restart_pays_once_and_recovers_without_balance() {
-    let (output, record, transfer, payment, transaction) = attempt_fixture();
+    let (output, mut record, transfer, payment, transaction) = attempt_fixture();
+    record["preparation"]["prepared_at"] = json!(now_unix_seconds().unwrap());
     let empty = json!({"object":"list","has_more":false,"data":[]});
     let responses = vec![
         ("GET /v1/transfers?", 200, empty.clone()),
@@ -336,6 +337,40 @@ async fn funding_then_restart_pays_once_and_recovers_without_balance() {
         "idempotency-key: {}",
         targeted_fiat_attempt_idempotency_key(&"d".repeat(64))
     )));
+}
+
+#[test]
+fn stripe_attempt_age_uses_the_signed_time_and_includes_the_existing_margin() {
+    let start = 1000;
+    let end = start + STRIPE_IDEMPOTENCY_RENEWAL_BOUND_SECONDS;
+    assert!(within_stripe_attempt_window(start, start));
+    assert!(within_stripe_attempt_window(start, end));
+    assert!(!within_stripe_attempt_window(start, end + 1));
+    assert!(!within_stripe_attempt_window(start, start - 1));
+}
+
+#[tokio::test]
+async fn stale_unconfirmed_payment_checks_history_without_requesting_a_transfer() {
+    let (output, record, _, _, _) = attempt_fixture();
+    let empty = json!({"object":"list","has_more":false,"data":[]});
+    let (base, server) = stripe_fixture(vec![("GET /v1/transfers?", 200, empty)]).await;
+    let result = execute_canonical_stripe_attempt(
+        &reqwest::Client::new(),
+        &base,
+        "sk_test_fixture",
+        &output,
+        &record,
+        &"e".repeat(64),
+        2,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        CanonicalFiatAttemptExecution::NeedsReconciliation
+    ));
+    assert_eq!(server.await.unwrap().len(), 1);
 }
 
 #[tokio::test]

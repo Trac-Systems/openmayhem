@@ -37575,10 +37575,10 @@ fn admin_fiat_dust_sweep_payload(args: &AdminFiatDustSweepArgs) -> Result<Value>
 
 // Later revisions of the same provider spend the aggregate left by this one.
 // The immutable plan orders them contiguously, ahead of the operator fee.
-fn next_fiat_output_after_funding_wait(outputs: &[Value], index: usize) -> Result<usize> {
+fn next_independent_fiat_output(outputs: &[Value], index: usize) -> Result<usize> {
     let provider = outputs[index]["provider"]
         .as_str()
-        .context("fiat funding wait requires a provider output")?;
+        .context("waiting for a FIAT output requires its provider")?;
     let dependent = outputs[index + 1..]
         .iter()
         .take_while(|output| output["provider"].as_str() == Some(provider))
@@ -37799,6 +37799,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .cloned()
             .context("canonical fiat plan is missing outputs")?;
         let mut next_index = 0;
+        let mut unresolved_attempts = Vec::new();
         while let Some(output) = outputs.get(next_index) {
             let index = next_index;
             next_index += 1;
@@ -37980,6 +37981,11 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                                     output_settlements.push(settled);
                                     break;
                                 }
+                                CanonicalFiatAttemptExecution::NeedsReconciliation => {
+                                    unresolved_attempts.push(economic_op_id);
+                                    next_index = next_independent_fiat_output(&outputs, index)?;
+                                    break;
+                                }
                                 CanonicalFiatAttemptExecution::ExpiredPreEffect { evidence } => {
                                     finalize_targeted_fiat_attempt(
                                         &rpc,
@@ -38050,7 +38056,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .await;
             if let Err(error) = output_result {
                 if let Some(wait) = error.downcast_ref::<FiatFundingWait>() {
-                    next_index = next_fiat_output_after_funding_wait(&outputs, index)?;
+                    next_index = next_independent_fiat_output(&outputs, index)?;
                     pending_outputs.push(json!({
                         "economic_op_id": economic_op_id,
                         "output_index": index,
@@ -38062,6 +38068,11 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 }
             }
         }
+        ensure!(
+            unresolved_attempts.is_empty(),
+            "Stripe transfer history did not confirm these FIAT outputs within the safe retry window; reconciliation required before sending: {}",
+            unresolved_attempts.join(", ")
+        );
     }
 
     if plan.already_settled.is_none()
@@ -57565,6 +57576,7 @@ async fn settle_targeted_fiat_output(
 enum CanonicalFiatAttemptExecution {
     Succeeded { evidence: Value, report: Value },
     ExpiredPreEffect { evidence: Value },
+    NeedsReconciliation,
 }
 
 #[derive(Debug)]
@@ -57816,6 +57828,11 @@ fn ensure_canonical_fiat_quote_matches_output(
     Ok(planned)
 }
 
+fn within_stripe_attempt_window(prepared_at: u64, now: u64) -> bool {
+    now.checked_sub(prepared_at)
+        .is_some_and(|age| age <= STRIPE_IDEMPOTENCY_RENEWAL_BOUND_SECONDS)
+}
+
 async fn execute_canonical_stripe_attempt(
     client: &reqwest::Client,
     api_base_url: &str,
@@ -57927,6 +57944,13 @@ async fn execute_canonical_stripe_attempt(
     )
     .await?;
     if transfer.is_none() {
+        let prepared_at = preparation
+            .get("prepared_at")
+            .and_then(Value::as_u64)
+            .context("canonical fiat attempt is missing prepared_at")?;
+        if !within_stripe_attempt_window(prepared_at, now_unix_seconds()?) {
+            return Ok(CanonicalFiatAttemptExecution::NeedsReconciliation);
+        }
         // A prior successful transfer can be reconciled with an empty balance.
         // Only a genuinely new external transfer requires available funding.
         require_fiat_output_funding(
@@ -57982,6 +58006,11 @@ async fn execute_canonical_stripe_attempt(
         let form = form_urlencoded_body(&params);
         let mut created = None;
         for attempt in 1..=max_attempts {
+            // Balance reads and HTTP backoff can cross the deadline. A new
+            // POST is safe only while Stripe still deduplicates this attempt.
+            if !within_stripe_attempt_window(prepared_at, now_unix_seconds()?) {
+                return Ok(CanonicalFiatAttemptExecution::NeedsReconciliation);
+            }
             let response = client
                 .post(format!(
                     "{}/v1/transfers",
@@ -58053,16 +58082,10 @@ async fn execute_canonical_stripe_attempt(
                         break;
                     }
                     let quote = quote.as_ref().expect("checked above");
-                    let prepared_at = preparation
-                        .get("prepared_at")
-                        .and_then(Value::as_u64)
-                        .context("canonical fiat attempt is missing prepared_at")?;
                     let now = now_unix_seconds()?;
-                    ensure!(
-                        now.saturating_sub(prepared_at)
-                            <= STRIPE_IDEMPOTENCY_RENEWAL_BOUND_SECONDS,
-                        "Stripe attempt is older than the safe idempotency renewal bound; manual Stripe reconciliation is required"
-                    );
+                    if !within_stripe_attempt_window(prepared_at, now) {
+                        return Ok(CanonicalFiatAttemptExecution::NeedsReconciliation);
+                    }
                     let quote_expires_at = preparation
                         .get("quote_expires_at")
                         .and_then(Value::as_u64)
