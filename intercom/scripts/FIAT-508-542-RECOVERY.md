@@ -83,6 +83,43 @@ fee preparation, retention attempt and accounting operation, including a fee
 attempt finalized before fencing. The repair leaves 508 open, and the CLI
 holds the overlapping batch before entering the Stripe sender.
 
+### Submitting a prepared fence or resolution
+
+On the writable admin host, use its verified loopback RPC base ending in
+`/v1`. Work in the private evidence directory. Keep the fence and resolution
+in separate files. Submit one stage at a time through the ordinary feature
+endpoint. Once the fence is confirmed, follow the drain and processor evidence
+steps above before preparing the resolution.
+
+```sh
+umask 077
+curl --noproxy '*' --fail-with-body --silent --show-error --max-time 30 \
+  --header 'Content-Type: application/json' --data-binary "@$signed_file" \
+  --output "$reply_file" "$writer_rpc/contract/feature"
+```
+
+An HTTP 200 can carry a rejected or pending append. Confirm the economic
+effect in the signed state before continuing, including after a lost response
+or restart. For a fence, use `record_kind=fence`. For either resolution use
+`record_kind=resolution`. This read checks the complete signed instruction.
+
+```sh
+old_operation=$(jq -er '.value.old_operation' "$signed_file")
+curl --noproxy '*' --fail --silent --show-error --max-time 10 --get \
+  --data-urlencode 'confirmed=true' \
+  --data-urlencode "key=payout/recovery/fiat/$old_operation/$record_kind" \
+  --output "$readback_file" "$writer_rpc/state" &&
+  jq -e --slurpfile signed "$signed_file" \
+    '.confirmed == true and .signed_length > $signed[0].value.signed_length
+     and .value.feature_key == $signed[0].key and .value.value == $signed[0].value' \
+    "$readback_file" >/dev/null
+```
+
+A confirmed null means the effect is still absent at that read position.
+Check the recorded append result and the writer's progress. If resubmission is
+needed, submit the same saved bytes. After a confirmed `supersede_absent`,
+the existing worker timer resumes 542 and reconciles its transfer.
+
 ## Contract upgrade prerequisites for existing proxy deployments
 
 1. Drain new publications on the current writer and use its normal recovery to
