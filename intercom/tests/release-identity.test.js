@@ -338,7 +338,7 @@ test('health has no compatibility fallback when release identity is unavailable'
 });
 
 test('release identity binds retained implementations and replay admission code', (t) => {
-  for (const name of ['contract/v30.js', 'contract/fiat-recovery.js', 'contract/history/v23.js', 'contract/history/v24.js', 'contract/history/v25.js', 'contract/history/v26.js', 'contract/history/v27.js', 'trac/trac-peer/src/base/canonical-replay.js']) {
+  for (const name of ['contract/v30.js', 'contract/fiat-recovery.js', 'contract/payout-history.js', 'contract/payout-reservations.js', 'contract/history/v23.js', 'contract/history/v24.js', 'contract/history/v25.js', 'contract/history/v26.js', 'contract/history/v27.js', 'trac/trac-peer/src/base/canonical-replay.js']) {
     const rootDir = fixtureRoot(t);
     fs.appendFileSync(path.join(rootDir, name), '\n// changed replay semantics\n');
     assert.throws(() => verifyReleaseIdentity({ rootDir }), /mismatch/);

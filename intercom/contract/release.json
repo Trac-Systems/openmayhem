@@ -2,11 +2,11 @@
   "schema": 1,
   "release_version": "0.2.313",
   "contract_version": 31,
-  "contract_code_sha256": "2547f1ecedca3024c58f2a9a79e59b5405fb6a7331c791d5803ccc8d7f946d3f",
+  "contract_code_sha256": "18c6b996c75a4f4386aa56ee0005c58d9ea36c639f0a3f48ac40be6e55358c33",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "7fea991998f3e21d4018fdb4de3200d1367b94635851175ef8a16efd15e3a3f0"
+      "sha256": "71f9432620657b26d93e5e5df4b6ecb66d283fc8ef428254de7bdc4fb199a348"
     },
     {
       "path": "contract/fiat-recovery.js",
@@ -65,8 +65,16 @@
       "sha256": "540a9aaa535b15d7fc05d9b916829c3837770b4f41c57152661ac650d0051ee6"
     },
     {
+      "path": "contract/payout-history.js",
+      "sha256": "da2103227006344e525e6a9b2babccafd0129ef75b4f98e38c49be4cae382b75"
+    },
+    {
+      "path": "contract/payout-reservations.js",
+      "sha256": "2528503d8e9b8d764edfb803ae838895df957ccc6b890655e3c1c85f799e4bc0"
+    },
+    {
       "path": "contract/protocol.js",
-      "sha256": "5bdb5fb70a67ee7e711b5383f6d2a8b2c6fd49e8b61edc8004ff1a7dc1743504"
+      "sha256": "e5ab29e7934338781dfd1ce03a2710438cd454a1f9bc41e22e2c2240e2de9706"
     },
     {
       "path": "contract/proxy-closure.js",
@@ -118,7 +126,7 @@
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "2e1902c8b371c3cb3cbc380dfd587ee628bc6fc82c4cd0628e1cef9a970203af"
+      "sha256": "705b1a37f35b0d1d7f6530c23a1ee4d9c2e7e3f7b842518d7674237bca48e742"
     },
     {
       "path": "features/mayhem/proxy-admission.js",

@@ -20,6 +20,8 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/history/v27.js',
   'contract/history/v28.js',
   'contract/history/v29.js',
+  'contract/payout-history.js',
+  'contract/payout-reservations.js',
   'contract/protocol.js',
   'contract/proxy-closure.js',
   'contract/proxy-context.js',
