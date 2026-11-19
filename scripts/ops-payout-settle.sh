@@ -1906,7 +1906,6 @@ PY
 
 validate_tap_processed() {
   local report="$1" bundle="$2"
-  node "$SOURCE_DIR/scripts/validate-tap-settlement-checkpoint.mjs" "$report" || return 1
   python3 - "$report" "$bundle" "$applied_epoch" "$apply_hash" <<'PY'
 import hashlib, json, re, sys
 report_path, bundle_path, expected_epoch, expected_hash = sys.argv[1:]
@@ -2135,10 +2134,8 @@ complete_tap_processed() {
     echo "tap: processed report has unsupported status $status" >&2
     return 1
   }
-  node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" \
-    "$bundle" "$report" "$RPC_URL" "${bundle%.receipts.json}.tap-rate.json" confirmed || return 1
   validate_tap_processed "$report" "$bundle" || return 1
-  reconcile_tap_contract_checkpoint "$report"
+  reconcile_tap_contract_checkpoint "$report" "$bundle"
 }
 
 validate_tap_cli_report() {
@@ -2201,15 +2198,17 @@ PY
 }
 
 reconcile_tap_contract_checkpoint() {
-  local processed_report="$1"
-  local checkpoint="$work_dir/tap-contract-checkpoint.json"
+  local processed_report="$1" bundle="$2"
+  local archive="$work_dir/tap-contract-checkpoint.json"
+  local proposal="$work_dir/tap-proposal-block.json"
+  local checkpoint="$work_dir/tap-contract-submission.json"
   local sim_report="$work_dir/tap-contract-sim.json"
   local submit_report="$work_dir/tap-contract-submit.json"
   local canonical_record="$work_dir/tap-contract-record.json"
   local reconciliation="$work_dir/tap-contract-reconciliation.json"
-  local attempt state_status
+  local attempt state_status mode
 
-  if ! python3 - "$processed_report" "$checkpoint.tmp" <<'PY'
+  if ! python3 - "$processed_report" "$archive.tmp" <<'PY'
 import json, os, sys
 report = json.load(open(sys.argv[1]))
 checkpoint = report.get("tap_settlement_checkpoint")
@@ -2222,63 +2221,123 @@ with open(sys.argv[2], "w") as out:
     os.fsync(out.fileno())
 PY
   then
-    rm -f "$checkpoint.tmp"
+    rm -f "$archive.tmp"
     return 1
   fi
-  if [[ -f "$checkpoint" ]] && ! cmp -s "$checkpoint" "$checkpoint.tmp"; then
-    rm -f "$checkpoint.tmp"
+  if [[ -f "$archive" ]] && ! cmp -s "$archive" "$archive.tmp"; then
+    rm -f "$archive.tmp"
     echo "tap: retained contract checkpoint conflicts with processed roller evidence" >&2
     return 1
   fi
-  mv "$checkpoint.tmp" "$checkpoint"
+  if [[ -f "$archive" ]]; then
+    rm -f "$archive.tmp" || return 1
+  else
+    mv "$archive.tmp" "$archive" || return 1
+  fi
 
-  local -a args=(
-    --home "$ADMIN_HOME"
-    --rpc-url "$RPC_URL"
-    --peer-store-name "$ADMIN_STORE"
-    --checkpoint-file "$checkpoint"
-    --json
-  )
-  if ! "$MAYHEM_BIN" admin tap-settlement "${args[@]}" \
-    --submit --sim >"$sim_report.tmp"; then
-    rm -f "$sim_report.tmp"
-    echo "tap: canonical checkpoint simulation failed" >&2
+  # Read the exact two finalized pool receipts even when recovering a legacy
+  # archive. A fresh Core settlement must never trigger a second Ethereum send.
+  node "$SOURCE_DIR/contracts/scripts/tap-finalized-proposal.mjs" "$processed_report" >"$proposal.tmp" || return 1
+  if [[ -f "$proposal" ]] && ! cmp -s "$proposal.tmp" "$proposal"; then
+    echo "tap: verified proposal block differs from retained final evidence" >&2
     return 1
   fi
-  mv "$sim_report.tmp" "$sim_report"
-  validate_tap_cli_report "$sim_report" "$checkpoint" false true || return 1
-
-  if ! "$MAYHEM_BIN" admin tap-settlement "${args[@]}" \
-    --submit >"$submit_report.tmp"; then
-    rm -f "$submit_report.tmp"
-    echo "tap: canonical checkpoint submission failed" >&2
-    return 1
-  fi
-  mv "$submit_report.tmp" "$submit_report"
-  validate_tap_cli_report "$submit_report" "$checkpoint" true false || return 1
-
-  for ((attempt = 1; attempt <= TAP_CONTRACT_WAIT_ATTEMPTS; attempt += 1)); do
-    if ! curl -sf -m 10 \
-      "$RPC_URL/state?key=settle/targeted/tap/$applied_epoch&confirmed=true" \
-      >"$canonical_record.tmp"; then
-      rm -f "$canonical_record.tmp"
-      echo "tap: canonical settlement readback failed" >&2
+  mv "$proposal.tmp" "$proposal" || return 1
+  curl -sf -m 10 "$RPC_URL/state?key=settle/targeted/tap/$applied_epoch&confirmed=true" \
+    >"$canonical_record.tmp" || return 1
+  mv "$canonical_record.tmp" "$canonical_record" || return 1
+  # Only old confirmed records enter legacy replay. For a v31 recovery the
+  # archived raw checkpoint may legitimately differ by its added clock field.
+  if python3 - "$archive" "$canonical_record" <<'PY' && tap_contract_record_status "$archive" "$canonical_record"; then
+import json, sys
+raw, envelope = (json.load(open(p)) for p in sys.argv[1:])
+actual = envelope.get("value")
+is_legacy = isinstance(actual, dict) and "proposal_block_timestamp" not in actual and "proposal_block_timestamp" not in raw
+raise SystemExit(0 if is_legacy else 1)
+PY
+    # Only an exact signed readback may enter the historical validation path.
+    # v30 used different rounding; never use these rules for new submissions.
+    node "$SOURCE_DIR/scripts/validate-tap-settlement-checkpoint.mjs" --confirmed-v30 "$processed_report" || return 1
+    node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" \
+      "$bundle" "$processed_report" "$RPC_URL" "${bundle%.receipts.json}.tap-rate.json" dry || return 1
+    checkpoint="$archive"
+    mode="confirmed_archive"
+  else
+    node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" submission \
+      "$processed_report" "$proposal" >"$checkpoint.tmp" || return 1
+    if [[ -f "$checkpoint" ]] && ! cmp -s "$checkpoint.tmp" "$checkpoint"; then
+      echo "tap: restored Core submission conflicts with retained evidence" >&2
       return 1
     fi
-    mv "$canonical_record.tmp" "$canonical_record"
+    mv "$checkpoint.tmp" "$checkpoint" || return 1
     state_status=0
     tap_contract_record_status "$checkpoint" "$canonical_record" || state_status=$?
-    if (( state_status == 0 )); then
-      break
-    elif (( state_status != 2 )); then
+    case "$state_status" in
+      0)
+        # The payout basis has already advanced. Verify the historical page
+        # and exact canonical close without planning the same increment again.
+        node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" \
+          "$bundle" "$processed_report" "$RPC_URL" "${bundle%.receipts.json}.tap-rate.json" dry || return 1
+        mode="confirmed_archive"
+        ;;
+      2)
+        node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" \
+          "$bundle" "$processed_report" "$RPC_URL" "${bundle%.receipts.json}.tap-rate.json" confirmed "$proposal" || return 1
+        mode="submit"
+        ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  if [[ "$mode" == submit ]]; then
+    local -a args=(
+      --home "$ADMIN_HOME"
+      --rpc-url "$RPC_URL"
+      --peer-store-name "$ADMIN_STORE"
+      --checkpoint-file "$checkpoint"
+      --json
+    )
+    if ! "$MAYHEM_BIN" admin tap-settlement "${args[@]}" \
+      --submit --sim >"$sim_report.tmp"; then
+      rm -f "$sim_report.tmp"
+      echo "tap: canonical checkpoint simulation failed" >&2
       return 1
     fi
-    if (( attempt == TAP_CONTRACT_WAIT_ATTEMPTS )); then
-      echo "tap: canonical settlement record did not become visible" >&2
+    mv "$sim_report.tmp" "$sim_report"
+    validate_tap_cli_report "$sim_report" "$checkpoint" false true || return 1
+
+    if ! "$MAYHEM_BIN" admin tap-settlement "${args[@]}" \
+      --submit >"$submit_report.tmp"; then
+      rm -f "$submit_report.tmp"
+      echo "tap: canonical checkpoint submission failed" >&2
       return 1
     fi
-    sleep "$TAP_CONTRACT_WAIT_SECONDS"
-  done
+    mv "$submit_report.tmp" "$submit_report"
+    validate_tap_cli_report "$submit_report" "$checkpoint" true false || return 1
+
+    for ((attempt = 1; attempt <= TAP_CONTRACT_WAIT_ATTEMPTS; attempt += 1)); do
+      if ! curl -sf -m 10 \
+        "$RPC_URL/state?key=settle/targeted/tap/$applied_epoch&confirmed=true" \
+        >"$canonical_record.tmp"; then
+        rm -f "$canonical_record.tmp"
+        echo "tap: canonical settlement readback failed" >&2
+        return 1
+      fi
+      mv "$canonical_record.tmp" "$canonical_record"
+      state_status=0
+      tap_contract_record_status "$checkpoint" "$canonical_record" || state_status=$?
+      if (( state_status == 0 )); then
+        break
+      elif (( state_status != 2 )); then
+        return 1
+      fi
+      if (( attempt == TAP_CONTRACT_WAIT_ATTEMPTS )); then
+        echo "tap: canonical settlement record did not become visible" >&2
+        return 1
+      fi
+      sleep "$TAP_CONTRACT_WAIT_SECONDS"
+    done
+  fi
 
   if [[ "${MAYHEM_PAYOUT_TEST_CRASH_AFTER_TAP_CONTRACT:-0}" == "1" ]]; then
     [[ "${MAYHEM_PAYOUT_TEST_MODE:-0}" == "1" ]] || {
@@ -2290,9 +2349,9 @@ PY
   fi
 
   python3 - "$reconciliation.tmp" "$processed_report" "$checkpoint" \
-    "$sim_report" "$submit_report" "$canonical_record" "$applied_epoch" "$apply_hash" <<'PY'
+    "$sim_report" "$submit_report" "$canonical_record" "$applied_epoch" "$apply_hash" "$mode" "$archive" "$proposal" <<'PY'
 import hashlib, json, os, sys
-target, processed, checkpoint, sim, submit, record, epoch, apply_hash = sys.argv[1:]
+target, processed, checkpoint, sim, submit, record, epoch, apply_hash, mode, archive, proposal = sys.argv[1:]
 def digest(path):
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
 with open(target, "w") as out:
@@ -2303,8 +2362,11 @@ with open(target, "w") as out:
         "epoch_apply_hash": apply_hash,
         "processed_report_sha256": digest(processed),
         "checkpoint_sha256": digest(checkpoint),
-        "simulation_sha256": digest(sim),
-        "submission_sha256": digest(submit),
+        "mode": mode,
+        "archived_checkpoint_sha256": digest(archive),
+        "proposal_block_sha256": digest(proposal),
+        "simulation_sha256": digest(sim) if mode == "submit" else None,
+        "submission_sha256": digest(submit) if mode == "submit" else None,
         "canonical_record_sha256": digest(record),
     }, out, indent=2)
     out.write("\n")
@@ -2314,6 +2376,43 @@ PY
   mv "$reconciliation.tmp" "$reconciliation"
   mark_rail tap settled "$reconciliation" || return 1
   echo "tap: Ethereum execution and canonical Intercom settlement reconciled"
+}
+
+dispatch_rail_outputs() {
+  local rail="$1" final_tmp="$2" error_file="$3" status=0
+  shift 3
+  python3 "$SOURCE_DIR/scripts/ops/dispatch-payout-outputs.py" \
+    "$work_dir" "$rail" "$applied_epoch" "$apply_hash" "$MAYHEM_BIN" admin "$rail-settlement" "$@" \
+    >"$final_tmp" 2>"$error_file" || status=$?
+  if (( status != 0 )); then
+    if [[ -s "$final_tmp" ]] && [[ "$(json_field type <"$final_tmp")" == outstanding_payout_outputs ]]; then
+      local journal="$work_dir/$rail-pending.json"
+      if (( status != 2 )); then
+        journal="$work_dir/$rail-reconciliation-needed.json"
+        rm -f "$work_dir/$rail-pending.json"
+      fi
+      mv "$final_tmp" "$journal" || return 1
+      echo "$rail: unpaid outputs retained; independent outputs can continue (see $journal)" >&2
+    else
+      rm -f "$final_tmp"
+      echo "$rail: could not verify payout results (see $error_file)" >&2
+    fi
+    return "$status"
+  fi
+}
+
+finish_independent_rail() {
+  local rail="$1" final_tmp="$2" final_file="$3" outcome
+  validate_settlement_report "$final_tmp" "$rail" final || return 1
+  mv "$final_tmp" "$final_file" || return 1
+  rm -f "$work_dir/$rail-pending.json" "$work_dir/$rail-reconciliation-needed.json"
+  outcome="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["settlement"]["outcome"])' "$final_file")" || return 1
+  case "$outcome" in
+    payouts) mark_rail "$rail" settled "$final_file" || return 1 ;;
+    no_work|carry) mark_rail "$rail" "$outcome" "$final_file" || return 1 ;;
+    *) echo "$rail: unsupported confirmed payout outcome" >&2; return 1 ;;
+  esac
+  echo "$rail: canonical epoch close verified ($outcome)"
 }
 
 settle_fiat() {
@@ -2342,58 +2441,8 @@ settle_fiat() {
   )
   [[ -n "$FIAT_STRIPE_ENV_FILE" ]] && args+=(--stripe-env-file "$FIAT_STRIPE_ENV_FILE")
 
-  if ! "$MAYHEM_BIN" admin fiat-settlement "${args[@]}" \
-    --submit-transfer --submit >"$final_tmp" 2>"$error_file"; then
-    rm -f "$final_tmp"
-    echo "fiat: transfer/evidence submit failed on attempt $attempt (see $error_file)" >&2
-    return 1
-  fi
-  if [[ "$(json_field pending <"$final_tmp")" == "true" ]]; then
-    validate_settlement_report "$final_tmp" fiat pending || return 1
-    mv "$final_tmp" "$work_dir/fiat-pending.json"
-    echo "fiat: waiting for available Stripe funds; automatic retry remains enabled (see $work_dir/fiat-pending.json)"
-    return 2
-  fi
-  mv "$final_tmp" "$final_file"
-  if ! validate_settlement_report "$final_file" fiat final; then
-    echo "fiat: final report did not prove exact settlement (see $final_file)" >&2
-    return 1
-  fi
-  rm -f "$work_dir/fiat-pending.json"
-  if python3 - "$final_file" <<'PY'
-import json, sys
-raise SystemExit(0 if json.load(open(sys.argv[1])).get("already_settled") is not None else 1)
-PY
-  then
-    mark_rail fiat already_settled "$final_file"
-    echo "fiat: canonical settlement evidence already exists"
-    return 0
-  fi
-  local outcome
-  outcome="$(python3 - "$final_file" <<'PY'
-import json, sys
-report = json.load(open(sys.argv[1]))
-print(report["settlement"]["outcome"])
-PY
-)"
-  case "$outcome" in
-    payouts)
-      mark_rail fiat settled "$final_file"
-      echo "fiat: Stripe transfers and canonical close reconciled"
-      ;;
-    carry)
-      mark_rail fiat carry "$final_file"
-      echo "fiat: below-threshold liabilities carried and canonically closed"
-      ;;
-    no_work)
-      mark_rail fiat no_work "$final_file"
-      echo "fiat: empty epoch plan canonically closed"
-      ;;
-    *)
-      echo "fiat: final report has an unsupported canonical outcome" >&2
-      return 1
-      ;;
-  esac
+  dispatch_rail_outputs fiat "$final_tmp" "$error_file" "${args[@]}" || return $?
+  finish_independent_rail fiat "$final_tmp" "$final_file"
 }
 
 settle_tnk() {
@@ -2461,51 +2510,8 @@ else:
 
   local final_tmp="$work_dir/tnk-settlement.json.tmp"
   local final_file="$work_dir/tnk-settlement.json"
-  if ! "$MAYHEM_BIN" admin tnk-settlement "${args[@]}" \
-    --submit-transfer --submit >"$final_tmp" 2>"$error_file"; then
-    rm -f "$final_tmp"
-    echo "tnk: transfer/evidence submit failed on attempt $attempt (see $error_file)" >&2
-    return 1
-  fi
-  mv "$final_tmp" "$final_file"
-  if ! validate_settlement_report "$final_file" tnk final; then
-    echo "tnk: final report did not prove exact settlement (see $final_file)" >&2
-    return 1
-  fi
-  if python3 - "$final_file" <<'PY'
-import json, sys
-raise SystemExit(0 if json.load(open(sys.argv[1])).get("already_settled") is not None else 1)
-PY
-  then
-    mark_rail tnk already_settled "$final_file"
-    echo "tnk: canonical settlement evidence already exists"
-    return 0
-  fi
-  local outcome
-  outcome="$(python3 - "$final_file" <<'PY'
-import json, sys
-report = json.load(open(sys.argv[1]))
-print(report["settlement"]["outcome"])
-PY
-)"
-  case "$outcome" in
-    payouts)
-      mark_rail tnk settled "$final_file"
-      echo "tnk: MSB transfers and canonical close reconciled"
-      ;;
-    carry)
-      mark_rail tnk carry "$final_file"
-      echo "tnk: below-threshold liabilities carried and canonically closed"
-      ;;
-    no_work)
-      mark_rail tnk no_work "$final_file"
-      echo "tnk: empty epoch plan canonically closed"
-      ;;
-    *)
-      echo "tnk: final report has an unsupported canonical outcome" >&2
-      return 1
-      ;;
-  esac
+  dispatch_rail_outputs tnk "$final_tmp" "$error_file" "${args[@]}" || return $?
+  finish_independent_rail tnk "$final_tmp" "$final_file"
 }
 
 produce_tap_work() {

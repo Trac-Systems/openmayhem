@@ -4,7 +4,9 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
+import { Worker } from 'node:worker_threads';
+import { pricingFixture } from '../../contracts/tests/helpers/tap-pricing.mjs';
 import { fileURLToPath } from 'node:url';
 import MayhemContract from '../../intercom/contract/contract.js';
 const tapContract = new MayhemContract({}, {});
@@ -1107,43 +1109,13 @@ for arg in "$@"; do
   [[ "$previous" == "--checkpoint-file" ]] && checkpoint_file="$arg"
   previous="$arg"
 done
-if [[ "$rail" == "fiat-settlement" ]]; then
-  mode="\${MOCK_FIAT_MODE:-success}"
-  if [[ "$mode" == "command_error" ]]; then
-    printf '%s\\n' 'simulated fiat command failure before a report was written' >&2
-    exit 1
-  elif [[ "$mode" == "blocking" || "$mode" == "stale_epoch" ]]; then
-    cat "$MOCK_FIAT_FIXTURES/$mode.json"
-  elif [[ "$mode" == "no_work" || "$mode" == "below_threshold" ]]; then
-    if (( submit == 1 )); then
-      cat "$MOCK_FIAT_FIXTURES/$mode-final.json"
-    else
-      cat "$MOCK_FIAT_FIXTURES/$mode-plan.json"
-    fi
-  elif (( submit == 1 )); then
-    if [[ "$mode" != "waiting_for_funds" && "$mode" != "invalid_funding_wait" ]]; then
-      record_external_effect fiat
-    fi
-    cat "$MOCK_FIAT_FIXTURES/\${mode/success/final}.json"
-  else
-    cat "$MOCK_FIAT_FIXTURES/plan.json"
+if [[ "$rail" == "fiat-settlement" || "$rail" == "tnk-settlement" ]]; then
+  if [[ "$rail" == fiat-settlement ]]; then mode="\${MOCK_FIAT_MODE:-success}"; else mode="\${MOCK_TNK_MODE:-success}"; fi
+  if [[ "$mode" == command_error ]]; then exit 1; fi
+  if (( submit == 1 )) && [[ "$mode" != waiting_for_funds && "$mode" != invalid_funding_wait ]]; then
+    record_external_effect "\${rail%-settlement}"
   fi
-elif [[ "$rail" == "tnk-settlement" ]]; then
-  mode="\${MOCK_TNK_MODE:-success}"
-  if [[ "$mode" == "no_work" || "$mode" == "below_threshold" ]]; then
-    if (( submit == 1 )); then
-      cat "$MOCK_TNK_FIXTURES/$mode-final.json"
-    else
-      cat "$MOCK_TNK_FIXTURES/$mode-plan.json"
-    fi
-  elif [[ "$mode" == "payable_omitted" ]]; then
-    cat "$MOCK_TNK_FIXTURES/payable_omitted.json"
-  elif (( submit == 1 )); then
-    record_external_effect tnk
-    cat "$MOCK_TNK_FIXTURES/\${mode/success/final}.json"
-  else
-    cat "$MOCK_TNK_FIXTURES/plan.json"
-  fi
+  python3 "$MAYHEM_SOURCE_DIR/scripts/tests/helpers/payout-cli-modes.py" "$rail" "$mode" "$@"
 elif [[ "$rail" == "tap-settlement" ]]; then
   [[ -f "$checkpoint_file" ]] || {
     printf '%s\\n' "missing TAP checkpoint file" >&2
@@ -1340,11 +1312,22 @@ fi
 }
 
 function runWorker(ctx, extraEnv = {}) {
-  return spawnSync('bash', [SCRIPT], {
+  const result = spawnSync('bash', [SCRIPT], {
     cwd: ROOT,
     env: { ...ctx.env, ...extraEnv },
     encoding: 'utf8',
   });
+  if (result.status !== 0) {
+    const payout = path.join(ctx.state, 'payout');
+    for (const entry of fs.readdirSync(payout, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(payout, entry.name);
+      for (const file of fs.readdirSync(dir).filter(name => name.endsWith('.stderr.log'))) {
+        result.stderr += fs.readFileSync(path.join(dir, file), 'utf8');
+      }
+    }
+  }
+  return result;
 }
 
 function logLines(ctx) {
@@ -1380,13 +1363,30 @@ function rebindArtifact(ctx) {
   });
 }
 
+const tapProofWorkers = new Set();
+after(async () => { await Promise.all([...tapProofWorkers].map(worker => worker.terminate())); });
+
+function startTapProofFixture(ctx, checkpoint) {
+  const { state } = pricingFixture(checkpoint.tap_rate_lock);
+  const ready = new Int32Array(new SharedArrayBuffer(4));
+  const worker = new Worker(new URL('./helpers/tap-proof-rpc.mjs', import.meta.url), {
+    workerData: { ready: ready.buffer, checkpoint, state: Object.fromEntries(state) },
+  });
+  tapProofWorkers.add(worker);
+  assert.notEqual(Atomics.wait(ready, 0, 0, 8000), 'timed-out');
+  const port = Atomics.load(ready, 0);
+  ctx.env.MOCK_PAYOUT_STATE_PORT = String(port);
+  ctx.env.MAYHEM_PAYOUT_TEST_ETH_RPC = 'http://127.0.0.1:' + port + '/eth';
+  ctx.env.NODE_OPTIONS = '--import=' + new URL('./helpers/loopback-payout-state.mjs', import.meta.url).href;
+}
+
 function writeTapReport(ctx, bundleName, overrides = {}) {
   const processed = path.join(ctx.spool, 'processed');
   const bundleRaw = fs.readFileSync(path.join(processed, bundleName));
   const rateLock = {
     type: 'tap_settlement_rate_lock',
     epoch: 7,
-    bundle_sha256: '2'.repeat(64),
+    bundle_sha256: sha256(stableJson(JSON.parse(bundleRaw))),
     denom: 'tap_usd_au',
     tap_usd_au: '1000000000000000000',
     source: 'uniswap_v3_twap',
@@ -1458,6 +1458,7 @@ function writeTapReport(ctx, bundleName, overrides = {}) {
       cumulative_claim_wei: '10',
     }],
   };
+  startTapProofFixture(ctx, checkpoint);
   writeJson(
     path.join(processed, `epoch-7-${APPLY_HASH}.settlement.json`),
     {
@@ -1469,6 +1470,11 @@ function writeTapReport(ctx, bundleName, overrides = {}) {
       blocked: false,
       root_confirmed: true,
       posted: true,
+      canonical_preparation_confirmed: true,
+      cumulative_spent_wei: checkpoint.cumulative_spent_wei,
+      preparation_ids: checkpoint.preparation_ids,
+      external_effect_ids: checkpoint.external_effect_ids,
+      root_preparation_id: checkpoint.root_preparation_id,
       proposal_tx: TAP_TX,
       execution_tx: TAP_EXECUTION_TX,
       tap_rate_lock: rateLock,
@@ -1542,11 +1548,11 @@ test('payout worker isolates TAP spool work and replays all rails idempotently',
   assert.equal(fs.existsSync(path.join(workDir, 'tap.produced')), true);
 
   const firstLog = logLines(ctx);
-  assert.equal(firstLog.length, 2);
-  assert.equal(firstLog.filter((line) => line.startsWith('admin fiat-settlement')).length, 1);
-  assert.equal(firstLog.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
+  assert.equal(firstLog.length, 8);
+  assert.equal(firstLog.filter(line => line.includes('admin fiat-settlement') && line.includes('--output-id')).length, 1);
+  assert.equal(firstLog.filter(line => line.includes('admin tnk-settlement') && line.includes('--output-id')).length, 1);
   assert.match(
-    firstLog.find((line) => line.startsWith('admin tnk-settlement')),
+    firstLog.find((line) => line.startsWith('admin tnk-settlement') && line.includes('--output-id')),
     /--at 1000 .*--submit-transfer --submit/
   );
   assert.equal(fs.readFileSync(path.join(workDir, 'tnk-settlement-at'), 'utf8').trim(), '1000');
@@ -1608,19 +1614,24 @@ test('ambiguous prior-epoch TAP payout reconciles before current remaining liabi
     `epoch-7-${APPLY_HASH}.settlement.json`
   );
   const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-  report.tap_settlement_checkpoint.cumulative_spent_wei = '104';
+  report.tap_settlement_checkpoint.cumulative_spent_wei = '134';
   report.tap_settlement_checkpoint.provider_paid_au = '100';
   report.tap_settlement_checkpoint.provider_tap_wei = '100';
   report.tap_settlement_checkpoint.entries[1].cumulative_wei = '100';
   report.tap_settlement_checkpoint.outputs[0].paid_au = '100';
   report.tap_settlement_checkpoint.outputs[0].tap_wei = '100';
   report.tap_settlement_checkpoint.outputs[0].cumulative_claim_wei = '100';
-  report.root_confirmation.onchain_cumulative_spent_wei = '104';
+  report.root_confirmation.onchain_cumulative_spent_wei = '134';
   report.tap_settlement_checkpoint.provider_cumulative_claimed_wei = '100';
   report.tap_settlement_checkpoint.provider_entries[0].cumulative_wei = '100';
+  report.cumulative_spent_wei = '134';
+  report.tap_settlement_checkpoint.entries[0].cumulative_wei = '34';
+  report.tap_settlement_checkpoint.refunds[0].cumulative_wei = '34';
+  report.tap_settlement_checkpoint.buyer_refund_wei = '34';
   report.root = tapContract.targetedTapSettlementRoot(report.tap_settlement_checkpoint.entries);
   report.tap_settlement_checkpoint.root = report.root;
   report.root_confirmation.onchain_root = report.root;
+  startTapProofFixture(ctx, report.tap_settlement_checkpoint);
   writeJson(reportPath, report);
   writeJson(ctx.tapLiabilityState, {
     provider: TAP_PROVIDER,
@@ -1714,7 +1725,7 @@ test('TAP canonical submit survives restart before the local completion marker',
   );
   assert.equal(
     logLines(ctx).filter((line) => line.startsWith('admin tap-settlement')).length,
-    4
+    2
   );
 });
 
@@ -1898,17 +1909,17 @@ test('stale fiat evidence is rejected before a completion marker is written', (t
     MOCK_TNK_MODE: 'no_work',
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /report outer epoch or ok flag is invalid/);
+  assert.match(result.stderr, /different epoch plan/);
   const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
   assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
 });
 
 test('fiat v17 final report requires attempts, output settlements, and close', async (t) => {
   const cases = [
-    ['bad_attempt_id', /does not match its planned output/],
-    ['missing_output_settlement', /does not cover every planned output/],
-    ['mismatched_output', /does not match its planned output/],
-    ['missing_close', /missing plan\/output\/close evidence/],
+    ['bad_attempt_id', /receipt is for a different payout/],
+    ['missing_output_settlement', /neither an exact receipt nor an outstanding reason/],
+    ['mismatched_output', /receipt is for a different payout/],
+    ['missing_close', /did not close the exact epoch/],
     ['mismatched_close', /canonical close does not match its immutable plan/],
   ];
   for (const [mode, error] of cases) {
@@ -1924,7 +1935,7 @@ test('fiat v17 final report requires attempts, output settlements, and close', a
       const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
       assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
       assert.equal(
-        logLines(ctx).filter((line) => line.startsWith('admin fiat-settlement')).length,
+        logLines(ctx).filter(line => line.startsWith('admin fiat-settlement') && line.includes('--output-id')).length,
         1
       );
     });
@@ -1973,9 +1984,9 @@ test('canonical preparation readback precedes fiat and TNK effects across restar
 
 test('TNK v17 final report requires every output settlement and canonical close', async (t) => {
   const cases = [
-    ['missing_output_settlement', /does not cover every planned output/],
-    ['mismatched_output', /does not match its planned output/],
-    ['missing_close', /missing plan\/output\/close evidence/],
+    ['missing_output_settlement', /neither an exact receipt nor an outstanding reason/],
+    ['mismatched_output', /receipt is for a different payout/],
+    ['missing_close', /did not close the exact epoch/],
   ];
   for (const [mode, error] of cases) {
     await t.test(mode, () => {
@@ -2104,10 +2115,10 @@ test('payout worker records canonical no-work outcomes without requiring live ke
     assert.equal(marker.status, 'no_work');
   }
   const calls = logLines(ctx);
-  assert.equal(calls.filter((line) => line.startsWith('admin fiat-settlement')).length, 1);
-  assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
-  assert.match(calls.find((line) => line.startsWith('admin fiat-settlement') && line.includes('--submit-transfer')), /--submit/);
-  assert.match(calls.find((line) => line.startsWith('admin tnk-settlement') && line.includes('--submit-transfer')), /--submit/);
+  assert.equal(calls.filter(line => line.startsWith('admin fiat-settlement') && line.includes('--close-only')).length, 1);
+  assert.equal(calls.filter(line => line.startsWith('admin tnk-settlement') && line.includes('--close-only')).length, 1);
+  assert.equal(calls.some(line => line.startsWith('admin fiat-settlement') && line.includes('--submit-transfer')), false);
+  assert.equal(calls.some(line => line.startsWith('admin tnk-settlement') && line.includes('--submit-transfer')), false);
 });
 
 test('funding wait survives restarts, keeps other rails moving and resumes without operator repair', (t) => {
@@ -2144,7 +2155,7 @@ test('inconsistent funding reports do not become accepted waits or completed pay
   t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
   const result = runWorker(ctx, { MOCK_FIAT_MODE: 'invalid_funding_wait' });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /inconsistent shortfall/);
+  assert.match(result.stderr, /inconsistent processor shortfall/);
   const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
   assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
   assert.equal(fs.existsSync(path.join(workDir, 'fiat-pending.json')), false);
@@ -2197,8 +2208,8 @@ test('held-only and below-threshold payout work close as no_work or carry', (t) 
   assert.equal(JSON.parse(fs.readFileSync(path.join(workDir, 'tnk.complete'))).status, 'carry');
   assert.equal(fs.existsSync(path.join(workDir, 'complete')), true);
   const calls = logLines(ctx);
-  assert.equal(calls.filter((line) => line.startsWith('admin fiat-settlement')).length, 1);
-  assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
+  assert.equal(calls.filter(line => line.startsWith('admin fiat-settlement') && line.includes('--close-only')).length, 1);
+  assert.equal(calls.filter(line => line.startsWith('admin tnk-settlement') && line.includes('--close-only')).length, 1);
 
   writeJson(ctx.applyState, {
     key: 'epoch/apply/state',
