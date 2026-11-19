@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import sodium from 'sodium-native';
 import { AdmissionApi, AdmissionWorker, boundedJson, fixedOrigin, tapVerifier, stripeVerifier, tnkVerifier, main, canonicalAdmissionMsbReader } from '../scripts/proxy-admission-worker.mjs';
+import { admissionTapRpc } from '../scripts/proxy-admission-discovery.mjs';
 import { validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, evidenceSetCommitment, invoiceCommitment, base, PURPOSE } from '../scripts/proxy-admission-wire.mjs';
 import { ERC20_TRANSFER_TOPIC, addressTopic, ReviewWork } from '../scripts/retail-crypto-verification.mjs';
 const fixture=JSON.parse(fs.readFileSync(new URL('./fixtures/proxy-admission-worker-v1.json',import.meta.url)));
@@ -147,6 +148,44 @@ test('TAP exact log observes underpayment, uses finalized head and checks networ
  const actual=await verify(w,signal());assert.equal(actual.amount_base_units,'4');assert.equal(actual.log_index,3);
  finalized=false;await assert.rejects(verify(w,signal()),/finality_unavailable/);finalized=true;wrongBlock=true;await assert.rejects(verify(w,signal()),/block changed/);
  wrongBlock=false;chain=1;await assert.rejects(verify(w,signal()),/network/);assert.ok(!seen.includes('eth_sendRawTransaction'));
+});
+
+test('TAP verifier checks each endpoint once and rebuilds the receipt evidence after a failed read', async () => {
+  const {verify_work: work, evidence_completion: {receipt}} = fixture.cases[0];
+  const payment = work.payment_reference;
+  const endpoints = ['https://primary.invalid/', 'https://fallback.invalid/'];
+  const calls = [];
+  let failFinality = false;
+  const rpc = admissionTapRpc({urls: endpoints, chainId: 31337, fetcher: async (url, {body}) => {
+    const {id, method, params} = JSON.parse(body);
+    const host = endpoints.indexOf(url);
+    calls.push([host, method, params[0]]);
+    let result;
+    if (method === 'eth_chainId') {
+      result = '0x7a69';
+    } else if (method === 'eth_getTransactionReceipt') {
+      result = {transactionHash: payment.transaction_hash, status: '0x1', blockHash: receipt.block_hash,
+        blockNumber: '0x64', logs: [{address: payment.token_contract, logIndex: '0x3',
+          topics: [ERC20_TRANSFER_TOPIC, addressTopic(receipt.from_address), addressTopic(receipt.to_address)],
+          data: host === 0 ? '0x4' : '0x5'}]};
+    } else {
+      assert.equal(method, 'eth_getBlockByNumber');
+      if (failFinality && host === 0 && params[0] === 'finalized') return new Response(null, {status: 503});
+      result = params[0] === 'finalized' ? {number: '0x70'} :
+        {number: '0x64', hash: receipt.block_hash, timestamp: '0x64'};
+    }
+    return Response.json({jsonrpc: '2.0', id, result});
+  }});
+  const verify = tapVerifier({rpc, chainId: 31337, tokenContract: payment.token_contract});
+  const reads = [
+    ['eth_chainId', undefined], ['eth_getTransactionReceipt', payment.transaction_hash],
+    ['eth_getBlockByNumber', 'finalized'], ['eth_getBlockByNumber', '0x64'],
+  ];
+  assert.equal((await verify(work, signal())).amount_base_units, '4');
+  assert.deepEqual(calls.splice(0), reads.map(read => [0, ...read]));
+  failFinality = true;
+  assert.equal((await verify(work, signal())).amount_base_units, '5');
+  assert.deepEqual(calls, [...reads.slice(0, 3).map(read => [0, ...read]), ...reads.map(read => [1, ...read])]);
 });
 
 test('Stripe retrieves exact event/intent/charge and rejects wrong purpose, account, refund and dispute',async()=>{

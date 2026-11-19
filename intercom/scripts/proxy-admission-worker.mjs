@@ -263,24 +263,30 @@ export function tapVerifier({origin,chainId,tokenContract,allowLoopbackHttp=fals
   const rpcOrigin=rpc?null:fixedOrigin(origin,{allowLoopbackHttp}); need(uint(chainId,1)&&/^0x[0-9a-f]{40}$/.test(tokenContract),'invalid TAP asset configuration');
   let id=0;
   const call=rpc??(async(method,params,signal)=>{const requestId=++id;const result=await boundedJson(rpcOrigin,{body:{jsonrpc:'2.0',id:requestId,method,params},signal,fetcher,maxBytes:262144});need(result.jsonrpc==='2.0'&&result.id===requestId&&!result.error,'TAP RPC unavailable');return result.result;});
-  return async(work,signal)=>{
-    const i=work.invoice,p=work.payment_reference;
-    need(i.rail==='tap'&&i.collection.chain_id===chainId&&i.collection.token_contract===tokenContract,'TAP asset differs');
-    need(parseHexInt(await call('eth_chainId',[],signal),'chain')===BigInt(chainId),'TAP network differs');
-    const receipt=await call('eth_getTransactionReceipt',[p.transaction_hash],signal);
+  const readEvidence=async(i,p,read)=>{
+    need(parseHexInt(await read('eth_chainId',[]),'chain')===BigInt(chainId),'TAP network differs');
+    const receipt=await read('eth_getTransactionReceipt',[p.transaction_hash]);
     if(!receipt) throw new RetryWork('transfer_pending',15);
     const logs=receipt.logs.filter(log=>parseHexInt(log.logIndex,'log index')===BigInt(p.log_index));
     need(logs.length===1,'exact TAP log missing or duplicated');
-    const finalized=await call('eth_getBlockByNumber',['finalized',false],signal);
+    const finalized=await read('eth_getBlockByNumber',['finalized',false]);
     if(!finalized?.number) throw new RetryWork('finality_unavailable',30);
     const e=verifyTapTransferReceipt({...receipt,logs},{transactionHash:p.transaction_hash,token:tokenContract,destination:i.collection.destination,
       amountBaseUnits:String(parseHexInt(logs[0].data,'transfer amount')),latestBlock:parseHexInt(finalized.number,'finalized block'),finalizedBlock:parseHexInt(finalized.number,'finalized block')});
-    const block=await call('eth_getBlockByNumber',[receipt.blockNumber,false],signal);
+    const block=await read('eth_getBlockByNumber',[receipt.blockNumber,false]);
     need(block?.hash===receipt.blockHash && block.number===receipt.blockNumber,'TAP block changed');
     const paid=Number(parseHexInt(block.timestamp,'block timestamp'))*1000; need(uint(paid,1),'TAP block time invalid');
     return {rail:'tap',physical_key:`tap/${chainId}/${tokenContract}/${p.transaction_hash}/${p.log_index}`,amount_base_units:String(e.tokenAmountBaseUnits),finalized:true,
       transaction_hash:p.transaction_hash,log_index:p.log_index,chain_id:chainId,token_contract:tokenContract,from_address:e.fromAddress,to_address:e.toAddress,
       block_number:String(e.blockNumber),block_hash:e.blockHash,paid_at_ms:paid};
+  };
+  return async(work,signal)=>{
+    const i=work.invoice,p=work.payment_reference;
+    need(i.rail==='tap'&&i.collection.chain_id===chainId&&i.collection.token_contract===tokenContract,'TAP asset differs');
+    // Re-read all evidence on failover so a receipt from one endpoint cannot
+    // be combined with a different endpoint's finality or canonical block.
+    if(rpc?.withEndpoint)return rpc.withEndpoint(signal,read=>readEvidence(i,p,read));
+    return readEvidence(i,p,(method,params)=>call(method,params,signal));
   };
 }
 
