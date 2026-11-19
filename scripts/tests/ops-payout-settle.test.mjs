@@ -559,14 +559,15 @@ function writeFiatFixtures(root) {
   return fixtureDir;
 }
 
-function writeV17FiatFixtures(root) {
+function writeV17FiatFixtures(root, epoch = 7, applyHash = APPLY_HASH, currency = 'usd') {
   const fixtureDir = path.join(root, 'fiat-v17-fixtures');
   fs.mkdirSync(fixtureDir, { recursive: true });
-  const economicOpId = '1'.repeat(64);
-  const attemptId = '2'.repeat(64);
-  const outputsRoot = '3'.repeat(64);
+  const provider = sha256(`fiat-provider-${epoch}`);
+  const economicOpId = sha256(`fiat-output-${epoch}`);
+  const attemptId = sha256(`fiat-attempt-${epoch}`);
+  const outputsRoot = sha256(economicOpId);
   const carryRoot = '4'.repeat(64);
-  const planRoot = '5'.repeat(64);
+  const planRoot = sha256(`fiat-plan-${epoch}`);
   const admin = '6'.repeat(64);
   const adminSig = '7'.repeat(128);
 
@@ -574,22 +575,22 @@ function writeV17FiatFixtures(root) {
     op: 'prepare_targeted_payout_epoch',
     contract_version: 17,
     rail: 'fiat',
-    epoch: 7,
+    epoch,
     at: 1000,
-    epoch_apply_hash: APPLY_HASH,
+    epoch_apply_hash: applyHash,
     snapshot_signed_length: 44,
     outcome: 'payouts',
     outputs: [{
       role: 'provider',
-      provider: FIAT_PROVIDER,
+      provider,
       payout_revision: FIAT_PAYOUT_REVISION,
-      to: 'acct_provider',
+      to: `acct_provider_${epoch}`,
       liability_au: '100',
       paid_au: '100',
       dust_au: '0',
-      source_currency: 'usd',
+      source_currency: currency,
       source_amount_minor: '1',
-      destination_currency: 'usd',
+      destination_currency: currency,
       destination_amount_min_minor: '1',
       destination_amount_max_minor: '1',
       economic_op_id: economicOpId,
@@ -605,20 +606,20 @@ function writeV17FiatFixtures(root) {
   const planRecord = {
     type: 'targeted_payout_epoch_plan',
     rail: 'fiat',
-    epoch: 7,
+    epoch,
     plan_root: planRoot,
     value: clone(plan),
   };
   const outputSettlement = {
     type: 'targeted_fiat_output_settlement',
     rail: 'fiat',
-    epoch: 7,
+    epoch,
     economic_op_id: economicOpId,
     value: {
       op: 'settle_targeted_fiat_output',
       rail: 'fiat',
-      epoch: 7,
-      epoch_apply_hash: APPLY_HASH,
+      epoch,
+      epoch_apply_hash: applyHash,
       plan_root: planRoot,
       economic_op_id: economicOpId,
       output_index: 0,
@@ -628,7 +629,7 @@ function writeV17FiatFixtures(root) {
   const close = {
     type: 'targeted_payout_epoch_close',
     rail: 'fiat',
-    epoch: 7,
+    epoch,
     plan_root: planRoot,
     outcome: 'payouts',
     output_count: 1,
@@ -638,8 +639,8 @@ function writeV17FiatFixtures(root) {
     value: {
       op: 'close_targeted_payout_epoch',
       rail: 'fiat',
-      epoch: 7,
-      epoch_apply_hash: APPLY_HASH,
+      epoch,
+      epoch_apply_hash: applyHash,
       plan_root: planRoot,
     },
   };
@@ -650,7 +651,7 @@ function writeV17FiatFixtures(root) {
     already_settled: null,
     no_work: settlement.outcome === 'no_work',
     carry_forward: settlement.outcome === 'carry',
-    epoch: 7,
+    epoch,
     settlement,
     feature: result?.plan ?? null,
     feature_result: result,
@@ -671,7 +672,7 @@ function writeV17FiatFixtures(root) {
     pending: true,
     pending_outputs: [{
       economic_op_id: economicOpId, output_index: 0, reason: 'waiting_for_funds',
-      funding: { currency: 'usd', required_minor: '1', available_minor: '-2',
+      funding: { currency, required_minor: '1', available_minor: '-2',
         pending_minor: '5', shortfall_minor: '3', sufficient: false },
     }],
   };
@@ -710,7 +711,7 @@ function writeV17FiatFixtures(root) {
   const carryPlan = clone(emptyPlan);
   carryPlan.outcome = 'carry';
   carryPlan.carry = [{
-    provider: FIAT_PROVIDER,
+    provider,
     payout_revision: FIAT_PAYOUT_REVISION,
     liability_au: '50',
     held_au: '0',
@@ -737,7 +738,7 @@ function writeV17FiatFixtures(root) {
     },
   };
   const carrySkipped = [{
-    provider: FIAT_PROVIDER,
+    provider,
     payout_revision: FIAT_PAYOUT_REVISION,
     au: '50',
     payout_min_au: '100',
@@ -755,15 +756,15 @@ function writeV17FiatFixtures(root) {
 
   const blocking = report(emptyPlan, false);
   blocking.skipped_providers = [{
-    provider: FIAT_PROVIDER,
+    provider,
     payout_revision: FIAT_PAYOUT_REVISION,
     au: '100',
     reason: 'payout target unavailable',
     blocking: true,
   }];
   const stale = report(clone(plan), false);
-  stale.epoch = 6;
-  stale.settlement.epoch = 6;
+  stale.epoch = epoch - 1;
+  stale.settlement.epoch = epoch - 1;
 
   const variants = {
     final: finalReport,
@@ -795,27 +796,28 @@ function writeV17FiatFixtures(root) {
   return fixtureDir;
 }
 
-function writeV17TnkFixtures(root) {
+function writeV17TnkFixtures(root, epoch = 7, applyHash = APPLY_HASH) {
   const fixtureDir = path.join(root, 'tnk-v17-fixtures');
   fs.mkdirSync(fixtureDir, { recursive: true });
-  const economicOpId = 'c'.repeat(64);
-  const outputsRoot = 'd'.repeat(64);
+  const provider = sha256(`tnk-provider-${epoch}`);
+  const economicOpId = sha256(`tnk-output-${epoch}`);
+  const outputsRoot = sha256(economicOpId);
   const carryRoot = 'e'.repeat(64);
-  const planRoot = 'f'.repeat(64);
+  const planRoot = sha256(`tnk-plan-${epoch}`);
   const plan = {
     op: 'prepare_targeted_payout_epoch',
     contract_version: 17,
     rail: 'tnk',
-    epoch: 7,
+    epoch,
     at: 1000,
-    epoch_apply_hash: APPLY_HASH,
+    epoch_apply_hash: applyHash,
     snapshot_signed_length: 44,
     outcome: 'payouts',
     outputs: [{
       role: 'provider',
-      provider: '8'.repeat(64),
+      provider,
       payout_revision: '9'.repeat(64),
-      to: 'trac1provider',
+      to: `trac1provider${epoch}`,
       liability_au: '10',
       paid_au: '10',
       economic_op_id: economicOpId,
@@ -831,20 +833,20 @@ function writeV17TnkFixtures(root) {
   const planRecord = {
     type: 'targeted_payout_epoch_plan',
     rail: 'tnk',
-    epoch: 7,
+    epoch,
     plan_root: planRoot,
     value: clone(plan),
   };
   const outputSettlement = {
     type: 'targeted_tnk_output_settlement',
     rail: 'tnk',
-    epoch: 7,
+    epoch,
     economic_op_id: economicOpId,
     value: {
       op: 'settle_targeted_tnk_output',
       rail: 'tnk',
-      epoch: 7,
-      epoch_apply_hash: APPLY_HASH,
+      epoch,
+      epoch_apply_hash: applyHash,
       plan_root: planRoot,
       economic_op_id: economicOpId,
       output_index: 0,
@@ -853,7 +855,7 @@ function writeV17TnkFixtures(root) {
   const close = {
     type: 'targeted_payout_epoch_close',
     rail: 'tnk',
-    epoch: 7,
+    epoch,
     plan_root: planRoot,
     outcome: 'payouts',
     output_count: 1,
@@ -863,8 +865,8 @@ function writeV17TnkFixtures(root) {
     value: {
       op: 'close_targeted_payout_epoch',
       rail: 'tnk',
-      epoch: 7,
-      epoch_apply_hash: APPLY_HASH,
+      epoch,
+      epoch_apply_hash: applyHash,
       plan_root: planRoot,
     },
   };
@@ -874,7 +876,7 @@ function writeV17TnkFixtures(root) {
     already_settled: null,
     no_work: settlement.outputs.length === 0,
     carry_forward: settlement.outputs.length === 0,
-    epoch: 7,
+    epoch,
     settlement,
     feature: result?.plan ?? null,
     feature_result: result,
@@ -915,7 +917,7 @@ function writeV17TnkFixtures(root) {
   const carryPlan = clone(emptyPlan);
   carryPlan.outcome = 'carry';
   carryPlan.carry = [{
-    provider: '8'.repeat(64),
+    provider,
     payout_revision: '9'.repeat(64),
     liability_au: '50',
     held_au: '0',
@@ -934,7 +936,7 @@ function writeV17TnkFixtures(root) {
     value: { ...emptyClose.value, plan_root: carryPlan.plan_root },
   };
   const carrySkipped = [{
-    provider: '8'.repeat(64),
+    provider,
     payout_revision: '9'.repeat(64),
     au: '50',
     payout_min_au: '100',
@@ -975,7 +977,7 @@ function writeV17TnkFixtures(root) {
   return fixtureDir;
 }
 
-function harness({ bundle = true, emptySeal = !bundle } = {}) {
+function harness({ bundle = true, emptySeal = !bundle, offlineTap = process.env.MAYHEM_TEST_OFFLINE_TAP === '1' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-payout-worker-'));
   const state = path.join(root, 'settlement');
   const spool = path.join(state, 'tap');
@@ -1016,6 +1018,8 @@ if [[ "$*" == *"prefix=payout/liability/tnk/"* && "\${MOCK_TNK_OUTSTANDING:-0}" 
   printf '%s\\n' '{"values":[{"key":"payout/liability/tnk/provider/revision","value":{"total_au":"10","paid_cum_au":"0"}}]}'
 elif [[ "$*" == *"key=payout/epoch-plan/tnk/"* && -n "\${MOCK_TNK_PLAN_RECORD:-}" ]]; then
   cat "$MOCK_TNK_PLAN_RECORD"
+elif [[ "$*" =~ key=([a-z0-9/-]+)"&confirmed=true" && -f "$MOCK_EXTERNAL_EFFECT_STATE/\${BASH_REMATCH[1]}.json" ]]; then
+  cat "$MOCK_EXTERNAL_EFFECT_STATE/\${BASH_REMATCH[1]}.json"
 elif [[ "$*" =~ key=(payout/epoch-plan/(fiat|tnk)/[0-9]+|settle/targeted/(fiat|tnk)/[0-9]+) ]]; then
   printf '{"key":"%s","confirmed":true,"signed_length":123,"value":null}\\n' "\${BASH_REMATCH[1]}"
 elif [[ "$*" == *"key=settle/targeted/tap/"* ]]; then
@@ -1081,41 +1085,19 @@ fi
 writeExecutable(path.join(bin, 'mock-mayhem'), `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >>"$MOCK_MAYHEM_LOG"
-record_external_effect() {
-  local rail="$1"
-  mkdir -p "$MOCK_EXTERNAL_EFFECT_STATE"
-  printf '%s\\n' "$rail:canonical-preparation-readback" >>"$MOCK_PAYOUT_EVENT_LOG"
-  if [[ ! -f "$MOCK_EXTERNAL_EFFECT_STATE/$rail.effect" ]]; then
-    printf '%s\\n' "$rail:external-transfer" >>"$MOCK_PAYOUT_EVENT_LOG"
-    : >"$MOCK_EXTERNAL_EFFECT_STATE/$rail.effect"
-    if [[ "\${MOCK_CRASH_AFTER_EXTERNAL_TRANSFER:-}" == "$rail" ]]; then
-      printf '%s\\n' "simulated crash after $rail external transfer" >&2
-      exit 75
-    fi
-  else
-    printf '%s\\n' "$rail:external-transfer-recovered" >>"$MOCK_PAYOUT_EVENT_LOG"
-  fi
-}
 rail="\${2:-}"
-submit=0
 contract_submit=0
 sim=0
 checkpoint_file=""
 previous=""
 for arg in "$@"; do
-  [[ "$arg" == "--submit-transfer" ]] && submit=1
   [[ "$arg" == "--submit" ]] && contract_submit=1
   [[ "$arg" == "--sim" ]] && sim=1
   [[ "$previous" == "--checkpoint-file" ]] && checkpoint_file="$arg"
   previous="$arg"
 done
 if [[ "$rail" == "fiat-settlement" || "$rail" == "tnk-settlement" ]]; then
-  if [[ "$rail" == fiat-settlement ]]; then mode="\${MOCK_FIAT_MODE:-success}"; else mode="\${MOCK_TNK_MODE:-success}"; fi
-  if [[ "$mode" == command_error ]]; then exit 1; fi
-  if (( submit == 1 )) && [[ "$mode" != waiting_for_funds && "$mode" != invalid_funding_wait ]]; then
-    record_external_effect "\${rail%-settlement}"
-  fi
-  python3 "$MAYHEM_SOURCE_DIR/scripts/tests/helpers/payout-cli-modes.py" "$rail" "$mode" "$@"
+  python3 "$MAYHEM_SOURCE_DIR/scripts/tests/helpers/payout-cli-modes.py" "$rail" "$@"
 elif [[ "$rail" == "tap-settlement" ]]; then
   [[ -f "$checkpoint_file" ]] || {
     printf '%s\\n' "missing TAP checkpoint file" >&2
@@ -1295,6 +1277,7 @@ fi
     MOCK_PAYOUT_EVENT_LOG: payoutEventLog,
     MOCK_EXTERNAL_EFFECT_STATE: externalEffectState,
   };
+  if (offlineTap) env.MOCK_OFFLINE_TAP_PROOF = path.join(root, 'tap-proof.json');
   return {
     root,
     state,
@@ -1368,9 +1351,17 @@ after(async () => { await Promise.all([...tapProofWorkers].map(worker => worker.
 
 function startTapProofFixture(ctx, checkpoint) {
   const { state } = pricingFixture(checkpoint.tap_rate_lock);
+  const fixture = { checkpoint, state: Object.fromEntries(state) };
+  const rpc = new URL('./helpers/tap-proof-rpc.mjs', import.meta.url);
+  if (ctx.env.MOCK_OFFLINE_TAP_PROOF) {
+    writeJson(ctx.env.MOCK_OFFLINE_TAP_PROOF, fixture);
+    ctx.env.NODE_OPTIONS = '--import=' + rpc.href;
+    ctx.env.MAYHEM_PAYOUT_TEST_ETH_RPC = 'http://127.0.0.1:1/eth';
+    return;
+  }
   const ready = new Int32Array(new SharedArrayBuffer(4));
-  const worker = new Worker(new URL('./helpers/tap-proof-rpc.mjs', import.meta.url), {
-    workerData: { ready: ready.buffer, checkpoint, state: Object.fromEntries(state) },
+  const worker = new Worker(rpc, {
+    workerData: { ready: ready.buffer, ...fixture },
   });
   tapProofWorkers.add(worker);
   assert.notEqual(Atomics.wait(ready, 0, 0, 8000), 'timed-out');
@@ -1595,6 +1586,147 @@ test('payout worker isolates TAP spool work and replays all rails idempotently',
     TAP_EXECUTION_TX
   );
   assert.deepEqual(fs.readdirSync(path.join(ctx.spool, 'ready')), []);
+});
+
+test('multiple open epochs settle later FIAT, TNK and TAP payouts before recovering old outputs', (t) => {
+  const ctx = harness({ offlineTap: true });
+  t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+  const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
+  const hashes = { 6: '6'.repeat(64), 7: APPLY_HASH, 8: NEXT_APPLY_HASH };
+  const work = (epoch, name) => path.join(ctx.state, 'payout', `epoch-${epoch}-${hashes[epoch]}`, name);
+  const state = key => path.join(ctx.externalEffectState, key + '.json');
+  const rails = ['fiat', 'tnk'];
+  const heads = { 7: read(ctx.applyState) }; // The existing receipt bundle includes TAP.
+  for (const epoch of [6, 8]) {
+    const root = path.join(ctx.root, `fixtures-${epoch}`);
+    // The old EUR shortfall leaves independent USD payouts eligible.
+    const currency = epoch === 6 ? 'eur' : 'usd';
+    ctx.env[`MOCK_FIAT_FIXTURES_${epoch}`] = writeV17FiatFixtures(root, epoch, hashes[epoch], currency);
+    ctx.env[`MOCK_TNK_FIXTURES_${epoch}`] = writeV17TnkFixtures(root, epoch, hashes[epoch]);
+    const settlement = epoch === 6 ? 800 : 1000;
+    heads[epoch] = { key: 'epoch/apply/state', confirmed: true, value: { updated_epoch: epoch,
+      pending_epoch: null, last_apply_hash: hashes[epoch], last_settlement_unix: settlement } };
+    const records = {
+      [`epoch/apply-anchor/${epoch}`]: { type: 'epoch_apply_anchor', epoch, apply_hash: hashes[epoch],
+        settlement_unix: settlement, applied_at: EPOCH_APPLIED_AT },
+      [`epoch/seal/${epoch}`]: { type: 'epoch_empty_seal', epoch, seal_hash: hashes[epoch],
+        totals: { debited_au: '0', earned_au: '0', fee_au: '0', burn_au: '0' } },
+    };
+    for (const [key, value] of Object.entries(records)) {
+      fs.mkdirSync(path.dirname(state(key)), { recursive: true });
+      writeJson(state(key), { key, value, confirmed: true, signed_length: 123 });
+    }
+  }
+
+  function expected(rail, epoch) {
+    const fixtures = 'MOCK_' + rail.toUpperCase() + '_FIXTURES';
+    return read(path.join(ctx.env[`${fixtures}_${epoch}`] ?? ctx.env[fixtures], 'final.json'));
+  }
+  function assertUnpaid(rail, epoch, reason) {
+    const { settlement, feature } = expected(rail, epoch);
+    const op = settlement.outputs[0].economic_op_id;
+    const journal = reason === 'waiting_for_funds' ? 'pending' : 'reconciliation-needed';
+    const pending = read(work(epoch, `${rail}-${journal}.json`));
+    assert.deepEqual(read(state(`payout/epoch-plan/${rail}/${epoch}`)).value, feature);
+    assert.equal(pending.plan_root, settlement.plan_root);
+    assert.deepEqual(pending.pending_outputs.map(row => [row.economic_op_id, row.reason]), [[op, reason]]);
+    assert.equal(fs.existsSync(state(`settle/targeted/${rail}/${epoch}/output/${op}`)), false);
+    assert.equal(fs.existsSync(state(`settle/targeted/${rail}/${epoch}`)), false);
+    assert.equal(fs.existsSync(work(epoch, rail + '.complete')), false);
+  }
+  function assertPaid(rail, epoch) {
+    const { settlement, feature_result } = expected(rail, epoch);
+    const [output] = settlement.outputs;
+    const key = `settle/targeted/${rail}/${epoch}`;
+    assert.deepEqual(read(state(`effect/${rail}/${output.economic_op_id}`)), output);
+    const receipt = read(state(`${key}/output/${output.economic_op_id}`));
+    assert.equal(receipt.confirmed, true);
+    assert.deepEqual(receipt.value, feature_result.outputs[0]);
+    const marker = read(work(epoch, rail + '.complete'));
+    assert.equal(marker.status, 'settled');
+    const evidence = read(marker.evidence);
+    assert.deepEqual(evidence.settlement, settlement);
+    assert.deepEqual(evidence.already_settled, feature_result.close);
+    assert.deepEqual(read(state(key)).value, feature_result.close);
+  }
+
+  const blocked = { MOCK_FIAT_MODE_6: 'waiting_for_funds', MOCK_TNK_MODE_6: 'needs_reconciliation' };
+  writeJson(ctx.applyState, heads[6]);
+  const first = runWorker(ctx, blocked);
+  assert.equal(first.status, 1, first.stderr);
+  assertUnpaid('fiat', 6, 'waiting_for_funds');
+  assertUnpaid('tnk', 6, 'needs_reconciliation');
+  assert.deepEqual(payoutEventLines(ctx), []);
+
+  writeJson(ctx.applyState, heads[7]);
+  const next = runWorker(ctx, { ...blocked, MOCK_FIAT_MODE_7: 'waiting_for_funds',
+    MOCK_TNK_MODE_7: 'needs_reconciliation' });
+  assert.equal(next.status, 1, next.stderr);
+  assertUnpaid('fiat', 7, 'waiting_for_funds');
+  assertUnpaid('tnk', 7, 'needs_reconciliation');
+  assert.deepEqual(payoutEventLines(ctx), []);
+
+  // The roller hands back a processed report. Its Core and Ethereum reads
+  // use the existing evidence fixture through an in-process fetch double.
+  const bundle = `epoch-7-${APPLY_HASH}.receipts.json`;
+  fs.renameSync(path.join(ctx.spool, 'ready', bundle), path.join(ctx.spool, 'processed', bundle));
+  writeTapReport(ctx, bundle);
+  writeJson(ctx.tapLiabilityState, { provider: TAP_PROVIDER, payout_revision: TAP_PAYOUT_REVISION,
+    total_au: '20', paid_cum_au: '0' });
+
+  writeJson(ctx.applyState, heads[8]);
+  const [interruptedOutput] = expected('fiat', 7).settlement.outputs;
+  const op = interruptedOutput.economic_op_id;
+  const killed = spawnSync('bash', ['-c', 'export MOCK_PAYOUT_TEST_GROUP=$$; exec bash "$1"', 'test', SCRIPT], {
+    cwd: ROOT, detached: true, encoding: 'utf8',
+    env: { ...ctx.env, ...blocked, MOCK_INTERRUPT_AFTER_OP: op },
+  });
+  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  assert.deepEqual(read(state(`effect/fiat/${op}`)), interruptedOutput);
+  assert.equal(fs.existsSync(state(`settle/targeted/fiat/7/output/${op}`)), false);
+  assert.equal(fs.existsSync(work(7, 'fiat.complete')), false);
+  assert.deepEqual(payoutEventLines(ctx), ['fiat:canonical-preparation-readback', 'fiat:external-transfer']);
+
+  const progress = runWorker(ctx, blocked);
+  assert.equal(progress.status, 1, progress.stderr);
+  assert.match(progress.stderr, /retained tnk payout attempt failed for epoch 6/);
+  for (const rail of rails) {
+    assertPaid(rail, 7); // Selected from the historical queue alongside epoch 6.
+    assertPaid(rail, 8); // Current work also ran.
+    const old = expected(rail, 6).settlement.outputs[0];
+    assert.equal(fs.existsSync(state(`effect/${rail}/${old.economic_op_id}`)), false);
+  }
+  assertUnpaid('fiat', 6, 'waiting_for_funds');
+  assertUnpaid('tnk', 6, 'needs_reconciliation');
+  assert.equal(read(work(7, 'tap.complete')).status, 'settled');
+  const tap = read(ctx.tapSettlementState);
+  assert.equal(tap.key, 'settle/targeted/tap/7');
+  assert.equal(tap.confirmed, true);
+  assert.equal(tap.value.execution_tx, TAP_EXECUTION_TX);
+  assert.equal(read(ctx.tapLiabilityState).paid_cum_au, '10');
+  assert.equal(read(work(8, 'complete')).epoch, 8);
+
+  // Only the two old failures clear. The timer still sees epoch 8.
+  const priorCalls = logLines(ctx).length;
+  const recovered = runWorker(ctx);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  for (const rail of rails) {
+    assertPaid(rail, 6);
+    const events = payoutEventLines(ctx).filter(event => event === rail + ':external-transfer');
+    assert.equal(events.length, 3); // One per distinct economic operation.
+  }
+  assert.equal(payoutEventLines(ctx).filter(event => event === 'fiat:external-transfer-recovered').length, 1);
+  const calls = logLines(ctx);
+  const dispatches = calls.slice(priorCalls).filter(line => line.includes('--output-id'));
+  const selected = dispatches.map(line => line.match(/--output-id (\S+)/)[1]);
+  const oldIds = rails.map(rail => expected(rail, 6).settlement.outputs[0].economic_op_id);
+  assert.deepEqual(selected.sort(), oldIds.sort());
+  assert.equal(read(work(6, 'summary.json')).complete, true);
+  assert.equal(calls.filter(line => line.startsWith('admin tap-settlement') && !line.includes('--sim')).length, 1);
+  const replay = runWorker(ctx);
+  assert.equal(replay.status, 0, replay.stderr);
+  assert.deepEqual(logLines(ctx), calls);
+  assert.equal(read(ctx.tapLiabilityState).paid_cum_au, '10');
 });
 
 test('ambiguous prior-epoch TAP payout reconciles before current remaining liability', (t) => {
