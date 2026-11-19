@@ -131,10 +131,6 @@ poll_again() {
 retry_draft() {
   if jq -e 'has("tap_liability_sweep")' "$bundle" >/dev/null; then
     touch "$working/$name.draft-retry"
-    if [[ -f "$rate_lock" && ! -e "$working/$name.prepare-intent.json" ]]; then
-      timeout "$attempt_timeout" node "$repo/contracts/scripts/tap-draft-recovery.mjs" \
-        reprice "$spool" "$name" "$peer_rpc" || :
-    fi
   fi
   poll_again
 }

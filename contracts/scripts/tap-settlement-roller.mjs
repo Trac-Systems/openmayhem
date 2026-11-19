@@ -9,7 +9,7 @@ import { ethers } from 'ethers';
 import { distribution } from './merkle.mjs';
 import { signRootProposal } from './pool-governance.mjs';
 import { safeErrorMessage } from './safe-output.mjs';
-import { holdTapLock, journalTapPreparation } from './tap-draft-files.mjs';
+import { durableWrite, holdTapLock, journalTapPreparation } from './tap-draft-files.mjs';
 import { MAINNET_POOL, preflightTapSweepPreparations, tapContractAt, validTapSweepPointer } from './tap-liability-sweep.mjs';
 import { tapRootEventReader } from './tap-root-events.mjs';
 import {
@@ -3798,18 +3798,10 @@ export function validateTapRateLock(lock, bundle, paymentScope) {
 
 function createRateLockFile(lockPath, lock) {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-  const tempPath = `${lockPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(lock, null, 2)}\n`, {
-    encoding: 'utf8',
-    flag: 'wx',
-    mode: 0o600,
-  });
   try {
-    fs.linkSync(tempPath, lockPath);
+    durableWrite(lockPath, lock, false);
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
-  } finally {
-    fs.rmSync(tempPath, { force: true });
   }
 }
 
@@ -3915,11 +3907,19 @@ async function main() {
       throw new Error(`--${key} is not supported; TAP epoch policy comes from active admin ledger state`);
     }
   }
-  const buyerAccountsPath = args['buyer-accounts'];
+  const buyerAccountsPath = args['buyer-accounts'] || (journal && fs.existsSync(journal + '.buyers.json') ? journal + '.buyers.json' : undefined);
+  const tapRateLockPath = args['tap-rate-lock'] || (journal && journal + '.tap-rate.json');
+  const managedLatest = spool && path.resolve(spool, 'processed/latest.json');
+  const priorPath = args.prior || (managedLatest && fs.existsSync(managedLatest) ? managedLatest : undefined);
+  if (journal && (path.resolve(tapRateLockPath) !== journal + '.tap-rate.json' ||
+      (buyerAccountsPath && path.resolve(buyerAccountsPath) !== journal + '.buyers.json') ||
+      (priorPath && path.resolve(priorPath) !== managedLatest) || (args['event-cursor-file'] &&
+        path.resolve(args['event-cursor-file']) !== journal + '.tap-rate.json.events.json'))) {
+    throw new Error('TAP managed attempt requires its canonical financial evidence paths');
+  }
   const buyerAccounts = buyerAccountsPath
     ? readJson(path.resolve(buyerAccountsPath), 'buyer accounts')
     : {};
-  const priorPath = args.prior;
   const prior = priorPath ? readJson(path.resolve(priorPath), 'prior settlement') : null;
   const peerRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC;
@@ -3930,8 +3930,7 @@ async function main() {
     bundle,
     peerRpcUrl,
   });
-  const tapRateLockPath = args['tap-rate-lock'];
-  const tapRateLock = await resolveTapSettlementRate({
+  let tapRateLock = await resolveTapSettlementRate({
     bundle,
     tapRateLockPath,
     peerRpcUrl,
@@ -3939,7 +3938,6 @@ async function main() {
   if (normalizeAddress(poolAddress, 'TAP pool address') !== tapRateLock.pool_address) {
     throw new Error('Configured TAP pool does not match the canonical payment pool');
   }
-  const tapUsdAu = tapRateLock.tap_usd_au;
   const snapshotAt = await resolveTapSnapshotAt(bundle, peerRpcUrl);
   const epochPolicy = await resolveTapSettlementEpochPolicy({
     peerRpcUrl, at: snapshotAt, signedLength: sweepPointer?.signed_length,
@@ -3980,6 +3978,13 @@ async function main() {
   if (confirm) {
     preparationAdminSigner = await tapPreparationAdminSignerFromEnv();
   }
+  if (!confirm && journal && sweepPointer && pool &&
+      fs.existsSync(journal + '.draft-retry') && !fs.existsSync(journal + '.prepare-intent.json')) {
+    const { recoverDraft } = await import('./tap-draft-recovery.mjs');
+    const changed = await recoverDraft({ action: 'reprice', spool, name: path.basename(journal),
+      peerRpcUrl, pool, loadedBundle: bundle }).catch(() => false);
+    if (changed) tapRateLock = await resolveTapSettlementRate({ bundle, tapRateLockPath, peerRpcUrl });
+  }
 
   const eventEpoch = parsePositiveInt(bundle.epoch ?? bundle.settlement_epoch, 'TAP event epoch');
   if (args.epoch && parsePositiveInt(args.epoch, '--epoch') !== eventEpoch) {
@@ -4008,7 +4013,7 @@ async function main() {
     payoutMinAu: payoutMinimum.value,
     buyerAccounts,
     prior,
-    tapUsdAu,
+    tapUsdAu: tapRateLock.tap_usd_au,
     ledgerFeeBps,
     settleThroughEpoch: epochPolicy.settleThroughEpoch,
     challengeEpochs: epochPolicy.challengeEpochs,

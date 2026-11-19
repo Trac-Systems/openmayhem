@@ -9,7 +9,7 @@ import { ZeroHash } from 'ethers';
 import { advanceSweep, loadCursor, prepareSweep, validateQueuedSweep } from '../scripts/prepare-tap-sweep-bundle.mjs';
 import { digest, handoffFile, journalTapPreparation, nextRefunds } from '../scripts/tap-draft-files.mjs';
 import { recoverDraft } from '../scripts/tap-draft-recovery.mjs';
-import { confirmedTapContract, preflightTapSweepPreparations } from '../scripts/tap-liability-sweep.mjs';
+import { confirmedTapContract, preflightTapSweepPreparations, verifyPriorTapClaims } from '../scripts/tap-liability-sweep.mjs';
 import { buildCanonicalTapPreparationPlan, guardianPreSignReport, projectTapRefunds, rollTapSettlement,
   tapRateRecordToLock } from '../scripts/tap-settlement-roller.mjs';
 import { distribution } from '../scripts/merkle.mjs';
@@ -230,7 +230,8 @@ for (const version of [1, 2]) {
     const marker = path.join(payable.dir, 'tap.complete.tmp');
     const plan = await buildCanonicalTapPreparationPlan({ settlement: report, bundle: payable.bundle,
       epoch: 6, epochApplyHash: hash(6), tapRateLock: payable.lock });
-    const cp = { ...plan.intent, root_confirmed: true, execution_tx: '0x' + hash(76) };
+    const cp = { ...plan.intent, root_preparation_id: plan.root_preparation_id, root_confirmed: true,
+      proposal_tx: '0x' + hash(75), execution_tx: '0x' + hash(76) };
     const settled = { ...report, root_confirmed: true, tap_settlement_checkpoint: cp,
       operator_fee: { completed: true }, burn: { completed: true } };
     const commit = refunds => {
@@ -256,12 +257,24 @@ for (const version of [1, 2]) {
     await assert.rejects(preflightTapSweepPreparations(plan, payable.peerRpcUrl, payable.fetchImpl, prior), /watermark/);
     write(path.join(f.spool, 'processed/latest.json'), settled);
     f.state.set('settle/targeted/tap/6', { ...cp, type: 'targeted_tap_settlement', settled_by: admin, settled_by_role: 'admin' });
+    f.state.set('payout/preparation/tap/' + cp.root_preparation_id, { ...plan.preparations.at(-1),
+      type: 'targeted_payout_preparation', rail: 'tap', epoch: 6, epoch_apply_hash: hash(6),
+      consumed: true, consumed_by: 'settle/targeted/tap/6' });
+    f.state.set('rail/seen/tap-settlement-root/1/' + scope.pool_address + '/' + cp.root, {
+      rail: 'tap', purpose: 'targeted_settlement', epoch: 6, epoch_apply_hash: hash(6), root: cp.root,
+      proposal_tx: cp.proposal_tx, execution_tx: cp.execution_tx });
     f.state.set('settle/targeted/tap/state/1/' + scope.pool_address, { ...scope, type: 'targeted_tap_settlement_state',
       last_epoch: 6, last_root: cp.root, last_execution_tx: cp.execution_tx, cumulative_spent_wei: '12',
       cumulative_provider_claimed_wei: '9', cumulative_buyer_refund_wei: '7' });
     Object.assign(f.pool, { epoch: async () => 6n, cumulativeSpent: async () => 12n,
       merkleRoot: async () => report.root, maxEpochDelta: async () => 100n });
     f.epoch(7);
+    const swapped = read(path.join(f.spool, 'processed/latest.json'));
+    swapped.providers = [settled.providers[0], { account: addr(3), cumulative_wei: '1' }, { account: addr(4), cumulative_wei: '2' }];
+    swapped.refunds = [{ account: addr(3), cumulative_wei: '6' }, { account: addr(4), cumulative_wei: '1' }];
+    Object.assign(swapped.tap_settlement_checkpoint, { provider_entries: swapped.providers, refunds: swapped.refunds });
+    await assert.rejects(verifyPriorTapClaims(await confirmedTapContract(payable.peerRpcUrl, payable.fetchImpl), swapped),
+      /claim distribution/); // identical account totals and root, different owners of the refund
     const next = await f.freeze(7);
     assert.equal(next.bundle.tap_carried_refunds, undefined);
     assert.equal(next.bundle.tap_liability_sweep.after, null); // unpaid first row is revisited
@@ -459,6 +472,9 @@ test('a historical failed bundle keeps every refund in bounded slices and honors
   fs.renameSync(work.file, failed);
   const incomplete = read(failed);
   delete incomplete.params.fee_bps;
+  // Recovery streams historical receipt data without charging it against
+  // the bounded financial header or treating an unread receipt as a payment.
+  incomplete.receipts = [{ retained: 'x'.repeat(17 * 1024 * 1024) }];
   write(failed, incomplete);
   const marker = path.join(work.dir, 'tap.produced');
   write(marker, { ...read(marker), evidence_sha256: digest(fs.readFileSync(failed)) });

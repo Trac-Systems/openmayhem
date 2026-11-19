@@ -338,18 +338,45 @@ export async function resolveTapLiabilitySweep({
   };
 }
 
+export async function verifyPriorTapClaims(current, prior) {
+  const cp = prior.tap_settlement_checkpoint;
+  const key = 'settle/targeted/tap/' + prior.epoch;
+  requireState(cp?.epoch === prior.epoch && cp.epoch_apply_hash === prior.epoch_apply_hash && cp.root === prior.root &&
+    cp.root_confirmed === true && cp.cumulative_spent_wei === prior.cumulative_spent_wei &&
+    [prior.providers, prior.entries, prior.refunds].every(Array.isArray) &&
+    isDeepStrictEqual(cp.provider_entries, prior.providers) && isDeepStrictEqual(cp.entries, prior.entries) &&
+    isDeepStrictEqual(cp.refunds, prior.refunds), 'Conflicting TAP predecessor distribution');
+  if (cp.root_preparation_id !== undefined || prior.root_preparation_id !== undefined) {
+    // The consumed root preparation already commits the complete lists. The
+    // amount of Core data fetched stays bounded as unclaimed leaves accumulate.
+    const id = cp.root_preparation_id;
+    requireState(hex32(id) && (prior.root_preparation_id === undefined || id === prior.root_preparation_id) &&
+      /^0x[0-9a-f]{64}$/.test(cp.proposal_tx) && /^0x[0-9a-f]{64}$/.test(cp.execution_tx) &&
+      cp.proposal_tx !== cp.execution_tx, 'Conflicting TAP predecessor preparation');
+    const record = await current.get(current.payoutPreparationRecordKey('tap', id));
+    const seen = await current.get('rail/seen/tap-settlement-root/' + cp.chain_id + '/' + cp.pool_address + '/' + cp.root);
+    requireState(record?.type === 'targeted_payout_preparation' && record.kind === 'tap_root' && record.rail === 'tap' &&
+      record.economic_op_id === id && record.epoch === cp.epoch && record.epoch_apply_hash === cp.epoch_apply_hash &&
+      record.consumed === true && record.consumed_by === key &&
+      seen?.rail === 'tap' && seen.purpose === 'targeted_settlement' && seen.epoch === cp.epoch &&
+      seen.epoch_apply_hash === cp.epoch_apply_hash && seen.root === cp.root &&
+      seen.proposal_tx === cp.proposal_tx && seen.execution_tx === cp.execution_tx,
+    'Missing consumed TAP predecessor preparation or execution');
+    const payload = await current.payoutPreparationTapRootPayload(cp, { ...cp, rate_lock: cp.tap_rate_lock });
+    requireState(isDeepStrictEqual(record.payload, payload), 'TAP prior claim distribution differs from confirmed Core');
+  } else {
+    const record = await current.get(key);
+    requireState(record?.type === 'targeted_tap_settlement' && record.settled_by_role === 'admin' &&
+      hex32(record.settled_by) && Object.entries(cp).every(([k,v]) => isDeepStrictEqual(record[k], v)),
+    'TAP prior claim distribution differs from confirmed Core');
+  }
+}
+
 // Rehearse the complete ordered plan at a fresh confirmed Core checkout before
 // reserving its first provider. A frozen page can outlive its original budget.
 export async function preflightTapSweepPreparations(plan, peerRpcUrl, fetchImpl, prior, verifyExisting) {
   const current = await confirmedTapContract(peerRpcUrl, fetchImpl);
-  if (prior?.root) {
-    const record = await current.get('settle/targeted/tap/' + prior.epoch);
-    requireState(record?.type === 'targeted_tap_settlement' && record.epoch === prior.epoch &&
-      record.epoch_apply_hash === prior.epoch_apply_hash && record.root_confirmed === true &&
-      record.root === prior.root && record.cumulative_spent_wei === prior.cumulative_spent_wei &&
-      isDeepStrictEqual(record.entries, prior.entries) && isDeepStrictEqual(record.provider_entries, prior.providers) &&
-      isDeepStrictEqual(record.refunds, prior.refunds), 'TAP prior claim distribution differs from confirmed Core');
-  }
+  if (prior?.root) await verifyPriorTapClaims(current, prior);
   const staged = new Map();
   const view = Object.assign(Object.create(current), {
     get: key => staged.has(key) ? staged.get(key) : current.get(key),

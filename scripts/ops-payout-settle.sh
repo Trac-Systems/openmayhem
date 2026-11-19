@@ -683,11 +683,15 @@ else:
         prefix = os.path.join(tap_spool, "deferred", f"epoch-{expected_epoch}-{expected_hash}")
         cert = json.load(open(evidence))
         produced = json.load(open(os.path.join(os.path.dirname(path), "tap.produced")))
+        archived = hashlib.sha256()
+        with open(prefix + ".receipts.json", "rb") as source:
+            for block in iter(lambda: source.read(65536), b""):
+                archived.update(block)
         if (os.path.abspath(evidence) != os.path.abspath(prefix + ".draft.json")
             or cert.get("type") != "unprepared_tap_sweep" or cert.get("epoch") != int(expected_epoch)
             or cert.get("epoch_apply_hash") != expected_hash or cert.get("at") != int(expected_settlement_unix)
             or cert.get("bundle_sha256") != produced.get("evidence_sha256")
-            or hashlib.sha256(open(prefix + ".receipts.json", "rb").read()).hexdigest() != cert["bundle_sha256"]):
+            or archived.hexdigest() != cert["bundle_sha256"]):
             raise SystemExit("TAP supersession lacks its original unpaid draft")
 PY
 }

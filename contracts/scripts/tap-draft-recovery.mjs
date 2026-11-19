@@ -5,11 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Contract, FetchRequest, JsonRpcProvider, ZeroHash } from 'ethers';
-import { confirmedTapContract, MAINNET_POOL as POOL, MAINNET_TOKEN as TOKEN, tapDraftWatermarks } from './tap-liability-sweep.mjs';
+import { confirmedTapContract, MAINNET_POOL as POOL, MAINNET_TOKEN as TOKEN, tapDraftWatermarks, verifyPriorTapClaims } from './tap-liability-sweep.mjs';
 import { canonicalTapPaymentScope, POOL_SETTLEMENT_ABI, tapRateRecordToLock, transferableTapRefunds,
   validateTapRateLock } from './tap-settlement-roller.mjs';
 import { loadCursor, validateIntent } from './prepare-tap-sweep-bundle.mjs';
-import { digest, durableWrite, handoffFile, holdTapLock, readDraftFile, readHandoff, refundQueue, refundSourceFile, syncDirectory } from './tap-draft-files.mjs';
+import { digest, digestFile, durableWrite, handoffFile, holdTapLock, readDraftFile, readDraftHeader, readHandoff, refundQueue, refundSourceFile, syncDirectory } from './tap-draft-files.mjs';
 
 const hash = s => typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
 const evmHash = s => typeof s === 'string' && /^0x[0-9a-f]{64}$/.test(s);
@@ -79,7 +79,10 @@ export async function proveUnpreparedTapDraft({ bundle, peerRpcUrl, fetchImpl = 
       lock.paid_cum_au_before === before, 'Ambiguous TAP liability lock');
     const prep = await preparationBeforeDraft(lock.economic_op_id);
     assert(prep.liability?.provider === provider && prep.liability.payout_revision === revision &&
-      prep.liability.paid_cum_au_before === before, 'Inconsistent TAP liability lock');
+      prep.liability.paid_cum_au_before === before && typeof prep.liability.paid_au === 'string' &&
+      /^[1-9][0-9]*$/.test(prep.liability.paid_au) && (prep.consumed ?
+        BigInt(current.paid_cum_au) >= BigInt(before) + BigInt(prep.liability.paid_au) : current.paid_cum_au === before),
+    'Inconsistent TAP liability lock');
   }
   for (const provider of new Set(page.rows.map(row => row.provider))) {
     const earning = await contract.get(contract.earningKey(provider, 'tap'));
@@ -131,13 +134,7 @@ export async function proveUnpreparedTapDraft({ bundle, peerRpcUrl, fetchImpl = 
       cp.root === basis.root && cp.cumulative_spent_wei === basis.spent && prior.root_confirmed === true &&
       prior.epoch === cp.epoch && prior.root === cp.root && prior.cumulative_spent_wei === basis.spent &&
       prior.operator_fee?.completed === true && prior.burn?.completed === true, 'Conflicting TAP cumulative predecessor');
-    const retained = await contract.get('settle/targeted/tap/' + basis.epoch);
-    assert(retained?.type === 'targeted_tap_settlement' && retained.settled_by === admin &&
-      retained.settled_by_role === 'admin' && retained.root === cp.root, 'Missing TAP predecessor reconciliation');
-    for (const [key,value] of Object.entries(cp)) assert.deepEqual(retained[key], value, 'Conflicting TAP predecessor ' + key);
-    assert.deepEqual(prior.providers, cp.provider_entries, 'Conflicting TAP predecessor provider claims');
-    assert.deepEqual(prior.refunds, cp.refunds, 'Conflicting TAP predecessor refund claims');
-    assert.deepEqual(prior.entries, cp.entries, 'Conflicting TAP predecessor distribution');
+    await verifyPriorTapClaims(contract, prior);
   }
   return { contract, scope, basis, page };
 }
@@ -150,17 +147,20 @@ function assertLocalDraft(prefix, processedPrefix) {
   }
   assert(!exists(processedPrefix + '.settlement.json'), 'TAP settlement publication already started');
   const reports = [];
+  const phase = ['posted', 'root_confirmed', 'root_already_posted', 'root_pending', 'root_proposed',
+    'awaiting_finality', 'awaiting_governance_delay', 'canonical_preparation_confirmed'];
+  const effects = ['proposal_tx', 'execution_tx', 'pending_root', 'root_confirmation', 'tap_settlement_checkpoint'];
   for (const ext of ['.dry-run.json', '.confirmation.json', '.draft-plan.json']) {
     if (!exists(prefix + ext)) continue;
-    const bytes = readDraftFile(prefix + ext).toString().trim();
-    if (!bytes) continue;
-    const report = JSON.parse(bytes);
+    const report = readDraftHeader(prefix + ext, [...phase, ...effects, 'operator_fee', 'burn',
+      'root_preparation_id', 'preparation_ids', 'external_effect_ids']);
+    if (report === null) {
+      assert(fs.statSync(prefix + ext).size === 0, 'Ambiguous TAP attempt report');
+      continue;
+    }
     reports.push(report);
     assert(report && typeof report === 'object' && !Array.isArray(report) &&
-      ['posted', 'root_confirmed', 'root_already_posted', 'root_pending', 'root_proposed',
-        'awaiting_finality', 'awaiting_governance_delay', 'canonical_preparation_confirmed'].every(k =>
-        report[k] == null || report[k] === false) &&
-      ['proposal_tx', 'execution_tx', 'pending_root', 'root_confirmation', 'tap_settlement_checkpoint'].every(k => report[k] == null) &&
+      phase.every(k => report[k] == null || report[k] === false) && effects.every(k => report[k] == null) &&
       [report.operator_fee, report.burn].every(value => value == null || (typeof value === 'object' &&
         !Array.isArray(value) && value.tx == null && (value.auto_sent == null || value.auto_sent === false))),
     'TAP report records a preparation or external effect');
@@ -176,7 +176,7 @@ function assertLocalDraft(prefix, processedPrefix) {
   return reports;
 }
 
-export async function recoverDraft({ action, spool, name, dir, successor, peerRpcUrl, pool, openPool, fetchImpl }) {
+export async function recoverDraft({ action, spool, name, dir, successor, peerRpcUrl, pool, openPool, fetchImpl, loadedBundle }) {
   const m = /^epoch-([1-9][0-9]*)-([0-9a-f]{64})$/.exec(name);
   assert(m && uint(Number(m[1])));
   const epoch = Number(m[1]), anchor = m[2];
@@ -194,13 +194,15 @@ export async function recoverDraft({ action, spool, name, dir, successor, peerRp
   const state = states[0];
   assert(state === 'working' || (action === 'retire' && state === 'failed'), 'TAP draft is not available for recovery');
   const item = path.join(spool, state, name);
-  const raw = readDraftFile(item + '.receipts.json');
-  const bundle = JSON.parse(raw);
+  const file = item + '.receipts.json';
+  const bundle = action === 'reprice' ? (loadedBundle ?? json(file)) : readDraftHeader(file,
+    ['rail', 'epoch', 'epoch_apply_hash', 'at', 'tap_liability_sweep', 'refunds', 'buyer_refunds', 'buyerRefunds'], true);
   assert(bundle.epoch === epoch && bundle.epoch_apply_hash === anchor);
   const reports = assertLocalDraft(prefix, path.join(spool, 'processed', name));
   if (state === 'failed') reports.push(...assertLocalDraft(item, path.join(spool, 'processed', name)));
   const latest = path.join(spool, 'processed/latest.json');
-  const prior = exists(latest) ? json(latest) : null;
+  const prior = exists(latest) ? readDraftHeader(latest, ['epoch', 'epoch_apply_hash', 'root', 'root_confirmed', 'root_preparation_id', 'cumulative_spent_wei',
+    'operator_fee', 'burn', 'providers', 'refunds', 'entries', 'tap_settlement_checkpoint']) : null;
   const proof = await proveUnpreparedTapDraft({ bundle, pool: pool ?? openPool(), prior, peerRpcUrl, fetchImpl, reports });
   if (action === 'reprice') {
     const lockFile = prefix + '.tap-rate.json';
@@ -234,8 +236,9 @@ export async function recoverDraft({ action, spool, name, dir, successor, peerRp
 
   assert.equal(bundle.at, intent.at);
   const produced = json(path.join(dir, 'tap.produced'));
+  const bundleDigest = digestFile(file);
   assert(produced.schema_version === 1 && produced.rail === 'tap' && produced.epoch === epoch && produced.epoch_apply_hash === anchor &&
-    produced.status === 'produced' && produced.evidence_sha256 === digest(raw), 'TAP produced draft changed');
+    produced.status === 'produced' && produced.evidence_sha256 === bundleDigest, 'TAP produced draft changed');
   // Never generate a competing transition after local checkpoint recovery started.
   for (const suffix of ['tap-contract-checkpoint.json', 'tap-contract-submission.json', 'tap.complete']) {
     assert(!exists(path.join(dir, suffix)), 'TAP checkpoint recovery already started');
@@ -248,8 +251,8 @@ export async function recoverDraft({ action, spool, name, dir, successor, peerRp
   const q = refundQueue(cursor, active);
   const nextQueue = { ...q, tail: q.tail + (refunds.length ? 1 : 0) };
   assert(Number.isSafeInteger(nextQueue.tail));
-  const cert = { at: intent.at, source_state: state, buyers_sha256: buyers ? digest(readDraftFile(buyers)) : null,
-    refund_queue: nextQueue, type: 'unprepared_tap_sweep', epoch, epoch_apply_hash: anchor, bundle_sha256: digest(raw),
+  const cert = { at: intent.at, source_state: state, buyers_sha256: buyers ? digestFile(buyers) : null,
+    refund_queue: nextQueue, type: 'unprepared_tap_sweep', epoch, epoch_apply_hash: anchor, bundle_sha256: bundleDigest,
     signed_length: proof.contract.signedLength, pool_basis: proof.basis, completed_cursor: cursor,
     predecessor: active?.ticket ?? null, successor, refunds,
     retry_after: bundle.tap_liability_sweep.limit === 1 && intent.after === openingCursor ? proof.page.next : openingCursor };
@@ -268,7 +271,7 @@ function publishHandoff({ spool, name, dir, cursor }) {
   const cert = JSON.parse(raw);
   const ticket = { epoch: cert.epoch, anchor: cert.epoch_apply_hash, proof_sha256: digest(raw) };
   assert(name === 'epoch-' + ticket.epoch + '-' + ticket.anchor && cert.type === 'unprepared_tap_sweep' &&
-    cert.bundle_sha256 === digest(readDraftFile(archive + '.receipts.json')) &&
+    cert.bundle_sha256 === digestFile(archive + '.receipts.json') &&
     cert.bundle_sha256 === json(path.join(dir, 'tap.produced')).evidence_sha256, 'Conflicting archived TAP draft');
   assert.deepEqual(cert.completed_cursor, cursor);
   const active = readHandoff(spool, cursor, name);
@@ -293,7 +296,7 @@ function publishHandoff({ spool, name, dir, cursor }) {
     }
     syncDirectory(path.dirname(origin));
   }
-  assert.equal(exists(archive + '.buyers.json') ? digest(readDraftFile(archive + '.buyers.json')) : null,
+  assert.equal(exists(archive + '.buyers.json') ? digestFile(archive + '.buyers.json') : null,
     cert.buyers_sha256, 'Archived TAP refund companion changed');
   syncDirectory(path.dirname(archive));
   // A later cursor can advance as soon as this marker is visible. Make it

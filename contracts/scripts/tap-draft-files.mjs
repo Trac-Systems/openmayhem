@@ -48,6 +48,51 @@ export function readDraftFile(file) {
   return fs.readFileSync(file);
 }
 
+// Reports may contain proofs for every historical claimant and bundles may
+// contain many receipts. Recovery needs only their financial header fields.
+export function readDraftHeader(file, keys, receipts = false) {
+  const stat = fs.lstatSync(file);
+  assert(stat.isFile(), 'Invalid TAP evidence file');
+  if (stat.size <= 16 * 1024 * 1024) {
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    return raw ? JSON.parse(raw) : null;
+  }
+  const filter = `reduce inputs as $event ({value:{}, bytes:0, done:false};
+    ($event[0]) as $p | if .done then error("extra document")
+    elif ($event|length) == 1 then .done = (($p|length) == 1)
+    elif ($p|length) == 0 then if $event[1] == {} then .done = true else error("invalid document") end
+    elif ($p[0]|type) != "string" then error("invalid document")
+    elif $receipts and $p[0] == "receipts" then
+      if ($p[1]|type) == "number" or (($p|length) == 1 and $event[1] == [])
+      then .value.receipts = [] else error("invalid receipt list") end
+    elif ($keys | index($p[0])) != null then
+      .bytes += ($event | tojson | utf8bytelength) |
+      if .bytes > 16777216 then error("oversized financial header") else .value |= setpath($p; $event[1]) end
+    else . end) | if .done then .value else error("incomplete document") end`;
+  const projected = spawnSync('jq', ['-cn', '--stream', '--argjson', 'keys', JSON.stringify(keys),
+    '--argjson', 'receipts', String(receipts), filter, file], { encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+  assert(projected.status === 0, 'Invalid or oversized TAP financial header');
+  return JSON.parse(projected.stdout);
+}
+
+export function digestFile(file) {
+  assert(fs.lstatSync(file).isFile(), 'Invalid TAP evidence file');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const hasher = createHash('sha256');
+    const block = Buffer.allocUnsafe(64 * 1024);
+    const size = fs.fstatSync(fd).size;
+    for (let offset = 0; offset < size;) {
+      const n = fs.readSync(fd, block, 0, Math.min(block.length, size - offset), offset);
+      assert(n > 0, 'TAP evidence was truncated');
+      hasher.update(block.subarray(0, n));
+      offset += n;
+    }
+    assert.equal(fs.fstatSync(fd).size, size, 'TAP evidence changed size');
+    return hasher.digest('hex');
+  } finally { fs.closeSync(fd); }
+}
+
 export function handoffFile(spool) { return path.join(spool, 'deferred/next-sweep.json'); }
 
 export function readHandoff(spool, cursor, firstArchive) {
@@ -78,7 +123,7 @@ export function readHandoff(spool, cursor, firstArchive) {
   const proof = JSON.parse(raw);
   assert(digest(raw) === ticket.proof_sha256 && proof.epoch === ticket.epoch &&
     proof.epoch_apply_hash === ticket.anchor && proof.type === 'unprepared_tap_sweep' &&
-    proof.bundle_sha256 === digest(readDraftFile(prefix + '.receipts.json')) &&
+    proof.bundle_sha256 === digestFile(prefix + '.receipts.json') &&
     Array.isArray(proof.refunds), 'TAP handoff differs from archived draft');
   assert.deepEqual(proof.completed_cursor, cursor, 'TAP handoff has a different completed predecessor');
   return { ticket, proof };
@@ -122,12 +167,12 @@ export function retainRefundRemainder(spool, prefix, record, refunds, queue) {
   const tail = queue.tail + 1;
   assert(Number.isSafeInteger(tail));
   const proof = { type: 'unpaid_tap_refunds', epoch: record.epoch, epoch_apply_hash: record.epoch_apply_hash,
-    bundle_sha256: digest(readDraftFile(prefix + '.receipts.json')), report_sha256: record.report_sha256,
+    bundle_sha256: digestFile(prefix + '.receipts.json'), report_sha256: record.report_sha256,
     refund_index: tail, refunds };
   const file = prefix + '.unpaid-refunds.json';
   immutableJson(file, proof);
   immutableJson(refundSourceFile(spool, tail), { epoch: record.epoch, anchor: record.epoch_apply_hash,
-    remainder: true, proof_sha256: digest(readDraftFile(file)) });
+    remainder: true, proof_sha256: digestFile(file) });
   return { ...queue, tail };
 }
 
@@ -142,10 +187,10 @@ export function nextRefunds(spool, q) {
   const source = JSON.parse(raw);
   assert(digest(raw) === ticket.proof_sha256 &&
     (ticket.remainder ? source.type === 'unpaid_tap_refunds' && source.refund_index === index &&
-      source.report_sha256 === digest(readDraftFile(prefix + '.settlement.json')) :
+      source.report_sha256 === digestFile(prefix + '.settlement.json') :
       source.type === 'unprepared_tap_sweep' && source.refund_queue.tail === index) &&
     source.epoch === ticket.epoch && source.epoch_apply_hash === ticket.anchor &&
-    source.bundle_sha256 === digest(readDraftFile(prefix + '.receipts.json')) &&
+    source.bundle_sha256 === digestFile(prefix + '.receipts.json') &&
     Array.isArray(source.refunds) && q.offset < source.refunds.length,
   'Invalid TAP refund source');
   const entries = source.refunds.slice(q.offset, q.offset + 32);
