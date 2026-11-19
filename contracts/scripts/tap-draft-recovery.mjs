@@ -62,6 +62,9 @@ export async function proveUnpreparedTapDraft({ bundle, peerRpcUrl, fetchImpl = 
       prep.economic_op_id === id && uint(prep.epoch) && prep.epoch > 0 && prep.epoch < bundle.epoch &&
       hash(prep.epoch_apply_hash) && typeof prep.consumed === 'boolean',
     'TAP draft has a prior preparation or ambiguous reservation');
+    const source = await contract.requireEpochApplyAnchor(prep.epoch, prep.epoch_apply_hash, 'Earlier TAP reservation');
+    if (source instanceof Error) throw source;
+    assert(uint(source.settlement_unix) && source.settlement_unix <= bundle.at, 'Invalid earlier TAP reservation epoch');
     return prep;
   };
   for (const { provider, revision, before, target, chainId } of page.rows) {

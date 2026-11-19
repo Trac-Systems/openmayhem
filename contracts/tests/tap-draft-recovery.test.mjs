@@ -8,7 +8,7 @@ import test from 'node:test';
 import { ZeroHash } from 'ethers';
 import { advanceSweep, loadCursor, prepareSweep, validateQueuedSweep } from '../scripts/prepare-tap-sweep-bundle.mjs';
 import { digest, handoffFile, journalTapPreparation, nextRefunds } from '../scripts/tap-draft-files.mjs';
-import { recoverDraft } from '../scripts/tap-draft-recovery.mjs';
+import { proveUnpreparedTapDraft, recoverDraft } from '../scripts/tap-draft-recovery.mjs';
 import { confirmedTapContract, preflightTapSweepPreparations, verifyPriorTapClaims } from '../scripts/tap-liability-sweep.mjs';
 import { buildCanonicalTapPreparationPlan, guardianPreSignReport, projectTapRefunds, rollTapSettlement,
   tapRateRecordToLock } from '../scripts/tap-settlement-roller.mjs';
@@ -288,7 +288,7 @@ for (const version of [1, 2]) {
 
 test('a stale local quote changes only before any preparation, pending root or ambiguous send', async t => {
   const f = fixture(t);
-  f.epoch(4); f.oracle(1000);
+  f.epoch(3); f.epoch(4); f.oracle(1000);
   const work = await f.freeze(4);
   f.oracle(9900, rateValue * 2n);
   const old = fs.readFileSync(work.prefix + '.tap-rate.json');
@@ -307,7 +307,15 @@ test('a stale local quote changes only before any preparation, pending root or a
       provider: hash(2), payout_revision: hash(2), paid_cum_au_before: '0' } });
   f.seal();
   await assert.rejects(reprice(), /prior preparation/);
-  f.state.delete(lockKey); f.state.delete(prepKey); f.seal();
+  const earlier = f.state.get(prepKey);
+  Object.assign(earlier, { epoch: 3, epoch_apply_hash: hash(3) });
+  Object.assign(earlier.liability, { paid_au: '6', aggregate_paid_cum_au_before: '0' });
+  const tailKey = 'payout/preparation-tail/tap/' + hash(2);
+  f.state.set(tailKey, { economic_op_id: hash(42), consumed: false, paid_cum_au_before: '0', paid_cum_au_after: '6' });
+  f.seal();
+  await proveUnpreparedTapDraft({ ...work, prior: null, reports: [] });
+  assert.equal(f.state.get(prepKey).consumed, false);
+  f.state.delete(tailKey); f.state.delete(lockKey); f.state.delete(prepKey); f.seal();
   const report = await rollTapSettlement(work.options);
   const plan = await buildCanonicalTapPreparationPlan({ settlement: report, bundle: work.bundle,
     epoch: 4, epochApplyHash: hash(4), tapRateLock: work.lock });

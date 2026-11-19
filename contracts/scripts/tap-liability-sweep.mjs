@@ -256,7 +256,7 @@ export function validTapSweepPointer(p) {
 // Every TAP root preparation follows a nonempty list of provider preparations.
 // Their immutable watermark locks cover all outputs the frozen selector could
 // ever have reserved, even when binding validation prevents rebuilding a root.
-export async function tapDraftWatermarks({ peerRpcUrl, bundle, fetchImpl }) {
+export async function tapDraftWatermarks({ peerRpcUrl, bundle, fetchImpl = fetch }) {
   const p = bundle.tap_liability_sweep;
   requireState(validTapSweepPointer(p), 'Invalid TAP draft selector');
   const snapshot = snapshotReader(peerRpcUrl, p.signed_length, fetchImpl);
