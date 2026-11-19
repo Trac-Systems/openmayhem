@@ -769,6 +769,21 @@ const overlapStart = '8028518251457218441';
 const paid508 = '1021701396860965955';
 const paid542 = '1877278632791707922';
 
+async function freezeFiatEpoch(ctx, epoch, anchor, outputs) {
+  const update = `epoch/targeted/${epoch}/apply`;
+  await ctx.storage.put(`epoch/apply-anchor/${epoch}`, {
+    type: 'epoch_apply_anchor', epoch, apply_hash: anchor, settlement_unix: 90_000, applied_at: update
+  });
+  await ctx.storage.put('epoch/apply/state', {
+    updated_epoch: epoch, updated_at: update, last_apply_hash: anchor, last_settlement_unix: 90_000
+  });
+  ctx.outputs = outputs;
+  const value = await planValue(ctx, epoch, anchor);
+  const r = await submitControl(ctx, value, 'targetedPayoutEpochFeatureKey');
+  assert.equal(r.ok, true, r.message);
+  return value;
+}
+
 async function overlapFixture(withAttempt = true) {
   const people = (await Promise.all([makeIdentity(), makeIdentity()]))
     .sort((a, b) => a.publicKey.localeCompare(b.publicKey));
@@ -803,22 +818,8 @@ async function overlapFixture(withAttempt = true) {
       });
     }
   }
-  async function freeze(epoch, anchor, outputs) {
-    const update = `epoch/targeted/${epoch}/apply`;
-    await storage.put(`epoch/apply-anchor/${epoch}`, {
-      type: 'epoch_apply_anchor', epoch, apply_hash: anchor, settlement_unix: 90_000, applied_at: update
-    });
-    await storage.put('epoch/apply/state', {
-      updated_epoch: epoch, updated_at: update, last_apply_hash: anchor, last_settlement_unix: 90_000
-    });
-    ctx.outputs = outputs;
-    const value = await planValue(ctx, epoch, anchor);
-    const r = await submitControl(ctx, value, 'targetedPayoutEpochFeatureKey');
-    assert.equal(r.ok, true, r.message);
-    return value;
-  }
   await updateBalances(508, old);
-  const prior = await freeze(508, 'a'.repeat(64), [old, oldFee]);
+  const prior = await freezeFiatEpoch(ctx, 508, 'a'.repeat(64), [old, oldFee]);
   const pre = await prepareEconomicOutput(ctx, prior, old);
   assert.equal(pre.ok, true, pre.message);
   const attempt = withAttempt ? await prepareAttempt(ctx, prior, old, 1) : null;
@@ -854,7 +855,7 @@ async function overlapFixture(withAttempt = true) {
     paid_au: '654219431548440044', liability_au: '654219431548440044'
   };
   await storage.put('fee/fiat/cum', { ...fee, cum_au: retainedFee.paid_au, settled_cum_au: retainedFee.paid_au });
-  const frozen = await freeze(542, 'b'.repeat(64), [first, next, retainedFee]);
+  const frozen = await freezeFiatEpoch(ctx, 542, 'b'.repeat(64), [first, next, retainedFee]);
   assert.equal((await prepareEconomicOutput(ctx, frozen, first)).ok, true);
   const paidAttempt = await prepareAttempt(ctx, frozen, first, 1);
   assert.equal(paidAttempt.result.ok, true, paidAttempt.result.message);
@@ -925,7 +926,7 @@ async function resignRecovery(ctx, feature, change) {
   return { value, key: await fiatRecoveryFeatureKey(ctx.contract, value) };
 }
 
-test('508/542 transfers only the unused reservation and preserves both paid siblings', async () => {
+test('508/542 recovers its reservation and permits subsequent provider and fee payouts', async () => {
   const { ctx, old, next, first, prior, frozen, attempt, earningKey, liabilityKey, proto } = await overlapFixture();
   const read = async k => (await ctx.storage.get(k))?.value ?? null;
   const originalRows = new Map(ctx.storage.values);
@@ -976,6 +977,60 @@ test('508/542 transfers only the unused reservation and preserves both paid sibl
   for (const k of [earningKey, liabilityKey]) assert.equal((await read(k)).paid_cum_au, String(BigInt(overlapStart) + BigInt(paid542)));
   assert.deepEqual(await read(firstPaidKey), originalRows.get(firstPaidKey));
   assert.equal((await submitRecovery(ctx, repair)).idempotent, true);
+
+  // Both providers earn again on the same revisions while the old 508 fee remains fenced.
+  const newEarnings = 100n * CENT_AU;
+  const expectedBalances = new Map();
+  const providerOutputs = [];
+  for (const original of [first, next]) {
+    const providerKey = `earn/fiat/${original.provider}`;
+    const revisionKey = ctx.contract.providerPayoutLiabilityKey(original.provider, 'fiat', original.payout_revision);
+    const revision = await read(revisionKey);
+    const aggregate = await read(providerKey);
+    for (const [key, balance] of [[revisionKey, revision], [providerKey, aggregate]]) {
+      expectedBalances.set(key, String(BigInt(balance.paid_cum_au) + newEarnings));
+      await ctx.storage.put(key, {
+        ...balance, updated_epoch: 543, total_au: String(BigInt(balance.total_au) + newEarnings),
+      });
+    }
+    providerOutputs.push({
+      ...original, economic_op_id: (6 + original.output_index).toString().repeat(64),
+      paid_cum_au_before: revision.paid_cum_au, aggregate_paid_cum_au_before: aggregate.paid_cum_au,
+      liability_au: String(newEarnings + BigInt(original.dust_au)), paid_au: String(newEarnings),
+      source_amount_minor: '88', destination_amount_min_minor: '88', destination_amount_max_minor: '88',
+    });
+  }
+  const newFee = 10n * CENT_AU;
+  const fee = await read('fee/fiat/cum');
+  await ctx.storage.put('fee/fiat/cum', {
+    ...fee, updated_epoch: 543,
+    cum_au: String(BigInt(fee.cum_au) + newFee),
+    settled_cum_au: String(BigInt(fee.settled_cum_au) + newFee),
+  });
+  const feeOutput = {
+    ...frozen.outputs[2], economic_op_id: '8'.repeat(64),
+    liability_au: String(newFee), paid_au: String(newFee), source_amount_minor: '9',
+  };
+  const later = await freezeFiatEpoch(ctx, 543, 'c'.repeat(64), [...providerOutputs, feeOutput]);
+  for (const output of later.outputs) {
+    const ref = output.role === 'operator_fee' ? 'platform_balance:fixture:543' : 'tr_fixture_later_' + output.output_index;
+    const prepared = await prepareEconomicOutput(ctx, later, output);
+    assert.equal(prepared.ok, true, prepared.message);
+    const attempt = await prepareAttempt(ctx, later, output, 1);
+    assert.equal(attempt.result.ok, true, attempt.result.message);
+    const evidence = transferEvidence(output, attempt.value, ref);
+    const finalized = await finalizeAttempt(ctx, attempt.value, 'succeeded', evidence);
+    assert.equal(finalized.result.ok, true, finalized.result.message);
+    const accounted = await settleOutput(ctx, later, output, attempt.value, evidence);
+    assert.equal(accounted.result.ok, true, accounted.result.message);
+  }
+  const closed = await closeEpoch(ctx, later);
+  assert.equal(closed.ok, true, closed.message);
+  assert.equal((await submitRecovery(ctx, repair)).idempotent, true);
+  for (const [key, amount] of expectedBalances) assert.equal((await read(key)).paid_cum_au, amount);
+  assert.equal((await read('fee/fiat/cum')).swept_cum_au, String(BigInt(fee.swept_cum_au) + newFee));
+  assert.equal(await read('settle/targeted/fiat/508'), null);
+  assert.deepEqual(await read(firstPaidKey), originalRows.get(firstPaidKey));
 });
 
 test('508 fence holds the original fee even if a runner already prepared or finalized its retention', async () => {
