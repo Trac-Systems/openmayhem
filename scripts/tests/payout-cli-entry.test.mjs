@@ -24,6 +24,8 @@ test('payout workers execute their CLI through a symlinked release directory', t
     ['scripts/validate-tap-settlement-checkpoint.mjs', /path|argument/i],
     ['contracts/scripts/tap-settlement-roller.mjs', /Missing --bundle/],
     ['contracts/scripts/tap-deposit-watcher.mjs', /Missing --rpc/],
+    ['contracts/scripts/tap-claim-proof.mjs', /Missing --settlement/],
+    ['contracts/scripts/tap-calldata-builder.mjs', /Use mode/],
   ]) {
     const result = run(script);
     assert.equal(result.status, 1, script);

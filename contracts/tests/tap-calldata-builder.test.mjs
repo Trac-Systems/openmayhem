@@ -16,13 +16,13 @@ import { deployPool } from '../scripts/deploy-local.mjs';
 import {
   auToTapWei,
   providerShareWei,
-  rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
 import {
   makeReceiptIdentity,
   signedTapReceipt,
-  targetedTapBindingsFor,
 } from './helpers/signed-receipt.mjs';
+
+import { claimSettlementInputs, postAndFinalizeClaimSettlement } from './helpers/tap-claim-settlement.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -40,7 +40,7 @@ async function localPool(accounts = 5) {
     chain: { chainId: 61_000 },
     wallet: { totalAccounts: accounts },
   });
-  const provider = new ethers.BrowserProvider(ganache);
+  const provider = new ethers.BrowserProvider(ganache, undefined, { cacheTimeout: -1 });
   const operator = await provider.getSigner(0);
   const { token, pool, tokenAddr, poolAddr, governanceWallet } = await deployPool(operator);
   return { provider, operator, token, pool, tokenAddr, poolAddr, governanceWallet };
@@ -58,7 +58,7 @@ async function localPoolWithKnownKeys({ poorBuyerEth = '0' } = {}) {
       ],
     },
   });
-  const provider = new ethers.BrowserProvider(ganache);
+  const provider = new ethers.BrowserProvider(ganache, undefined, { cacheTimeout: -1 });
   const operator = await provider.getSigner(0);
   const { token, pool, tokenAddr, poolAddr, governanceWallet } = await deployPool(operator);
   return { provider, operator, token, pool, tokenAddr, poolAddr, governanceWallet };
@@ -179,14 +179,12 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
   const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
   const bundle = {
     epoch: 1,
+    epoch_apply_hash: 'ab'.repeat(32),
+    params: { payout_min_au: usdAu(1), fee_bps: 1500, challenge_epochs: 6 },
     receipts: [receipt({ session: 's1', provider: providerId, au: usdAu(2) })],
   };
-  const rolled = await rollTapSettlement({
-    bundle,
-    providerAccounts,
-    targetedSessionBindings: targetedTapBindingsFor(bundle, providerAccounts),
-    tapUsdAu: TAP_USD_AU,
-    ledgerFeeBps: 1500,
+  const rolled = await postAndFinalizeClaimSettlement(provider, {
+    ...claimSettlementInputs({ bundle, providerAccounts, tapUsdAu: TAP_USD_AU, tokenAddr: await token.getAddress(), poolAddr }),
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
@@ -231,14 +229,12 @@ test('local wallet TAP claim simulates, then confirms from the provider wallet',
   const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
   const bundle = {
     epoch: 1,
+    epoch_apply_hash: 'ab'.repeat(32),
+    params: { payout_min_au: usdAu(1), fee_bps: 1500, challenge_epochs: 6 },
     receipts: [receipt({ session: 'local-claim', provider: providerId, au: usdAu(2) })],
   };
-  const rolled = await rollTapSettlement({
-    bundle,
-    providerAccounts,
-    targetedSessionBindings: targetedTapBindingsFor(bundle, providerAccounts),
-    tapUsdAu: TAP_USD_AU,
-    ledgerFeeBps: 1500,
+  const rolled = await postAndFinalizeClaimSettlement(provider, {
+    ...claimSettlementInputs({ bundle, providerAccounts, tapUsdAu: TAP_USD_AU, tokenAddr: await token.getAddress(), poolAddr }),
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,

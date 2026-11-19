@@ -2363,6 +2363,10 @@ struct WithdrawArgs {
     #[arg(long, value_name = "PATH")]
     claim_proof: Option<PathBuf>,
 
+    /// Posted distribution epoch. Required for raw proofs or proof files without an epoch.
+    #[arg(long)]
+    root_epoch: Option<u64>,
+
     /// Cumulative claimable TAP wei, when not using --settlement/--claim-proof.
     #[arg(long)]
     cumulative_wei: Option<String>,
@@ -40645,8 +40649,8 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         }
     }
     let peer_rpc = PeerRpcClient::new(&peer_rpc_url)?;
-    let payment_state = read_canonical_payment_state(&peer_rpc).await?;
-    let tap = payment_state.payments.tap.clone();
+    // A posted claim is denominated in TAP and does not depend on exchange rates.
+    let tap = read_canonical_payments(&peer_rpc).await?.tap;
     let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
     let eth_key = ethereum_wallet_key(&keypair_path, &password)
@@ -40696,8 +40700,19 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         })
         .context("withdrawal proof is missing proof")?;
 
+    if let Some(proof_account) = proof_report.get("account") {
+        ensure!(
+            proof_account
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&account)),
+            "withdrawal proof account does not match the wallet"
+        );
+    }
+    let root_epoch = withdraw_root_epoch(&proof_report, args.root_epoch)?;
     let mut script_args = vec![
         "claim".to_owned(),
+        "--root-epoch".to_owned(),
+        root_epoch.to_string(),
         "--account".to_owned(),
         account.clone(),
         "--cumulative-wei".to_owned(),
@@ -41529,6 +41544,26 @@ fn print_participant_report(report: &Value) -> Result<()> {
     Ok(())
 }
 
+fn withdraw_root_epoch(proof: &Value, explicit_epoch: Option<u64>) -> Result<u64> {
+    let mut epoch = explicit_epoch;
+    for key in ["epoch", "root_epoch"] {
+        if let Some(value) = proof.get(key) {
+            let recorded = value.as_u64().context("invalid TAP proof epoch")?;
+            ensure!(
+                epoch.is_none_or(|current| current == recorded),
+                "conflicting TAP proof epochs"
+            );
+            epoch = Some(recorded);
+        }
+    }
+    let epoch = epoch.context("withdrawal proof has no epoch; supply the posted --root-epoch")?;
+    ensure!(
+        (1..=9_007_199_254_740_991).contains(&epoch),
+        "invalid TAP root epoch"
+    );
+    Ok(epoch)
+}
+
 async fn resolve_withdraw_proof(
     args: &WithdrawArgs,
     account: &str,
@@ -41570,7 +41605,7 @@ async fn resolve_withdraw_proof(
                 .context("withdraw requires --proof when using --cumulative-wei")?;
             Ok(json!({
                 "claimable": true,
-                "account": args.account,
+                "account": account,
                 "cumulative_wei": cumulative,
                 "proof": serde_json::from_str::<Value>(proof).unwrap_or_else(|_| Value::String(proof.to_owned())),
             }))
@@ -100600,6 +100635,8 @@ mod tests {
         let withdraw = Cli::try_parse_from([
             "mayhem",
             "withdraw",
+            "--root-epoch",
+            "7",
             "--account",
             "0x1111111111111111111111111111111111111111",
             "--cumulative-wei",
@@ -100618,6 +100655,7 @@ mod tests {
             args.account.as_deref(),
             Some("0x1111111111111111111111111111111111111111")
         );
+        assert_eq!(args.root_epoch, Some(7));
         assert_eq!(args.cumulative_wei.as_deref(), Some("100"));
         assert_eq!(args.proof.as_deref(), Some("[]"));
         assert_eq!(

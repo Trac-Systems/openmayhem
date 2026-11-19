@@ -450,3 +450,26 @@ async fn expired_valuation_quote_can_reconcile_paid_output_without_more_cash() {
         .iter()
         .all(|request| request.starts_with("GET ")));
 }
+
+#[test]
+fn withdraw_uses_the_proofs_historical_epoch_and_rejects_conflicts() {
+    let proof = json!({"epoch": 7, "chain_epoch": 12});
+    assert_eq!(withdraw_root_epoch(&proof, None).unwrap(), 7);
+    assert_eq!(
+        withdraw_root_epoch(&json!({"root_epoch": 7}), Some(7)).unwrap(),
+        7
+    );
+    assert_eq!(withdraw_root_epoch(&json!({}), Some(7)).unwrap(), 7);
+    assert!(withdraw_root_epoch(&proof, Some(12)).is_err());
+    assert!(withdraw_root_epoch(&json!({"epoch":7,"root_epoch":8}), None).is_err());
+    assert!(withdraw_root_epoch(&json!({"chain_epoch":12}), None).is_err());
+    for invalid in [
+        json!(0),
+        json!(-1),
+        json!(7.5),
+        json!(null),
+        json!(9_007_199_254_740_992_u64),
+    ] {
+        assert!(withdraw_root_epoch(&json!({"epoch":invalid}), None).is_err());
+    }
+}
