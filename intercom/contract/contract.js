@@ -19,6 +19,9 @@ import ContractV27 from './history/v27.js';
 import ContractV28 from './history/v28.js';
 import ContractV29 from './history/v29.js';
 import ContractV30 from './v30.js';
+import { indexPayoutHistory, historyKey } from './payout-history.js';
+import { bookedBalance, unbookedBalance, allocationCursor, revisionScope, providerScope,
+  planClaimWrites, openClaim, consumeClaimWrites, receiptMatchesOutput } from './payout-reservations.js';
 import { applyFiatRecovery, fiat508FeeHeld, fiatFenceKey } from './fiat-recovery.js';
 import { ProxyValidationError, isProxyPublication } from './proxy-protocol.js';
 import { proxyRuntimeContext, proxyAppliedEpoch } from './proxy-context.js';
@@ -1802,6 +1805,11 @@ class MayhemContract extends Contract {
     if (value.op === 'rate_oracle' || value.op === 'tap_rate_oracle') {
       const result = await this.applyRateOracleFeature(key, value);
       this._mayhemApplyStage = null;
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'index_targeted_payout_history') {
+      const result = await indexPayoutHistory(this, key, value, CONTRACT_VERSION);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -5544,7 +5552,7 @@ class MayhemContract extends Contract {
     return `payout/preparation-effect/${rail}/${effectId}`;
   }
 
-  async validatePayoutPreparationLiability(value, replaces = null) {
+  async validatePayoutPreparationLiability(value, replaces = null, claim = null) {
     const liability = value.liability;
     const binding = await this.get(
       this.providerPayoutBindingFeatureKey(
@@ -5577,7 +5585,7 @@ class MayhemContract extends Contract {
         current.target !== liability.target ||
         (current.currency ?? null) !== liability.currency ||
         (current.chain_id ?? null) !== liability.chain_id ||
-        current.paid_cum_au !== liability.paid_cum_au_before) {
+        (claim === null && current.paid_cum_au !== liability.paid_cum_au_before)) {
       return new Error('Targeted payout preparation liability watermark mismatch.');
     }
     const provider = await this.get(`prov/${liability.provider}`);
@@ -5615,6 +5623,26 @@ class MayhemContract extends Contract {
     }
     const earning = await this.earningRecord(liability.provider, value.rail);
     if (earning instanceof Error) return earning;
+    if (claim !== null && replaces === null) {
+      const aggregateGate = await this.probeGateForEarning(liability.provider, earning, params);
+      if (aggregateGate instanceof Error) return aggregateGate;
+      const aggregate = this.refreshEarningHoldback(earning, value.epoch, lockedEpochs, aggregateGate, disputeGate);
+      if (aggregate instanceof Error) return aggregate;
+      const covered = this.safeSubAu(this.safeSubAu(aggregate.total_au, aggregate.held_au), aggregate.paid_cum_au);
+      if (covered instanceof Error || this.compareAu(liability.paid_au, covered) > 0) {
+        return new Error('Targeted payout exceeds payable aggregate earnings.');
+      }
+      const booked = await bookedBalance(this, value.rail, providerScope(liability));
+      if (booked instanceof Error) return booked;
+      const head = (await this.epochApplyStateRecord()).updated_epoch;
+      const live = this.refreshEarningHoldback(earning, head, lockedEpochs, aggregateGate, disputeGate);
+      if (live instanceof Error) return live;
+      const liveCovered = this.safeSubAu(this.safeSubAu(live.total_au, live.held_au), live.paid_cum_au);
+      if (liveCovered instanceof Error || this.compareAu(booked.pending_au, liveCovered) > 0) {
+        return new Error('Targeted payout reservations exceed payable aggregate earnings.');
+      }
+      return { liability_key: liabilityKey };
+    }
     const tailKey = this.payoutPreparationAggregateTailKey(value.rail, liability.provider);
     const tail = await this.get(tailKey);
     if (tail &&
@@ -5673,6 +5701,7 @@ class MayhemContract extends Contract {
       'Targeted payout preparation'
     );
     if (applyAnchor instanceof Error) return applyAnchor;
+    let claim = null;
     if (['fiat', 'tnk'].includes(normalized.rail)) {
       const plan = await this.get(
         this.targetedPayoutEpochPlanRecordKey(normalized.rail, normalized.epoch)
@@ -5687,6 +5716,8 @@ class MayhemContract extends Contract {
           'Targeted payout preparation does not match its canonical epoch plan.'
         );
       }
+      claim = await openClaim(this, normalized.rail, plan.value, output, replaces);
+      if (claim instanceof Error) return claim;
     }
     if (normalized.rail === 'tnk') {
       const payment = await this.canonicalTnkPaymentConfig();
@@ -5737,7 +5768,7 @@ class MayhemContract extends Contract {
     }
     let liabilityState = null;
     if (normalized.liability !== null) {
-      liabilityState = await this.validatePayoutPreparationLiability(normalized, replaces);
+      liabilityState = await this.validatePayoutPreparationLiability(normalized, replaces, claim);
       if (liabilityState instanceof Error) return liabilityState;
       const lockKey = this.payoutPreparationLiabilityLockKey(
         normalized.rail,
@@ -5767,13 +5798,17 @@ class MayhemContract extends Contract {
           prepared_at: this.tx,
         }
       );
-      await this.put(liabilityState.tail_key, {
+      if (claim === null || replaces !== null) await this.put(liabilityState.tail_key, {
         economic_op_id: normalized.economic_op_id,
         paid_cum_au_before: normalized.liability.aggregate_paid_cum_au_before,
         paid_cum_au_after: liabilityState.paid_cum_au_after,
         consumed: false,
         updated_at: this.tx,
       });
+    }
+    if (claim?.legacy_group) {
+      const group = await this.get(claim.legacy_group);
+      await this.put(claim.legacy_group, { ...group, prepared: true, owner: normalized.economic_op_id });
     }
     for (const effectId of normalized.external_effect_ids) {
       await this.put(this.payoutPreparationEffectLockKey(normalized.rail, effectId), {
@@ -5918,7 +5953,19 @@ class MayhemContract extends Contract {
       : new Error('Targeted payout epoch output must be canonical.');
   }
 
-  normalizeTargetedPayoutCarry(value) {
+  normalizeTargetedPayoutCarry(value, rail) {
+    if (rail === 'fiat' && value?.reason === 'awaiting_processor_terms') {
+      const provider = value.role === 'provider';
+      const fields = ['role', 'reason', 'liability_au', ...(provider ? ['provider','payout_revision'] : [])];
+      const error = this.validateExactObjectKeys(value, fields, 'deferred fiat payout terms');
+      if (error) return error;
+      if ((!provider && value.role !== 'operator_fee') ||
+          this.normalizeAu(value.liability_au, 'Deferred fiat liability', { allowZero: false }) !== value.liability_au ||
+          (provider && ![value.provider,value.payout_revision].every(v => this.isHexBytes(v,32) && v === v.toLowerCase()))) {
+        return new Error('Invalid deferred fiat liability.');
+      }
+      return { ...value };
+    }
     const shapeError = this.validateExactObjectKeys(
       value,
       [
@@ -6058,10 +6105,11 @@ class MayhemContract extends Contract {
         return new Error('Targeted payout epoch outputs are not canonically ordered.');
       }
     }
-    const carry = value.carry.map((entry) => this.normalizeTargetedPayoutCarry(entry));
+    const carry = value.carry.map((entry) => this.normalizeTargetedPayoutCarry(entry, value.rail));
     const carryError = carry.find((entry) => entry instanceof Error);
     if (carryError) return carryError;
     carry.sort((left, right) =>
+      Number(left.role === 'operator_fee') - Number(right.role === 'operator_fee') ||
       compareCodepoint(left.provider, right.provider) ||
       compareCodepoint(left.payout_revision, right.payout_revision)
     );
@@ -6135,7 +6183,7 @@ class MayhemContract extends Contract {
       : new Error('Targeted payout epoch plan must be canonical.');
   }
 
-  async validateTargetedPayoutEpochCompleteness(value, params) {
+  async validateTargetedPayoutEpochCompleteness(value, params, priorReservations) {
     const index = await this.providerPayoutLiabilityIndex(value.rail);
     if (index instanceof Error) return index;
     const providerOutputs = new Map(
@@ -6146,7 +6194,7 @@ class MayhemContract extends Contract {
           output,
         ])
     );
-    const carries = new Map(value.carry.map((entry) => [
+    const carries = new Map(value.carry.filter(entry => entry.role !== 'operator_fee').map((entry) => [
       `${entry.provider}/${entry.payout_revision}`,
       entry,
     ]));
@@ -6218,14 +6266,21 @@ class MayhemContract extends Contract {
         disputeGate
       );
       if (refreshed instanceof Error) return refreshed;
-      const outstanding = this.safeSubAu(
+      const totalOutstanding = this.safeSubAu(
         refreshed.total_au,
         refreshed.paid_cum_au
       );
-      const payable = this.safeSubAu(outstanding, refreshed.held_au);
-      if (outstanding instanceof Error || payable instanceof Error) {
-        return new Error('Targeted payout canonical liability is invalid.');
+      if (totalOutstanding instanceof Error) return totalOutstanding;
+      const booked = await bookedBalance(this, value.rail, revisionScope(entry));
+      if (booked instanceof Error) return booked;
+      if (!this.isZeroAu(booked.pending_au) || !this.isZeroAu(booked.pending_dust_au)) {
+        priorReservations.push({ ...entry, paid_au: booked.pending_au, dust_au: booked.pending_dust_au });
       }
+      const available = unbookedBalance(this, totalOutstanding, refreshed.held_au, booked);
+      if (available instanceof Error) return available;
+      const { outstanding, held, payable } = available;
+      const revisionBefore = allocationCursor(this, refreshed.paid_cum_au, booked);
+      if (revisionBefore instanceof Error) return revisionBefore;
       const output = providerOutputs.get(identity) ?? null;
       const carry = carries.get(identity) ?? null;
       if (this.isZeroAu(outstanding)) {
@@ -6243,7 +6298,7 @@ class MayhemContract extends Contract {
           provider: entry.provider,
           payout_revision: entry.payout_revision,
           liability_au: outstanding,
-          held_au: refreshed.held_au,
+          held_au: held,
           payable_au: payable,
           payout_min_au: params.payout_min_au,
           reason: this.isZeroAu(payable) ? 'held' : 'below_payout_minimum',
@@ -6259,9 +6314,13 @@ class MayhemContract extends Contract {
         continue;
       }
 
+      if (output === null && carry?.reason === 'awaiting_processor_terms' && carry.liability_au === payable) {
+        classified.add(identity);
+        continue;
+      }
       if (output === null || carry !== null ||
           output.to !== binding.target ||
-          output.paid_cum_au_before !== refreshed.paid_cum_au ||
+          output.paid_cum_au_before !== revisionBefore ||
           (value.rail === 'tnk' && output.au !== payable) ||
           (value.rail === 'fiat' &&
             (output.liability_au !== payable ||
@@ -6294,7 +6353,11 @@ class MayhemContract extends Contract {
           disputeGate
         );
         if (refreshedEarning instanceof Error) return refreshedEarning;
-        aggregate = { paid_cum_au: refreshedEarning.paid_cum_au };
+        const providerBooked = await bookedBalance(this, value.rail, providerScope(entry));
+        if (providerBooked instanceof Error) return providerBooked;
+        const before = allocationCursor(this, refreshedEarning.paid_cum_au, providerBooked);
+        if (before instanceof Error) return before;
+        aggregate = { paid_cum_au: before };
       }
       if (output.aggregate_paid_cum_au_before !== aggregate.paid_cum_au) {
         return new Error('Targeted payout aggregate paid watermark mismatch.');
@@ -6319,9 +6382,21 @@ class MayhemContract extends Contract {
     if (fee instanceof Error) return fee;
     const feeError = this.guardianValidateFeeRecord(fee, value.rail);
     if (feeError) return feeError;
-    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+    const feeBooked = await bookedBalance(this, value.rail, 'fee');
+    if (feeBooked instanceof Error) return feeBooked;
+    if (!this.isZeroAu(feeBooked.pending_au)) {
+      priorReservations.push({ role: 'operator_fee', paid_au: feeBooked.pending_au });
+    }
+    const feeBefore = this.safeAddAu(fee.swept_cum_au, feeBooked.pending_au);
+    if (feeBefore instanceof Error) return feeBefore;
+    const payableFee = this.safeSubAu(fee.cum_au, feeBefore);
     if (payableFee instanceof Error) return payableFee;
-    if (this.isZeroAu(payableFee)) {
+    const deferredFee = value.carry.find(entry => entry.role === 'operator_fee');
+    if (deferredFee) {
+      if (operatorOutputs.length !== 0 || deferredFee.liability_au !== payableFee) {
+        return new Error('Deferred fiat fee does not match the unswept, unbooked balance.');
+      }
+    } else if (this.isZeroAu(payableFee)) {
       if (operatorOutputs.length !== 0) {
         return new Error('Targeted payout plan includes a nonexistent operator fee.');
       }
@@ -6401,13 +6476,24 @@ class MayhemContract extends Contract {
     if (normalized.outputs.length > maxOutputs) {
       return new Error('Targeted payout epoch output count exceeds limit.');
     }
+    const priorReservations = [];
     const completenessError = await this.validateTargetedPayoutEpochCompleteness(
       normalized,
-      params
+      params,
+      priorReservations
     );
     if (completenessError) return completenessError;
+    const history = await this.get(historyKey(normalized.rail));
+    if (history?.complete !== true && normalized.epoch !== 1) {
+      return new Error('Historical payout inventory must finish before freezing a new plan.');
+    }
+    const claims = await planClaimWrites(this, normalized);
+    if (claims instanceof Error) return claims;
+    if (history === null) await this.put(historyKey(normalized.rail), { through_epoch: 1, complete: true });
+    for (const [key, claim] of claims) await this.put(key, claim);
     await this.put(recordKey, {
       type: 'targeted_payout_epoch_plan',
+      ...(priorReservations.length ? { prior_reservations: priorReservations } : {}),
       rail: normalized.rail,
       epoch: normalized.epoch,
       plan_root: normalized.plan_root,
@@ -6686,6 +6772,8 @@ class MayhemContract extends Contract {
     }
     if (normalized.epoch === 508 && output.role === 'operator_fee' &&
         await fiat508FeeHeld(this, normalized.economic_op_id, plan)) return new Error('FIAT recovery holds the 508 fee.');
+    const claim = await openClaim(this, 'fiat', plan.value, output);
+    if (claim instanceof Error) return claim;
     const expectedKind = output.role === 'provider'
       ? 'stripe_transfer'
       : 'platform_balance';
@@ -7156,7 +7244,13 @@ class MayhemContract extends Contract {
         stableJson(preparation.payload?.output) !== stableJson(output)) {
       return new Error('Targeted output settlement requires its unconsumed preparation.');
     }
-    return preparation;
+    if (preparation.superseded_by !== undefined) return new Error('Targeted payout preparation was superseded.');
+    return this.validatePayoutPreparationRecord({
+      economicOpId: output.economic_op_id, rail, epoch: value.epoch, epochApplyHash: value.epoch_apply_hash,
+      kind: output.role === 'provider' ? 'liability' : 'fee', outputIndex: value.output_index,
+      payload: preparation.payload, liability: this.payoutPreparationLiabilityForOutput(value, output, rail),
+      externalEffectIds: rail === 'tnk' ? [value.external_effect_id] : [],
+    });
   }
 
   async applyTargetedTnkOutputFeature(key, value) {
@@ -7221,17 +7315,22 @@ class MayhemContract extends Contract {
     if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
       return new Error('Targeted TNK transfer was already consumed.');
     }
-    const preparationReady = await this.validatePayoutPreparationConsumption(
-      [preparation]
-    );
-    if (preparationReady instanceof Error) return preparationReady;
+    const claim = await openClaim(this, 'tnk', planned.plan.value, planned.output);
+    if (claim instanceof Error) return claim;
+    const claimWrites = claim === null ? [] : await consumeClaimWrites(this, claim, recordKey);
+    if (claimWrites instanceof Error) return claimWrites;
+    if (claim === null) {
+      const ready = await this.validatePayoutPreparationConsumption([preparation]);
+      if (ready instanceof Error) return ready;
+    }
     if (planned.output.role === 'provider') {
       const updates = await this.targetedPayoutSettlementUpdates(
         [planned.output],
         'tnk',
         normalized.epoch,
         normalized.at,
-        [transfer.tx_hash]
+        [transfer.tx_hash],
+        claim
       );
       if (updates instanceof Error) return updates;
       for (const update of updates.liabilityUpdates) {
@@ -7253,8 +7352,9 @@ class MayhemContract extends Contract {
         ...fee,
         swept_cum_au: swept,
         updated_epoch: Math.max(fee.updated_epoch, normalized.epoch),
-        last_targeted_settlement_epoch: normalized.epoch,
-        last_targeted_settlement_transfer: transfer.tx_hash,
+        last_targeted_settlement_epoch: Math.max(fee.last_targeted_settlement_epoch ?? 0, normalized.epoch),
+        last_targeted_settlement_transfer: fee.last_targeted_settlement_epoch > normalized.epoch
+          ? fee.last_targeted_settlement_transfer : transfer.tx_hash,
       };
       const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
       if (nextFeeError) return nextFeeError;
@@ -7269,9 +7369,11 @@ class MayhemContract extends Contract {
     });
     const preparationError = await this.consumePayoutPreparations(
       [preparation],
-      recordKey
+      recordKey,
+      claim !== null
     );
     if (preparationError) return preparationError;
+    for (const [key, value] of claimWrites) await this.put(key, value);
     await this.put(recordKey, {
       type: 'targeted_tnk_output_settlement',
       rail: 'tnk',
@@ -7329,7 +7431,6 @@ class MayhemContract extends Contract {
       'fiat'
     );
     if (preparation instanceof Error) return preparation;
-    if (preparation.superseded_by !== undefined) return new Error('FIAT preparation was superseded.');
     const attemptKey = this.targetedFiatAttemptRecordKey(
       normalized.economic_op_id,
       normalized.attempt_id
@@ -7359,17 +7460,22 @@ class MayhemContract extends Contract {
         return new Error('Targeted Stripe transfer evidence was already consumed.');
       }
     }
-    const preparationReady = await this.validatePayoutPreparationConsumption(
-      [preparation]
-    );
-    if (preparationReady instanceof Error) return preparationReady;
+    const claim = await openClaim(this, 'fiat', planned.plan.value, planned.output);
+    if (claim instanceof Error) return claim;
+    const claimWrites = claim === null ? [] : await consumeClaimWrites(this, claim, recordKey);
+    if (claimWrites instanceof Error) return claimWrites;
+    if (claim === null) {
+      const ready = await this.validatePayoutPreparationConsumption([preparation]);
+      if (ready instanceof Error) return ready;
+    }
     if (planned.output.role === 'provider') {
       const updates = await this.targetedPayoutSettlementUpdates(
         [planned.output],
         'fiat',
         normalized.epoch,
         normalized.at,
-        [transfer.ref]
+        [transfer.ref],
+        claim
       );
       if (updates instanceof Error) return updates;
       for (const update of updates.liabilityUpdates) {
@@ -7393,8 +7499,9 @@ class MayhemContract extends Contract {
         ...fee,
         swept_cum_au: swept,
         updated_epoch: Math.max(fee.updated_epoch, normalized.epoch),
-        last_targeted_settlement_epoch: normalized.epoch,
-        last_targeted_settlement_transfer: transfer.ref,
+        last_targeted_settlement_epoch: Math.max(fee.last_targeted_settlement_epoch ?? 0, normalized.epoch),
+        last_targeted_settlement_transfer: fee.last_targeted_settlement_epoch > normalized.epoch
+          ? fee.last_targeted_settlement_transfer : transfer.ref,
       };
       const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
       if (nextFeeError) return nextFeeError;
@@ -7416,9 +7523,11 @@ class MayhemContract extends Contract {
     }
     const preparationError = await this.consumePayoutPreparations(
       [preparation],
-      recordKey
+      recordKey,
+      claim !== null
     );
     if (preparationError) return preparationError;
+    for (const [key, value] of claimWrites) await this.put(key, value);
     await this.put(attemptKey, {
       ...attempt,
       consumed: true,
@@ -7542,9 +7651,7 @@ class MayhemContract extends Contract {
           output.economic_op_id
         )
       );
-      if (!settled ||
-          settled.economic_op_id !== output.economic_op_id ||
-          settled.value.plan_root !== normalized.plan_root) {
+      if (!receiptMatchesOutput(settled, plan.value, output)) {
         return new Error('Targeted payout epoch has unsettled planned outputs.');
       }
     }
@@ -14202,10 +14309,17 @@ class MayhemContract extends Contract {
     return validatedTails;
   }
 
-  async consumePayoutPreparations(plans, settlementKey) {
-    const validatedTails = await this.validatePayoutPreparationConsumption(plans);
+  async consumePayoutPreparations(plans, settlementKey, independent = false) {
+    const validatedTails = independent ? [] : await this.validatePayoutPreparationConsumption(plans);
     if (validatedTails instanceof Error) return validatedTails;
     for (const record of plans) {
+      if (independent && record.liability) {
+        const key = this.payoutPreparationAggregateTailKey(record.rail, record.liability.provider);
+        const tail = await this.get(key);
+        if (tail?.economic_op_id === record.economic_op_id && tail.consumed === false) {
+          validatedTails.push({ key, value: tail });
+        }
+      }
       await this.put(
         this.payoutPreparationRecordKey(record.rail, record.economic_op_id),
         {
@@ -14245,7 +14359,7 @@ class MayhemContract extends Contract {
     return rail === 'tap' ? this.targetedTapParamsAt(at, policyKeys) : this.activeParamsAt(at, policyKeys);
   }
 
-  async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds) {
+  async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds, claim = null) {
     const params = await this.targetedPayoutHoldbackParamsAt(rail, at);
     if (params instanceof Error) return params;
     const liabilityUpdates = [];
@@ -14319,7 +14433,7 @@ class MayhemContract extends Contract {
         refreshed.paid_cum_au
       );
       if (payable instanceof Error) return payable;
-      if (refreshed.paid_cum_au !== output.paid_cum_au_before) {
+      if (claim === null && refreshed.paid_cum_au !== output.paid_cum_au_before) {
         return new Error('Targeted settlement paid cumulative watermark mismatch.');
       }
       let settledAu = output.au;
@@ -14345,9 +14459,11 @@ class MayhemContract extends Contract {
       const nextLiability = {
         ...refreshed,
         paid_cum_au: paidCumAu,
+        last_holdback_release_epoch: claim ? Math.max(liability.last_holdback_release_epoch ?? 0, epoch) : refreshed.last_holdback_release_epoch,
         updated_epoch: Math.max(refreshed.updated_epoch, epoch),
-        last_settlement_epoch: epoch,
-        last_settlement_transfer: transferIds[outputIndex],
+        last_settlement_epoch: claim ? Math.max(refreshed.last_settlement_epoch ?? 0, epoch) : epoch,
+        last_settlement_transfer: claim && refreshed.last_settlement_epoch > epoch
+          ? refreshed.last_settlement_transfer : transferIds[outputIndex],
         updated_at: this.tx,
       };
       const nextLiabilityError = this.guardianValidatePayoutLiabilityRecord(
@@ -14412,7 +14528,7 @@ class MayhemContract extends Contract {
         refreshed.paid_cum_au
       );
       if (payable instanceof Error) return payable;
-      if (refreshed.paid_cum_au !== providerPaid.aggregate_paid_cum_au_before) {
+      if (claim === null && refreshed.paid_cum_au !== providerPaid.aggregate_paid_cum_au_before) {
         return new Error('Targeted settlement aggregate paid cumulative watermark mismatch.');
       }
       if (this.compareAu(paidAu, payable) > 0) {
@@ -14423,8 +14539,9 @@ class MayhemContract extends Contract {
       const nextEarning = {
         ...refreshed,
         paid_cum_au: paidCumAu,
+        last_holdback_release_epoch: claim ? Math.max(earning.last_holdback_release_epoch ?? 0, epoch) : refreshed.last_holdback_release_epoch,
         updated_epoch: Math.max(refreshed.updated_epoch, epoch),
-        last_targeted_settlement_epoch: epoch,
+        last_targeted_settlement_epoch: claim ? Math.max(refreshed.last_targeted_settlement_epoch ?? 0, epoch) : epoch,
         updated_at: this.tx,
       };
       const nextError = this.guardianValidateEarningRecord(
@@ -14839,6 +14956,10 @@ class MayhemContract extends Contract {
       'Targeted TNK settlement'
     );
     if (applyAnchor instanceof Error) return applyAnchor;
+    if (await this.get(this.targetedPayoutEpochPlanRecordKey('tnk', value.epoch)) !== null ||
+        await this.get(historyKey('tnk')) !== null) {
+      return new Error('Indexed payouts require an individual output receipt.');
+    }
     const preparations = await this.payoutPreparationsForSettlement(
       value,
       normalized,
@@ -15036,6 +15157,10 @@ class MayhemContract extends Contract {
       'Targeted fiat settlement'
     );
     if (applyAnchor instanceof Error) return applyAnchor;
+    if (await this.get(this.targetedPayoutEpochPlanRecordKey('fiat', value.epoch)) !== null ||
+        await this.get(historyKey('fiat')) !== null) {
+      return new Error('Indexed payouts require an individual output receipt.');
+    }
     const preparations = await this.payoutPreparationsForSettlement(
       value,
       normalized,
@@ -15277,6 +15402,12 @@ class MayhemContract extends Contract {
     const dustValue = unpaidValue % USD_CENT_AU;
     if (dustValue === 0n) return new Error('Provider has no fiat dust to sweep.');
     const dustAu = this.canonicalAu(dustValue);
+    const booked = await bookedBalance(this, 'fiat', providerScope({ provider: this.value.provider }));
+    if (booked instanceof Error) return booked;
+    const available = unbookedBalance(this, unpaid, ZERO_AU, booked);
+    if (available instanceof Error || this.compareAu(available.payable, dustAu) < 0) {
+      return new Error('Fiat dust is reserved by a frozen payout.');
+    }
     const totalAu = this.safeSubAu(refreshed.total_au, dustAu);
     if (totalAu instanceof Error) return totalAu;
     const dustSweptCumAu = this.safeAddAu(refreshed.fiat_dust_swept_cum_au ?? ZERO_AU, dustAu);

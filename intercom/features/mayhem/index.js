@@ -385,6 +385,7 @@ const participantFor = (value) => {
   if ([
     'prepare_targeted_payout',
     'prepare_targeted_payout_epoch',
+    'index_targeted_payout_history',
     'recover_fiat_preparation',
     'prepare_targeted_fiat_attempt',
     'finalize_targeted_fiat_attempt',

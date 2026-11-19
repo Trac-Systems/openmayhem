@@ -5229,6 +5229,18 @@ struct AdminTnkSettlementArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
+    /// Freeze the epoch plan without dispatching payments.
+    #[arg(long, requires = "submit", conflicts_with_all = ["sim", "submit_transfer", "output_id", "settlement_json", "settlement_file"])]
+    freeze_only: bool,
+
+    /// Close an already frozen epoch when Core confirms every planned output.
+    #[arg(long, requires = "submit", conflicts_with_all = ["sim", "submit_transfer", "output_id", "freeze_only", "settlement_json", "settlement_file"])]
+    close_only: bool,
+
+    /// Dispatch only this economic operation from the confirmed frozen epoch plan.
+    #[arg(long, requires = "submit_transfer", conflicts_with_all = ["settlement_json", "settlement_file"], value_parser = parse_payout_output_id)]
+    output_id: Option<String>,
+
     /// Full settle_targeted_tnk feature JSON produced by the settlement runner.
     #[arg(long)]
     settlement_json: Option<String>,
@@ -5305,6 +5317,18 @@ struct AdminTapSettlementArgs {
 struct AdminFiatSettlementArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
+
+    /// Freeze the epoch plan without dispatching payments.
+    #[arg(long, requires = "submit", conflicts_with_all = ["sim", "submit_transfer", "output_id", "settlement_json", "settlement_file"])]
+    freeze_only: bool,
+
+    /// Close an already frozen epoch when Core confirms every planned output.
+    #[arg(long, requires = "submit", conflicts_with_all = ["sim", "submit_transfer", "output_id", "freeze_only", "settlement_json", "settlement_file"])]
+    close_only: bool,
+
+    /// Dispatch only this economic operation from the confirmed frozen epoch plan.
+    #[arg(long, requires = "submit_transfer", conflicts_with_all = ["settlement_json", "settlement_file"], value_parser = parse_payout_output_id)]
+    output_id: Option<String>,
 
     /// Full settle_targeted_fiat feature JSON produced by the settlement runner.
     #[arg(long)]
@@ -37110,6 +37134,228 @@ fn admin_fiat_settlement_payload(args: &AdminFiatSettlementArgs) -> Result<Value
     Ok(value)
 }
 
+fn parse_payout_output_id(value: &str) -> std::result::Result<String, String> {
+    if is_hex_len(value, 64) && value.bytes().all(|b| !b.is_ascii_uppercase()) {
+        Ok(value.to_owned())
+    } else {
+        Err("output ID must be 64 lowercase hex digits".into())
+    }
+}
+
+// Prior versions persisted plans and preparations without a rail-wide
+// outstanding index. Each signed page is bounded; confirmed cursor progress
+// survives process loss. No processor credentials are used for inventory.
+async fn ensure_payout_history(rpc: &PeerRpcClient, signer: &TargetedPayoutPreparationSigner, rail: &str) -> Result<()> {
+    let key = format!("payout/history/{rail}");
+    for _ in 0..64 {
+        let state = read_confirmed_state_value(rpc, &key).await?;
+        if state.as_ref().is_some_and(|s| s["complete"] == true) { return Ok(()); }
+        let after = match &state {
+            Some(s) => s["through_epoch"].as_u64().context("invalid payout history cursor")?,
+            None => 0,
+        };
+        let head = read_confirmed_state_value(rpc, "epoch/apply/state").await?
+            .and_then(|s| s["updated_epoch"].as_u64()).context("missing applied payout epoch")?;
+        let end = after.saturating_add(32).min(head);
+        ensure!(end > after, "inconsistent payout history boundary");
+        let value = json!({
+            "op":"index_targeted_payout_history", "contract_version": CONTRACT_VERSION,
+            "rail":rail, "epoch":end, "after_epoch":after, "admin":"", "admin_sig":""
+        });
+        let indexed = submit_targeted_payout_control(rpc, signer, &value, &key, state.as_ref(),
+            |record| record["through_epoch"].as_u64().is_some_and(|n| n >= end)).await?;
+        if indexed["complete"] == true { return Ok(()); }
+    }
+    bail!("payout history inventory advanced 64 pages; resume the same command");
+}
+
+async fn require_output_claim(rpc: &PeerRpcClient, rail: &str, plan: &Value, output: &Value) -> Result<()> {
+    let id = output["economic_op_id"].as_str().context("missing payout output ID")?;
+    let claim = read_confirmed_state_value(rpc, &format!("payout/claim/{rail}/{id}")).await?
+        .context("frozen output has no independently dispatchable claim")?;
+    ensure!(claim["economic_op_id"] == id && claim["rail"] == rail && claim["epoch"] == plan["epoch"]
+        && claim["plan_root"] == plan["plan_root"] && claim["output_index"] == output["output_index"]
+        && claim.get("consumed_by") == Some(&Value::Null), "payout claim conflicts with the frozen output");
+    if let Some(reason) = claim["blocked_reason"].as_str() {
+        bail!("historical payout held: {reason}");
+    }
+    if rail == "fiat" && output["role"] == "provider" {
+        let provider = output["provider"].as_str().context("missing provider")?;
+        if let Some(review) = read_confirmed_state_value(rpc, &format!("payout/legacy-review/fiat/{provider}")).await? {
+            let old = review["old_operation"].as_str().context("invalid historical review owner")?;
+            if old != id && review["new_operation"] != id {
+                ensure!(read_confirmed_state_value(rpc, &format!("payout/recovery/fiat/{old}/resolution")).await?.is_some(),
+                    "historical FIAT review binds the provider's unchanged paid watermarks");
+            }
+        }
+    }
+    if let Some(group_key) = claim["legacy_group"].as_str() {
+        let group = read_confirmed_state_value(rpc, group_key).await?.context("missing historical payout reservation")?;
+        ensure!(group["owner"] == id && group["blocked"] == false
+            && group.get("consumed_by") == Some(&Value::Null), "historical payout reservation requires reconciliation");
+    }
+    Ok(())
+}
+
+// Check the same immutable locks Core requires for accounting before using
+// an already prepared operation to contact a payment provider.
+async fn require_prepared_output_locks(rpc: &PeerRpcClient, rail: &str, record: &Value) -> Result<()> {
+    let id = record["economic_op_id"].as_str().context("missing preparation identity")?;
+    if !record["liability"].is_null() {
+        let liability = &record["liability"];
+        let provider = liability["provider"].as_str().context("missing preparation provider")?;
+        let revision = liability["payout_revision"].as_str().context("missing preparation revision")?;
+        let before = liability["paid_cum_au_before"].as_str().context("missing revision watermark")?;
+        let key = format!("payout/preparation-lock/{rail}/{provider}/{revision}/{before}");
+        let lock = read_confirmed_state_value(rpc, &key).await?.context("missing preparation liability lock")?;
+        ensure!(lock["economic_op_id"] == id && lock["rail"] == rail && lock["provider"] == provider &&
+            lock["payout_revision"] == revision && lock["paid_cum_au_before"] == before,
+            "preparation liability lock has a different owner or watermark");
+    }
+    for effect in record["external_effect_ids"].as_array().context("missing preparation effects")? {
+        let effect = effect.as_str().context("invalid prepared effect")?;
+        let key = format!("payout/preparation-effect/{rail}/{effect}");
+        let lock = read_confirmed_state_value(rpc, &key).await?.context("missing prepared effect lock")?;
+        ensure!(lock["economic_op_id"] == id && lock["effect_id"] == effect && lock["consumed"] == false,
+            "prepared effect is consumed or belongs to a different output");
+    }
+    Ok(())
+}
+
+async fn require_prepared_fiat_attempt(
+    rpc: &PeerRpcClient, record: &Value, plan: &Value, output: &Value,
+) -> Result<()> {
+    let preparation = &record["preparation"];
+    let id = output["economic_op_id"].as_str().context("missing output identity")?;
+    let attempt = preparation["attempt_id"].as_str().context("missing attempt identity")?;
+    ensure!(record["economic_op_id"] == id && record["attempt_id"] == attempt && record["consumed"] == false &&
+        preparation["economic_op_id"] == id && preparation["plan_root"] == plan["plan_root"] &&
+        preparation["epoch"] == plan["epoch"] && preparation["epoch_apply_hash"] == plan["epoch_apply_hash"] &&
+        preparation["output_index"] == output["output_index"],
+        "FIAT attempt conflicts with the original frozen output");
+    let key_hash = preparation["idempotency_key_hash"].as_str().context("missing attempt idempotency hash")?;
+    let lock = read_confirmed_state_value(rpc, &format!("payout/attempt-idempotency/fiat/{key_hash}"))
+        .await?.context("missing attempt idempotency lock")?;
+    ensure!(lock["economic_op_id"] == id && lock["attempt_id"] == attempt, "FIAT attempt idempotency lock mismatch");
+    if let Some(quote) = preparation["request"]["fx_quote_id"].as_str() {
+        let lock = read_confirmed_state_value(rpc, &format!("payout/attempt-quote/fiat/{quote}"))
+            .await?.context("missing frozen quote lock")?;
+        ensure!(lock["economic_op_id"] == id && lock["attempt_id"] == attempt &&
+            lock["quote_hash"] == preparation["request"]["fx_quote_hash"], "FIAT attempt quote lock mismatch");
+    }
+    Ok(())
+}
+
+fn selected_payout_index(plan: &Value, id: &str) -> Result<usize> {
+    let outputs = plan["outputs"].as_array().context("frozen plan has no outputs")?;
+    let mut matches = outputs.iter().enumerate().filter(|(_, out)| out["economic_op_id"] == id);
+    let (index, output) = matches.next().context("--output-id is absent from the frozen plan")?;
+    ensure!(matches.next().is_none() && output["output_index"].as_u64() == Some(index as u64),
+        "ambiguous or inconsistent frozen output identity");
+    Ok(index)
+}
+
+async fn confirmed_payout_close(rpc: &PeerRpcClient, plan: &Value) -> Result<Option<Value>> {
+    let rail = plan["rail"].as_str().context("missing rail")?;
+    let epoch = plan["epoch"].as_u64().context("missing epoch")?;
+    let row = read_confirmed_state_value(rpc, &format!("settle/targeted/{rail}/{epoch}")).await?;
+    if let Some(row) = &row {
+        ensure!(row["type"] == "targeted_payout_epoch_close" && row["rail"] == rail &&
+            row["epoch"] == epoch && row["plan_root"] == plan["plan_root"] &&
+            row["value"]["epoch_apply_hash"] == plan["epoch_apply_hash"] &&
+            row["outputs_root"] == plan["outputs_root"] && row["carry_root"] == plan["carry_root"],
+            "confirmed epoch close conflicts with the frozen plan");
+    }
+    Ok(row)
+}
+
+async fn confirmed_payout_output(rpc: &PeerRpcClient, plan: &Value, output: &Value) -> Result<Option<Value>> {
+    let rail = plan["rail"].as_str().context("missing rail")?;
+    let epoch = plan["epoch"].as_u64().context("missing epoch")?;
+    let id = output["economic_op_id"].as_str().context("missing output identity")?;
+    let key = format!("settle/targeted/{rail}/{epoch}/output/{id}");
+    let receipt = read_confirmed_state_value(rpc, &key).await?;
+    if let Some(row) = &receipt {
+        ensure!(row["type"] == format!("targeted_{rail}_output_settlement") && row["rail"] == rail
+            && row["epoch"] == epoch && row["economic_op_id"] == id && row["value"]["economic_op_id"] == id
+            && row["value"]["preparation_id"] == id && row["value"]["plan_root"] == plan["plan_root"] && row["value"]["output_index"] == output["output_index"]
+            && row["value"]["epoch_apply_hash"] == plan["epoch_apply_hash"],
+            "confirmed payout receipt conflicts with the frozen output");
+    }
+    Ok(receipt)
+}
+
+enum ExplicitPayout {
+    Dispatch(Option<usize>),
+    Report(Value),
+}
+
+// An explicit replay or close uses only the retained canonical plan and Core
+// receipts. Only an actual close needs the Core admin signer.
+async fn explicit_payout(
+    rpc: &PeerRpcClient, tx: &AdminTxArgs, home: &Path, rail: &str, epoch: u64,
+    output_id: Option<&str>, close_only: bool,
+) -> Result<ExplicitPayout> {
+    if output_id.is_none() && !close_only { return Ok(ExplicitPayout::Dispatch(None)); }
+    let record = read_confirmed_state_value(rpc, &format!("payout/epoch-plan/{rail}/{epoch}")).await?
+        .context("explicit payout requires a confirmed frozen epoch plan")?;
+    let plan = canonical_targeted_payout_plan(&record, rail, epoch)?;
+    let outputs = plan["outputs"].as_array().context("missing frozen outputs")?;
+    let already_settled = confirmed_payout_close(rpc, &plan).await?;
+    let mut settlement_state = already_settled.clone();
+    let mut receipts = Vec::new();
+    let mut pending = Vec::new();
+    let mut submitted = false;
+    if let Some(id) = output_id {
+        let index = selected_payout_index(&plan, id)?;
+        if let Some(row) = confirmed_payout_output(rpc, &plan, &outputs[index]).await? {
+            receipts.push(row);
+        } else {
+            ensure!(already_settled.is_none(), "closed epoch is missing its selected output receipt");
+            return Ok(ExplicitPayout::Dispatch(Some(index)));
+        }
+    } else if settlement_state.is_none() {
+        for output in outputs {
+            if confirmed_payout_output(rpc, &plan, output).await?.is_none() {
+                pending.push(json!({"economic_op_id":output["economic_op_id"],
+                    "output_index":output["output_index"], "reason":"awaiting_output_receipt"}));
+            }
+        }
+        if pending.is_empty() {
+            let signer = targeted_payout_preparation_signer(tx, home, rpc).await?;
+            let at = plan["at"].as_u64().context("missing frozen plan timestamp")?;
+            settlement_state = Some(close_targeted_payout_epoch(rpc, &signer, &plan, at).await?);
+            submitted = true;
+        }
+    }
+    Ok(ExplicitPayout::Report(json!({
+        "ok":true, "submitted":submitted, "epoch":epoch, "settlement":plan,
+        "freeze_only":false, "close_only":close_only, "selected_output_id":output_id,
+        "already_settled":already_settled,"settlement_state":settlement_state,"feature":record,
+        "pending":settlement_state.is_none(), "pending_outputs":pending,"output_settlements":receipts,
+    })))
+}
+
+fn print_explicit_payout(report: &Value, as_json: bool) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        print_payout_progress(report);
+    }
+    Ok(())
+}
+
+fn print_payout_progress(report: &Value) {
+    if let Some(id) = report["selected_output_id"].as_str() {
+        let confirmed = report["output_settlements"].as_array().is_some_and(|rows| !rows.is_empty());
+        println!("Selected output {id} confirmed: {confirmed}");
+    }
+    println!("Epoch pending: {}", report["pending"].as_bool().unwrap_or(false));
+    for item in report["pending_outputs"].as_array().into_iter().flatten() {
+        println!("  {}  {}", item["economic_op_id"].as_str().unwrap_or(""), item["reason"].as_str().unwrap_or(""));
+    }
+}
+
 async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Result<()> {
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
@@ -37136,6 +37382,15 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         require_secure_fund_rpc_url(&rpc_url)?;
     }
     let rpc = PeerRpcClient::new(&rpc_url)?;
+    let selected = match explicit_payout(&rpc, &args.tx, &home, "tnk", epoch, args.output_id.as_deref(), args.close_only).await? {
+        ExplicitPayout::Dispatch(selected) => selected,
+        ExplicitPayout::Report(report) => return print_explicit_payout(&report, args.tx.json),
+    };
+    let signer = if args.tx.submit && !args.tx.sim {
+        let signer = targeted_payout_preparation_signer(&args.tx, &home, &rpc).await?;
+        ensure_payout_history(&rpc, &signer, "tnk").await?;
+        Some(signer)
+    } else { None };
     let treasury_address =
         resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
     let treasury_keypair_path =
@@ -37175,6 +37430,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         && !plan.msb_outputs.is_empty()
         && args.tx.submit
         && !args.submit_transfer
+        && !args.freeze_only
     {
         bail!("--submit requires --submit-transfer so the embedded MSB reader can confirm every TNK settlement output");
     }
@@ -37182,10 +37438,10 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     let mut payout_preparation_results = Vec::new();
     let mut msb_transfer_results = Vec::new();
     let mut output_settlements = Vec::new();
+    let mut pending_outputs = Vec::new();
     let mut plan_state = None;
     let mut settlement_state = plan.already_settled.clone();
     let mut feature_result = None;
-    let mut signer = None;
     if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim {
         let canonical_preexisting =
             read_confirmed_state_value(&rpc, &format!("payout/epoch-plan/tnk/{epoch}"))
@@ -37195,14 +37451,25 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             ensure_confirmed_snapshot_current(&rpc, "payout/liability/tnk/", plan.signed_length)
                 .await?;
         }
-        let admin_signer = targeted_payout_preparation_signer(&args.tx, &home, &rpc).await?;
+        let admin_signer = signer.as_ref().context("missing payout signer")?;
         let (canonical_plan, record) =
-            ensure_targeted_payout_epoch_plan(&rpc, &admin_signer, &plan.payload).await?;
+            ensure_targeted_payout_epoch_plan(&rpc, admin_signer, &plan.payload).await?;
         plan.payload = canonical_plan;
         plan_state = Some(record);
-        signer = Some(admin_signer);
     }
-    if plan.already_settled.is_none() && args.submit_transfer && !plan.msb_outputs.is_empty() {
+    let mut dispatch_indices = Vec::new();
+    if plan.already_settled.is_none() && args.submit_transfer {
+        let outputs = plan.payload["outputs"].as_array().context("missing frozen TNK outputs")?;
+        for (index, output) in outputs.iter().enumerate() {
+            if selected.is_some_and(|selected| index != selected) { continue; }
+            if let Some(receipt) = confirmed_payout_output(&rpc, &plan.payload, output).await? {
+                output_settlements.push(receipt);
+            } else {
+                dispatch_indices.push(index);
+            }
+        }
+    }
+    if !dispatch_indices.is_empty() {
         let signer = signer
             .as_ref()
             .context("TNK settlement requires its canonical admin signer")?;
@@ -37228,7 +37495,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             );
         }
         let (stores_directory, store_name) = msb_store_from_keypair_path(keypair_path)?;
-        for (index, output) in plan.msb_outputs.iter().enumerate() {
+        for (position, index) in dispatch_indices.into_iter().enumerate() {
+            let output = &plan.msb_outputs[index];
             let settlement_output = plan
                 .payload
                 .get("outputs")
@@ -37243,18 +37511,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                 .context("canonical TNK output is missing economic_op_id")?
                 .to_owned();
             let output_record_key = format!("settle/targeted/tnk/{epoch}/output/{operation_id}");
-            if let Some(existing) = read_confirmed_state_value(&rpc, &output_record_key).await? {
-                ensure!(
-                    existing.get("type").and_then(Value::as_str)
-                        == Some("targeted_tnk_output_settlement")
-                        && existing.get("economic_op_id").and_then(Value::as_str)
-                            == Some(operation_id.as_str())
-                        && existing.pointer("/value/plan_root") == plan.payload.get("plan_root"),
-                    "canonical TNK output settlement conflicts with the epoch plan"
-                );
-                output_settlements.push(existing);
-                continue;
-            }
+            let result: Result<()> = async {
+            require_output_claim(&rpc, "tnk", &plan.payload, &settlement_output).await?;
             let liability =
                 targeted_payout_output_liability("tnk", &plan.payload, &settlement_output)?;
             let kind = if liability.is_some() {
@@ -37276,7 +37534,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                     &output.amount,
                     args.msb_transfer_timeout_seconds,
                     args.msb_transfer_max_retries,
-                    (index == 0)
+                    (position == 0)
                         .then(|| args.expected_treasury_balance_before.as_deref())
                         .flatten(),
                     Some(&treasury_password),
@@ -37345,7 +37603,17 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                 .cloned()
                 .context("canonical TNK preparation is missing its signed MSB payload")?;
             ensure!(
-                preparation.get("economic_op_id").and_then(Value::as_str)
+                preparation["type"] == "targeted_payout_preparation"
+                    && preparation["rail"] == "tnk" && preparation["epoch"] == epoch
+                    && preparation["output_index"] == index && preparation["kind"] == kind
+                    && preparation["payload"]["plan_root"] == plan.payload["plan_root"]
+                    && preparation["payload"]["output"] == settlement_output
+                    && preparation["payload"]["network"] == network
+                    && preparation["payload"]["treasury_from"] == treasury_address
+                    && preparation["epoch_apply_hash"] == epoch_apply_hash
+                    && preparation["payload"]["msb_payload"]["tro"]["tx"] == tx_hash
+                    && preparation.get("superseded_by").is_none()
+                    && preparation.get("economic_op_id").and_then(Value::as_str)
                     == Some(operation_id.as_str())
                     && preparation.get("consumed").and_then(Value::as_bool) == Some(false)
                     && preparation
@@ -37356,6 +37624,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                         }),
                 "canonical TNK payout preparation does not match its output"
             );
+            require_prepared_output_locks(&rpc, "tnk", &preparation).await?;
             payout_preparation_results.push(preparation);
             let transfer = execute_prepared_msb_settlement_transfer(
                 &network,
@@ -37448,11 +37717,22 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                 "canonical_preparation": preparation_key,
                 "transfer": transfer,
             }));
+            Ok(())
+            }.await;
+            if let Err(error) = result {
+                pending_outputs.push(json!({"economic_op_id": operation_id,
+                    "output_index": index, "reason":"dispatch_error", "detail": redact_stripe_credentials(&format!("{error:#}"))}));
+            }
+
         }
     }
 
     let settlement_report = plan.payload.clone();
-    if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim {
+    if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim
+        && !args.freeze_only
+        && pending_outputs.is_empty()
+        && selected.is_none()
+    {
         let signer = signer
             .as_ref()
             .context("TNK settlement requires its canonical admin signer")?;
@@ -37468,7 +37748,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .cloned();
     }
 
-    let copy_paste_submit = format!(
+    let mut copy_paste_submit = format!(
         "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}{}{}",
         epoch,
         planned_at,
@@ -37507,11 +37787,19 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .map(|balance| format!(" --expected-treasury-balance-before {}", shell_single_quote(balance)))
             .unwrap_or_default()
     );
+    if let Some(id) = &args.output_id {
+        copy_paste_submit.push_str(&format!(" --output-id {id}"));
+    } else if args.freeze_only {
+        copy_paste_submit = copy_paste_submit.replacen("--submit-transfer --submit", "--freeze-only --submit", 1);
+    }
     let msb_transfer_commands = Vec::<String>::new();
 
     let report = json!({
         "ok": true,
-        "submitted": feature_result.is_some(),
+        "submitted": plan_state.is_some(),
+        "freeze_only": args.freeze_only,
+        "close_only": false,
+        "selected_output_id": args.output_id,
         "sim": args.tx.submit && args.tx.sim,
         "already_settled": plan.already_settled,
         "no_work": plan.already_settled.is_none() && plan.msb_outputs.is_empty(),
@@ -37531,6 +37819,9 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         "payout_preparations": payout_preparation_results,
         "msb_transfers": msb_transfer_results,
         "msb_outputs": plan.msb_outputs,
+        "output_settlements": output_settlements,
+        "pending": args.tx.submit && settlement_state.is_none(),
+        "pending_outputs": pending_outputs,
         "skipped_providers": plan.skipped_providers,
         "copy_paste": {
             "submit_settlement": copy_paste_submit,
@@ -37575,62 +37866,6 @@ fn admin_fiat_dust_sweep_payload(args: &AdminFiatDustSweepArgs) -> Result<Value>
         "epoch": args.epoch,
         "at": args.at,
     }))
-}
-
-// Later revisions of the same provider spend the aggregate left by this one.
-// The immutable plan orders them contiguously, ahead of the operator fee.
-fn next_independent_fiat_output(outputs: &[Value], index: usize) -> Result<usize> {
-    let provider = outputs[index]["provider"]
-        .as_str()
-        .context("waiting for a FIAT output requires its provider")?;
-    let dependent = outputs[index + 1..]
-        .iter()
-        .take_while(|output| output["provider"].as_str() == Some(provider))
-        .count();
-    Ok(index + 1 + dependent)
-}
-
-fn check_fiat_output_aggregate(
-    output: &Value,
-    earning_paid: MoneyAu,
-    tail: Option<&Value>,
-) -> Result<()> {
-    let before = value_money_au(&output["aggregate_paid_cum_au_before"])
-        .context("invalid planned fiat aggregate watermark")?;
-    if let Some(tail) = tail {
-        let after = value_money_au(&tail["paid_cum_au_after"])
-            .context("invalid fiat preparation tail watermark")?;
-        let owner = tail["economic_op_id"]
-            .as_str()
-            .filter(|id| is_hex_len(id, 64))
-            .context("invalid fiat preparation tail operation")?;
-        if tail["consumed"]
-            .as_bool()
-            .context("invalid fiat preparation tail status")?
-        {
-            ensure!(
-                after == earning_paid,
-                "consumed fiat preparation {owner} ends at {after} AU but earnings show {earning_paid} AU"
-            );
-        } else {
-            // Per-output settlement must consume its own preparation tail.
-            ensure!(
-                Some(owner) == output["economic_op_id"].as_str(),
-                "open fiat preparation {owner} reserves through {after} AU; earnings show {earning_paid} AU and this output starts at {before} AU"
-            );
-            let paid = value_money_au(&output["paid_au"]).context("invalid planned fiat paid AU")?;
-            ensure!(
-                value_money_au(&tail["paid_cum_au_before"]) == Some(before)
-                    && before.checked_add(paid) == Some(after),
-                "open fiat preparation {owner} disagrees with its immutable output"
-            );
-        }
-    }
-    ensure!(
-        earning_paid == before,
-        "immutable fiat output starts at {before} aggregate AU but confirmed earnings show {earning_paid} AU"
-    );
-    Ok(())
 }
 
 /// Read both frozen plans before any Stripe access. Once an overlapping 542
@@ -37684,6 +37919,25 @@ fn check_fiat_508_sender_open(old_output: &Value, state: &Value) -> Result<()> {
     Ok(())
 }
 
+struct StripeSettlementProcessor {
+    client: reqwest::Client,
+    url: String,
+    secret: String,
+}
+
+fn settlement_processor<'a>(processor: &'a mut Option<StripeSettlementProcessor>,
+    args: &AdminFiatSettlementArgs, home: &Path) -> Result<&'a StripeSettlementProcessor> {
+    if processor.is_none() {
+        let secret = load_stripe_secret_key(args.stripe_env_file.as_ref(), home)?;
+        let url = stripe_api_base_url(args.stripe_api_base_url.as_deref())?;
+        validate_stripe_transfer_environment(&secret, &url, env::var("MAYHEM_STRIPE_MODE").ok().as_deref(),
+            stripe_transfer_runtime_is_mainnet()?)?;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+        *processor = Some(StripeSettlementProcessor { client, url, secret });
+    }
+    processor.as_ref().context("missing Stripe settlement processor")
+}
+
 async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
@@ -37715,6 +37969,15 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         require_secure_fund_rpc_url(&rpc_url)?;
     }
     let rpc = PeerRpcClient::new(&rpc_url)?;
+    let selected = match explicit_payout(&rpc, &args.tx, &home, "fiat", epoch, args.output_id.as_deref(), args.close_only).await? {
+        ExplicitPayout::Dispatch(selected) => selected,
+        ExplicitPayout::Report(report) => return print_explicit_payout(&report, args.tx.json),
+    };
+    let signer = if args.tx.submit && !args.tx.sim {
+        let signer = targeted_payout_preparation_signer(&args.tx, &home, &rpc).await?;
+        ensure_payout_history(&rpc, &signer, "fiat").await?;
+        Some(signer)
+    } else { None };
     let mut plan = build_fiat_settlement_plan(&rpc, epoch, at, &operator_to).await?;
     let blocking_skips = plan
         .skipped_providers
@@ -37729,54 +37992,16 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         && !plan.stripe_outputs.is_empty()
         && args.tx.submit
         && !args.submit_transfer
+        && !args.freeze_only
     {
         bail!(
             "--submit requires --submit-transfer when the canonical fiat plan has payable outputs"
         );
     }
 
-    if epoch == 508 && args.tx.submit && plan.already_settled.is_none() {
-        for output in plan.payload["outputs"]
-            .as_array()
-            .context("missing FIAT 508 outputs")?
-        {
-            if output["role"] == "provider" {
-                require_fiat_508_sender_open(&rpc, output).await?;
-            }
-        }
-    }
-
     let mut initial_attempt_quotes = Vec::<Option<StripeFxQuote>>::new();
-    let mut stripe_client = None::<reqwest::Client>;
-    let mut stripe_secret_key = None::<String>;
-    let mut stripe_api_url = None::<String>;
-    let mut platform_account = None::<StripePlatformAccount>;
-    if plan.already_settled.is_none() && args.submit_transfer && !plan.stripe_outputs.is_empty() {
-        let secret_key = load_stripe_secret_key(args.stripe_env_file.as_ref(), &home)?;
-        let api_base_url = stripe_api_base_url(args.stripe_api_base_url.as_deref())?;
-        validate_stripe_transfer_environment(
-            &secret_key,
-            &api_base_url,
-            env::var("MAYHEM_STRIPE_MODE").ok().as_deref(),
-            stripe_transfer_runtime_is_mainnet()?,
-        )?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-        let platform = stripe_platform_account(
-            &client,
-            &api_base_url,
-            &secret_key,
-            args.stripe_transfer_max_attempts,
-            args.stripe_transfer_retry_ms,
-        )
-        .await?;
-        stripe_client = Some(client);
-        stripe_secret_key = Some(secret_key);
-        stripe_api_url = Some(api_base_url);
-        platform_account = Some(platform);
-    }
-
+    let mut processor = None;
+    let mut platform_account = None;
     let mut plan_state = None;
     let mut output_settlements = Vec::new();
     let mut payout_preparations = Vec::new();
@@ -37784,7 +38009,6 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     let mut pending_outputs = Vec::new();
     let mut feature_result = None;
     let mut settlement_state = plan.already_settled.clone();
-    let mut signer = None;
     if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim {
         let canonical_preexisting =
             read_confirmed_state_value(&rpc, &format!("payout/epoch-plan/fiat/{epoch}"))
@@ -37804,19 +38028,11 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                     &plan.carry,
                 )?;
             } else {
+                let stripe = settlement_processor(&mut processor, args, &home)?;
+                let platform = stripe_platform_account(&stripe.client, &stripe.url, &stripe.secret,
+                    args.stripe_transfer_max_attempts, args.stripe_transfer_retry_ms).await?;
                 let (payload, quotes) = canonicalize_fiat_settlement_plan(
-                    stripe_client
-                        .as_ref()
-                        .context("Stripe client is missing for fiat plan construction")?,
-                    stripe_api_url
-                        .as_deref()
-                        .context("Stripe API URL is missing for fiat plan construction")?,
-                    stripe_secret_key
-                        .as_deref()
-                        .context("Stripe key is missing for fiat plan construction")?,
-                    platform_account
-                        .as_ref()
-                        .context("Stripe platform account is missing for fiat plan construction")?,
+                    &stripe.client, &stripe.url, &stripe.secret, &platform,
                     &plan,
                     epoch,
                     at,
@@ -37824,13 +38040,14 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                     args.stripe_transfer_retry_ms,
                 )
                 .await?;
+                platform_account = Some(platform);
                 plan.payload = payload;
                 initial_attempt_quotes = quotes;
             }
         }
-        let admin_signer = targeted_payout_preparation_signer(&args.tx, &home, &rpc).await?;
+        let admin_signer = signer.as_ref().context("missing payout signer")?;
         let (canonical_plan, record) =
-            ensure_targeted_payout_epoch_plan(&rpc, &admin_signer, &plan.payload).await?;
+            ensure_targeted_payout_epoch_plan(&rpc, admin_signer, &plan.payload).await?;
         plan.payload = canonical_plan;
         plan.stripe_outputs = plan
             .payload
@@ -37841,7 +38058,6 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .map(fiat_plan_output_as_settlement_output)
             .collect::<Result<Vec<_>>>()?;
         plan_state = Some(record);
-        signer = Some(admin_signer);
     }
 
     let planned_at = plan.payload.get("at").and_then(Value::as_u64).unwrap_or(at);
@@ -37849,58 +38065,33 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         let signer = signer
             .as_ref()
             .context("fiat settlement requires its canonical admin signer")?;
-        let client = stripe_client
-            .as_ref()
-            .context("Stripe client is missing for fiat execution")?;
-        let api_base_url = stripe_api_url
-            .as_deref()
-            .context("Stripe API URL is missing for fiat execution")?;
-        let secret_key = stripe_secret_key
-            .as_deref()
-            .context("Stripe key is missing for fiat execution")?;
         let outputs = plan
             .payload
             .get("outputs")
             .and_then(Value::as_array)
             .cloned()
             .context("canonical fiat plan is missing outputs")?;
-        let mut next_index = 0;
-        let mut unresolved_attempts = Vec::new();
-        while let Some(output) = outputs.get(next_index) {
-            let index = next_index;
-            next_index += 1;
+        for (index, output) in outputs.iter().enumerate() {
+            if selected.is_some_and(|selected| index != selected) { continue; }
             let economic_op_id = output
                 .get("economic_op_id")
                 .and_then(Value::as_str)
                 .filter(|value| is_hex_len(value, 64))
                 .context("canonical fiat output is missing economic_op_id")?;
-            let output_record_key = format!("settle/targeted/fiat/{epoch}/output/{economic_op_id}");
-            if let Some(existing) = read_confirmed_state_value(&rpc, &output_record_key).await? {
-                ensure!(
-                    existing.get("type").and_then(Value::as_str)
-                        == Some("targeted_fiat_output_settlement")
-                        && existing.get("economic_op_id").and_then(Value::as_str)
-                            == Some(economic_op_id)
-                        && existing.pointer("/value/plan_root") == plan.payload.get("plan_root"),
-                    "canonical fiat output settlement conflicts with the epoch plan"
-                );
-                output_settlements.push(existing);
+            if let Some(receipt) = confirmed_payout_output(&rpc, &plan.payload, output).await? {
+                output_settlements.push(receipt);
                 continue;
             }
             let output_result: Result<()> = async {
+                require_output_claim(&rpc, "fiat", &plan.payload, output).await?;
+                if epoch == 508 {
+                    if output["role"] == "provider" {
+                        require_fiat_508_sender_open(&rpc, output).await?;
+                    } else if let Some(sibling) = outputs.iter().find(|o| o["role"] == "provider") {
+                        require_fiat_508_sender_open(&rpc, sibling).await?;
+                    }
+                }
                 if output["role"] == "provider" {
-                    let provider = output["provider"].as_str().context("missing fiat provider")?;
-                    let length = confirmed_snapshot_signed_length(&rpc, "earn/fiat/").await?;
-                    let tail_key = format!("payout/preparation-tail/fiat/{provider}");
-                    let (earning_paid, tail) = tokio::try_join!(
-                        aggregate_provider_paid_cum_au(&rpc, provider, "fiat", length),
-                        read_state_value_at(&rpc, &tail_key, length)
-                    )?;
-                    check_fiat_output_aggregate(output, earning_paid, tail.as_ref())
-                        .with_context(|| format!(
-                            "checking fiat output {} ({economic_op_id}) for provider {provider} at signed length {length}",
-                            index + 1
-                        ))?;
                     // Existing attempts reconcile any external effect before checking funds.
                     if read_confirmed_state_value(
                         &rpc,
@@ -37909,10 +38100,9 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                     .await?
                     .is_none()
                     {
+                        let stripe = settlement_processor(&mut processor, args, &home)?;
                         require_fiat_output_funding(
-                            client,
-                            api_base_url,
-                            secret_key,
+                            &stripe.client, &stripe.url, &stripe.secret,
                             output,
                             args.stripe_transfer_max_attempts,
                             args.stripe_transfer_retry_ms,
@@ -37955,6 +38145,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 )
                 .await
                 .with_context(|| format!("anchoring fiat economic output {}", index + 1))?;
+                require_prepared_output_locks(&rpc, "fiat", &preparation).await?;
                 payout_preparations.push(preparation);
 
                 let mut renewal_count = 0_u32;
@@ -37987,10 +38178,9 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                                 ensure_canonical_fiat_quote_matches_output(output, Some(&quote))?;
                                 Some(quote)
                             } else {
+                                let stripe = settlement_processor(&mut processor, args, &home)?;
                                 create_targeted_fiat_quote(
-                                    client,
-                                    api_base_url,
-                                    secret_key,
+                                    &stripe.client, &stripe.url, &stripe.secret,
                                     output,
                                     1,
                                     args.stripe_transfer_max_attempts,
@@ -38011,19 +38201,18 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                     };
                     match attempt_record.get("status").and_then(Value::as_str) {
                         Some("prepared") => {
-                            match execute_canonical_stripe_attempt(
-                                Some(&rpc),
-                                client,
-                                api_base_url,
-                                secret_key,
-                                output,
-                                &attempt_record,
-                                &plan.epoch_apply_hash,
-                                args.stripe_transfer_max_attempts,
-                                args.stripe_transfer_retry_ms,
-                            )
-                            .await?
-                            {
+                            require_prepared_fiat_attempt(&rpc, &attempt_record, &plan.payload, output).await?;
+                            let execution = if output["role"] == "operator_fee" {
+                                let attempt_id = attempt_record["preparation"]["attempt_id"].as_str()
+                                    .context("missing retained fee attempt")?;
+                                retained_fiat_fee_execution(output, epoch, &plan.epoch_apply_hash, attempt_id)
+                            } else {
+                                let stripe = settlement_processor(&mut processor, args, &home)?;
+                                execute_canonical_stripe_attempt(Some(&rpc), &stripe.client, &stripe.url,
+                                    &stripe.secret, output, &attempt_record, &plan.epoch_apply_hash,
+                                    args.stripe_transfer_max_attempts, args.stripe_transfer_retry_ms).await?
+                            };
+                            match execution {
                                 CanonicalFiatAttemptExecution::Succeeded { evidence, report } => {
                                     let terminal = finalize_targeted_fiat_attempt(
                                         &rpc,
@@ -38049,8 +38238,8 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                                     break;
                                 }
                                 CanonicalFiatAttemptExecution::NeedsReconciliation => {
-                                    unresolved_attempts.push(economic_op_id);
-                                    next_index = next_independent_fiat_output(&outputs, index)?;
+                                    pending_outputs.push(json!({"economic_op_id": economic_op_id,
+                                        "output_index": index, "reason": "needs_reconciliation"}));
                                     break;
                                 }
                                 CanonicalFiatAttemptExecution::ExpiredPreEffect { evidence } => {
@@ -38092,10 +38281,9 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                                 .context("expired fiat attempt is missing attempt_no")?
                                 .checked_add(1)
                                 .context("fiat attempt number overflow")?;
+                            let stripe = settlement_processor(&mut processor, args, &home)?;
                             let quote = create_targeted_fiat_quote(
-                                client,
-                                api_base_url,
-                                secret_key,
+                                &stripe.client, &stripe.url, &stripe.secret,
                                 output,
                                 attempt_no,
                                 args.stripe_transfer_max_attempts,
@@ -38123,7 +38311,6 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .await;
             if let Err(error) = output_result {
                 if let Some(wait) = error.downcast_ref::<FiatFundingWait>() {
-                    next_index = next_independent_fiat_output(&outputs, index)?;
                     pending_outputs.push(json!({
                         "economic_op_id": economic_op_id,
                         "output_index": index,
@@ -38131,21 +38318,20 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                         "funding": wait.0,
                     }));
                 } else {
-                    return Err(error);
+                    pending_outputs.push(json!({"economic_op_id": economic_op_id,
+                        "output_index": index, "reason": "dispatch_error", "detail": redact_stripe_credentials(&format!("{error:#}"))}));
                 }
             }
         }
-        ensure!(
-            unresolved_attempts.is_empty(),
-            "Stripe transfer history did not confirm these FIAT outputs within the safe retry window; reconciliation required before sending: {}",
-            unresolved_attempts.join(", ")
-        );
+
     }
 
     if plan.already_settled.is_none()
         && args.tx.submit
         && !args.tx.sim
+        && !args.freeze_only
         && pending_outputs.is_empty()
+        && selected.is_none()
     {
         let signer = signer
             .as_ref()
@@ -38162,7 +38348,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .cloned();
     }
 
-    let copy_paste_submit = format!(
+    let mut copy_paste_submit = format!(
         "mayhem admin fiat-settlement --epoch {} --at {} --operator-stripe-account {} --submit-transfer --submit{}{}{}{}",
         epoch,
         planned_at,
@@ -38185,6 +38371,11 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .map(|path| format!(" --stripe-env-file {}", shell_single_quote(&path.display().to_string())))
             .unwrap_or_default()
     );
+    if let Some(id) = &args.output_id {
+        copy_paste_submit.push_str(&format!(" --output-id {id}"));
+    } else if args.freeze_only {
+        copy_paste_submit = copy_paste_submit.replacen("--submit-transfer --submit", "--freeze-only --submit", 1);
+    }
     let no_work = plan.already_settled.is_none()
         && plan
             .payload
@@ -38199,7 +38390,10 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .is_some_and(|outcome| outcome == "carry");
     let report = json!({
         "ok": true,
-        "submitted": feature_result.is_some(),
+        "submitted": plan_state.is_some(),
+        "freeze_only": args.freeze_only,
+        "close_only": false,
+        "selected_output_id": args.output_id,
         "nothing_to_settle": no_work,
         "sim": args.tx.submit && args.tx.sim,
         "already_settled": plan.already_settled,
@@ -38212,7 +38406,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         "processor": "stripe",
         "operator_to": operator_to,
         "platform_account": platform_account,
-        "pending": !pending_outputs.is_empty(),
+        "pending": args.tx.submit && settlement_state.is_none(),
         "pending_outputs": pending_outputs,
         "output_settlements": output_settlements,
         "settlement": plan.payload,
@@ -38879,19 +39073,10 @@ async fn submit_targeted_payout_preparation(
         "external_effect_ids": external_effect_ids,
         "admin": signer.admin,
     }));
-    let message = targeted_payout_preparation_message(&value)?;
-    value["admin_sig"] =
-        json!(
-            sign_message(&signer.keypair_path, &signer.wallet_password, &message,)
-                .await
-                .context("signing canonical targeted payout preparation")?
-        );
-    value = stable_json_value(&value);
     let record_key = format!("payout/preparation/{rail}/{economic_op_id}");
-    let exact_record = |record: &Value| canonical_payout_preparation_matches(record, &value);
     if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
         ensure!(
-            exact_record(&existing),
+            canonical_payout_preparation_matches(&existing, &value),
             "canonical payout preparation {economic_op_id} conflicts with the planned operation"
         );
         return Ok(existing);
@@ -38900,6 +39085,14 @@ async fn submit_targeted_payout_preparation(
         allow_create,
         "external payout effect {economic_op_id} exists without its required canonical preparation"
     );
+    let message = targeted_payout_preparation_message(&value)?;
+    value["admin_sig"] =
+        json!(
+            sign_message(&signer.keypair_path, &signer.wallet_password, &message,)
+                .await
+                .context("signing canonical targeted payout preparation")?
+        );
+    value = stable_json_value(&value);
     let feature = json!({
         "feature": "mayhem",
         "key": targeted_payout_preparation_feature_key(&value)?,
@@ -38913,7 +39106,7 @@ async fn submit_targeted_payout_preparation(
         submitted.get("ok").and_then(Value::as_bool) == Some(true),
         "targeted payout preparation was not accepted: {submitted}"
     );
-    wait_for_confirmed_state(rpc, &record_key, exact_record)
+    wait_for_confirmed_state(rpc, &record_key, |record| canonical_payout_preparation_matches(record, &value))
         .await
         .with_context(|| format!("waiting for canonical payout preparation {economic_op_id}"))
 }
@@ -38964,6 +39157,10 @@ fn targeted_payout_control_feature_key(value: &Value) -> Result<String> {
         .filter(|epoch| *epoch > 0)
         .context("targeted payout control value is missing epoch")?;
     let (domain, key) = match op {
+        "index_targeted_payout_history" => (
+            "mayhem-payout-history-v1",
+            format!("payout/history-submit/{rail}/{epoch}"),
+        ),
         "prepare_targeted_payout_epoch" => (
             "mayhem-targeted-payout-epoch-feature-v1",
             format!("payout/epoch-plan-submit/{rail}/{epoch}"),
@@ -39137,7 +39334,10 @@ fn targeted_payout_epoch_plan_value(
             targeted_payout_plan_output(rail, epoch, epoch_apply_hash, index, output)
         })
         .collect::<Vec<_>>();
-    let carry = carry.iter().map(stable_json_value).collect::<Vec<_>>();
+    let mut carry = carry.iter().map(stable_json_value).collect::<Vec<_>>();
+    carry.sort_by(|a,b| (a["role"] == "operator_fee").cmp(&(b["role"] == "operator_fee"))
+        .then_with(|| a["provider"].as_str().cmp(&b["provider"].as_str()))
+        .then_with(|| a["payout_revision"].as_str().cmp(&b["payout_revision"].as_str())));
     let outcome = if !outputs.is_empty() {
         "payouts"
     } else if !carry.is_empty() {
@@ -39199,6 +39399,7 @@ fn canonical_payout_preparation_matches(record: &Value, expected: &Value) -> boo
     // checked on admission. Never re-sign or rewrite historical preparations.
     record.get("type").and_then(Value::as_str) == Some("targeted_payout_preparation")
         && record.get("consumed").and_then(Value::as_bool) == Some(false)
+        && record.get("superseded_by").is_none()
         && targeted_payout_record_version_supported(record)
         && record
             .get("admin_sig")
@@ -39815,6 +40016,7 @@ fn print_reputation_anchor_scan_report(scan: &Value) -> Result<()> {
 
 fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
     println!("TNK settlement runner report.");
+    print_payout_progress(report);
     println!("Epoch: {}", report["epoch"].as_u64().unwrap_or(0));
     println!("Network: {}", report["network"].as_str().unwrap_or(""));
     println!(
@@ -39910,6 +40112,7 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
 
 fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
     println!("Fiat settlement runner report.");
+    print_payout_progress(report);
     println!("Epoch: {}", report["epoch"].as_u64().unwrap_or(0));
     println!(
         "Processor: {}",
@@ -53223,6 +53426,36 @@ fn ensure_no_unresolved_tnk_predecessor(
     Ok(())
 }
 
+#[derive(Default)]
+struct BookedPayout {
+    paid: MoneyAu,
+    dust: MoneyAu,
+    through: MoneyAu,
+}
+
+impl BookedPayout {
+    fn cursor(&self, paid: MoneyAu) -> Result<MoneyAu> {
+        Ok(paid.checked_add(self.paid).context("payout reservation overflow")?.max(self.through))
+    }
+
+    fn available(&self, outstanding: MoneyAu, held: MoneyAu) -> Result<(MoneyAu, MoneyAu, MoneyAu)> {
+        let reserved = self.paid.checked_add(self.dust).context("reserved payout overflow")?;
+        let free = outstanding.saturating_sub(reserved);
+        let free_held = free.min(held);
+        Ok((free, free_held, free-free_held))
+    }
+}
+
+async fn booked_payout(rpc: &PeerRpcClient, rail: &str, scope: &str, length: u64) -> Result<BookedPayout> {
+    let key = format!("payout/booked/{rail}/{scope}");
+    let Some(row) = read_state_value_at(rpc, &key, length).await? else { return Ok(BookedPayout::default()) };
+    Ok(BookedPayout {
+        paid: value_money_au(&row["pending_au"]).context("invalid booked payout AU")?,
+        dust: value_money_au(&row["pending_dust_au"]).context("invalid booked payout dust")?,
+        through: value_money_au(&row["allocated_through_au"]).context("invalid payout allocation cursor")?,
+    })
+}
+
 async fn build_tnk_settlement_plan(
     rpc: &PeerRpcClient,
     epoch: u64,
@@ -53281,8 +53514,7 @@ async fn build_tnk_settlement_plan(
                 "canonical TNK epoch output does not match its frozen oracle rate"
             );
         }
-        let already_settled =
-            read_confirmed_state_value(rpc, &format!("settle/targeted/tnk/{epoch}")).await?;
+        let already_settled = confirmed_payout_close(rpc, &payload).await?;
         return Ok(TnkSettlementPlan {
             msb_outputs: msb_outputs_from_tnk_settlement_payload(&payload)?,
             payload,
@@ -53368,9 +53600,13 @@ async fn build_tnk_settlement_plan(
             .total_au
             .checked_sub(liability.paid_cum_au)
             .context("TNK paid cumulative amount exceeds liability")?;
-        let (held_au, payable_au) =
+        let (held_au, _) =
             tnk_payable_earning_state(rpc, &earning, provider, epoch, &params, signed_length)
                 .await?;
+        let scope = format!("revision/{}/{}", liability.provider, liability.revision);
+        let booked = booked_payout(rpc, "tnk", &scope, signed_length).await?;
+        let paid_before = booked.cursor(liability.paid_cum_au)?;
+        let (outstanding_au, held_au, payable_au) = booked.available(outstanding_au, held_au)?;
         if payable_au == 0 {
             if outstanding_au > 0 {
                 carry.push(json!({
@@ -53412,8 +53648,8 @@ async fn build_tnk_settlement_plan(
                 {
                     *cursor
                 } else {
-                    aggregate_provider_paid_cum_au(rpc, &liability.provider, "tnk", signed_length)
-                        .await?
+                    let paid = aggregate_provider_paid_cum_au(rpc, &liability.provider, "tnk", signed_length).await?;
+                    booked_payout(rpc, "tnk", &format!("provider/{}", liability.provider), signed_length).await?.cursor(paid)?
                 };
                 aggregate_paid_cursors.insert(
                     liability.provider.clone(),
@@ -53426,7 +53662,7 @@ async fn build_tnk_settlement_plan(
                     "provider": liability.provider,
                     "payout_revision": liability.revision,
                     "to": binding["target"],
-                    "paid_cum_au_before": money_au_json(liability.paid_cum_au),
+                    "paid_cum_au_before": money_au_json(paid_before),
                     "aggregate_paid_cum_au_before": money_au_json(aggregate_paid_cum_au_before),
                     "au": money_au_json(payable_au),
                     "tnk_e18": au_to_tnk_e18_ceil_u128(payable_au, rate.tnk_usd_au)?.to_string(),
@@ -53447,6 +53683,7 @@ async fn build_tnk_settlement_plan(
         .cum_au
         .checked_sub(fee.swept_cum_au)
         .context("fee/tnk/cum swept amount exceeds cumulative fee")?;
+    let (operator_fee_au, _, _) = booked_payout(rpc, "tnk", "fee", signed_length).await?.available(operator_fee_au, 0)?;
     if operator_fee_au > 0 {
         outputs.push(json!({
             "role": "operator_fee",
@@ -54435,8 +54672,7 @@ async fn build_fiat_settlement_plan(
             .iter()
             .map(fiat_plan_output_as_settlement_output)
             .collect::<Result<Vec<_>>>()?;
-        let already_settled =
-            read_confirmed_state_value(rpc, &format!("settle/targeted/fiat/{epoch}")).await?;
+        let already_settled = confirmed_payout_close(rpc, &payload).await?;
         return Ok(FiatSettlementPlan {
             payload,
             stripe_outputs,
@@ -54489,13 +54725,17 @@ async fn build_fiat_settlement_plan(
             continue;
         };
         let earning = liability.earning_view();
-        let (held_au, payable_au) =
+        let (held_au, _) =
             tnk_payable_earning_state(rpc, &earning, provider, epoch, &params, signed_length)
                 .await?;
         let outstanding_au = liability
             .total_au
             .checked_sub(liability.paid_cum_au)
             .context("fiat paid cumulative amount exceeds liability")?;
+        let scope = format!("revision/{}/{}", liability.provider, liability.revision);
+        let booked = booked_payout(rpc, "fiat", &scope, signed_length).await?;
+        let paid_before = booked.cursor(liability.paid_cum_au)?;
+        let (outstanding_au, held_au, payable_au) = booked.available(outstanding_au, held_au)?;
         if payable_au == 0 {
             if outstanding_au > 0 {
                 carry.push(json!({
@@ -54543,6 +54783,8 @@ async fn build_fiat_settlement_plan(
                 let aggregate_paid_cum_au_before =
                     aggregate_provider_paid_cum_au(rpc, &liability.provider, "fiat", signed_length)
                         .await?;
+                let aggregate_paid_cum_au_before = booked_payout(rpc, "fiat",
+                    &format!("provider/{}", liability.provider), signed_length).await?.cursor(aggregate_paid_cum_au_before)?;
                 outputs.push(FiatSettlementOutput {
                     role: "provider".to_owned(),
                     provider: Some(liability.provider),
@@ -54559,17 +54801,14 @@ async fn build_fiat_settlement_plan(
                     ),
                     liability_total_au: liability.total_au,
                     held_au,
-                    paid_cum_au_before: liability.paid_cum_au,
+                    paid_cum_au_before: paid_before,
                     aggregate_paid_cum_au_before,
                     liability_au: payable_au,
                 })
             }
-            Ok(_) => skipped_providers.push(json!({
-                "provider": liability.provider,
-                "payout_revision": liability.revision,
-                "au": money_au_json(payable_au),
-                "reason": "Stripe payout binding is temporarily not ready",
-                "blocking": true,
+            Ok(_) => carry.push(json!({
+                "role": "provider", "provider": liability.provider, "payout_revision": liability.revision,
+                "liability_au": money_au_json(payable_au), "reason": "awaiting_processor_terms",
             })),
             Err(error) => skipped_providers.push(json!({
                 "provider": liability.provider,
@@ -54586,6 +54825,7 @@ async fn build_fiat_settlement_plan(
         .cum_au
         .checked_sub(fee.swept_cum_au)
         .context("fee/fiat/cum swept amount exceeds cumulative fee")?;
+    let (payable_fee_au, _, _) = booked_payout(rpc, "fiat", "fee", signed_length).await?.available(payable_fee_au, 0)?;
     if payable_fee_au > 0 {
         outputs.push(FiatSettlementOutput {
             role: "operator_fee".to_owned(),
@@ -54637,21 +54877,17 @@ async fn build_fiat_settlement_plan(
     })
 }
 
-async fn canonicalize_fiat_settlement_plan(
+async fn quote_fiat_plan_output(
     client: &reqwest::Client,
     api_base_url: &str,
     secret_key: &str,
     platform: &StripePlatformAccount,
-    plan: &FiatSettlementPlan,
+    epoch_apply_hash: &str,
     epoch: u64,
-    at: u64,
+    output: &FiatSettlementOutput,
     max_attempts: u32,
     retry_ms: u64,
-) -> Result<(Value, Vec<Option<StripeFxQuote>>)> {
-    let mut economic_outputs = Vec::with_capacity(plan.stripe_outputs.len());
-    let mut attempt_quotes = Vec::with_capacity(plan.stripe_outputs.len());
-    let mut aggregate_paid_cursors = BTreeMap::<String, MoneyAu>::new();
-    for output in &plan.stripe_outputs {
+) -> Result<(Value, Option<StripeFxQuote>)> {
         match output.role.as_str() {
             "provider" => {
                 let provider = output
@@ -54711,7 +54947,7 @@ async fn canonicalize_fiat_settlement_plan(
                             &json!({
                                 "rail": "fiat",
                                 "epoch": epoch,
-                                "epoch_apply_hash": plan.epoch_apply_hash,
+                                "epoch_apply_hash": epoch_apply_hash,
                                 "provider": provider,
                                 "payout_revision": output.payout_revision,
                                 "liability_au": money_au_json(output.liability_au),
@@ -54734,20 +54970,7 @@ async fn canonicalize_fiat_settlement_plan(
                     fx.source_amount_minor > 0 && fx.paid_au > 0,
                     "payable fiat liability is below one transferable currency minor unit"
                 );
-                let aggregate_paid_cum_au_before = aggregate_paid_cursors
-                    .get(provider)
-                    .copied()
-                    .unwrap_or(output.aggregate_paid_cum_au_before);
-                let mut operation_output = output.clone();
-                operation_output.aggregate_paid_cum_au_before = aggregate_paid_cum_au_before;
-                economic_outputs.push(canonical_fiat_provider_plan_output(&operation_output, &fx)?);
-                attempt_quotes.push(quote);
-                aggregate_paid_cursors.insert(
-                    provider.to_owned(),
-                    aggregate_paid_cum_au_before
-                        .checked_add(fx.paid_au)
-                        .context("fiat aggregate paid cumulative watermark overflow")?,
-                );
+                Ok((canonical_fiat_provider_plan_output(output, &fx)?, quote))
             }
             "operator_fee" => {
                 let source_scale = checked_pow10_u128(stripe_currency_minor_exponent(
@@ -54768,7 +54991,7 @@ async fn canonicalize_fiat_settlement_plan(
                         &json!({
                             "rail": "fiat",
                             "epoch": epoch,
-                            "epoch_apply_hash": plan.epoch_apply_hash,
+                            "epoch_apply_hash": epoch_apply_hash,
                             "role": "operator_fee",
                             "liability_au": money_au_json(output.liability_au),
                         }),
@@ -54793,7 +55016,7 @@ async fn canonicalize_fiat_settlement_plan(
                     source_amount_minor > 0,
                     "operator fee source amount must be positive"
                 );
-                economic_outputs.push(stable_json_value(&json!({
+                Ok((stable_json_value(&json!({
                     "role": "operator_fee",
                     "to": output.to,
                     "liability_au": money_au_json(output.liability_au),
@@ -54802,10 +55025,55 @@ async fn canonicalize_fiat_settlement_plan(
                     "dust_au": money_au_json(0),
                     "source_currency": platform.default_currency,
                     "source_amount_minor": source_amount_minor.to_string(),
-                })));
-                attempt_quotes.push(None);
+                })), None))
             }
             other => bail!("invalid fiat settlement output role {other}"),
+        }
+}
+
+async fn canonicalize_fiat_settlement_plan(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    platform: &StripePlatformAccount,
+    plan: &FiatSettlementPlan,
+    epoch: u64,
+    at: u64,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<(Value, Vec<Option<StripeFxQuote>>)> {
+    let mut economic_outputs = Vec::with_capacity(plan.stripe_outputs.len());
+    let mut attempt_quotes = Vec::with_capacity(plan.stripe_outputs.len());
+    let mut aggregate_paid_cursors = BTreeMap::<String, MoneyAu>::new();
+    let mut carry = plan.carry.clone();
+    for output in &plan.stripe_outputs {
+        let mut operation = output.clone();
+        if let Some(provider) = &operation.provider {
+            if let Some(before) = aggregate_paid_cursors.get(provider) {
+                operation.aggregate_paid_cum_au_before = *before;
+            }
+        }
+        match quote_fiat_plan_output(client, api_base_url, secret_key, platform, &plan.epoch_apply_hash,
+            epoch, &operation, max_attempts, retry_ms).await {
+            Ok((terms, quote)) => {
+                if let Some(provider) = &operation.provider {
+                    let paid = value_money_au(&terms["paid_au"]).context("invalid frozen fiat amount")?;
+                    aggregate_paid_cursors.insert(provider.clone(), operation.aggregate_paid_cum_au_before
+                        .checked_add(paid).context("fiat aggregate paid cumulative watermark overflow")?);
+                }
+                economic_outputs.push(terms);
+                attempt_quotes.push(quote);
+            }
+            Err(error) => {
+                let mut entry = json!({"role":operation.role, "reason":"awaiting_processor_terms",
+                    "liability_au":money_au_json(operation.liability_au)});
+                if let Some(provider) = &operation.provider {
+                    entry["provider"] = json!(provider);
+                    entry["payout_revision"] = json!(operation.payout_revision);
+                }
+                eprintln!("FIAT terms deferred for {}: {}", operation.to, redact_stripe_credentials(&format!("{error:#}")));
+                carry.push(entry);
+            }
         }
     }
     let payload = targeted_payout_epoch_plan_value(
@@ -54815,7 +55083,7 @@ async fn canonicalize_fiat_settlement_plan(
         &plan.epoch_apply_hash,
         plan.signed_length,
         &economic_outputs,
-        &plan.carry,
+        &carry,
     )?;
     Ok((payload, attempt_quotes))
 }
@@ -57931,6 +58199,27 @@ fn within_stripe_attempt_window(prepared_at: u64, now: u64) -> bool {
         .is_some_and(|age| age <= STRIPE_IDEMPOTENCY_RENEWAL_BOUND_SECONDS)
 }
 
+fn retained_fiat_fee_execution(output: &Value, epoch: u64, epoch_apply_hash: &str, attempt_id: &str)
+    -> CanonicalFiatAttemptExecution {
+    CanonicalFiatAttemptExecution::Succeeded {
+            evidence: stable_json_value(&json!({
+                "schema_version": 2,
+                "kind": "platform_balance",
+                "attempt_id": attempt_id,
+                "ref": operator_fiat_settlement_ref(epoch, epoch_apply_hash),
+                "destination": output.get("to"),
+                "source_currency": output.get("source_currency"),
+                "source_amount_minor": output.get("source_amount_minor"),
+                "transfer_group": null,
+            })),
+            report: json!({
+                "kind": "platform_balance",
+                "attempt_id": attempt_id,
+                "recovered": true,
+            }),
+    }
+}
+
 async fn execute_canonical_stripe_attempt(
     rpc: Option<&PeerRpcClient>,
     client: &reqwest::Client,
@@ -57970,23 +58259,7 @@ async fn execute_canonical_stripe_attempt(
         .and_then(Value::as_str)
         .context("canonical fiat output is missing role")?;
     if role == "operator_fee" {
-        return Ok(CanonicalFiatAttemptExecution::Succeeded {
-            evidence: stable_json_value(&json!({
-                "schema_version": 2,
-                "kind": "platform_balance",
-                "attempt_id": attempt_id,
-                "ref": operator_fiat_settlement_ref(epoch, epoch_apply_hash),
-                "destination": output.get("to"),
-                "source_currency": output.get("source_currency"),
-                "source_amount_minor": output.get("source_amount_minor"),
-                "transfer_group": null,
-            })),
-            report: json!({
-                "kind": "platform_balance",
-                "attempt_id": attempt_id,
-                "recovered": true,
-            }),
-        });
+        return Ok(retained_fiat_fee_execution(output, epoch, epoch_apply_hash, attempt_id));
     }
     ensure!(role == "provider", "unsupported canonical fiat output role");
     let provider = output
@@ -107411,6 +107684,9 @@ status: linked
         assert_eq!(
             admin_tnk_settlement_payload(&AdminTnkSettlementArgs {
                 tx: test_admin_tx_args(),
+                freeze_only: false,
+                close_only: false,
+                output_id: None,
                 settlement_json: Some(settlement_payload.to_string()),
                 settlement_file: None,
                 epoch: None,
@@ -107440,6 +107716,9 @@ status: linked
         assert_eq!(
             admin_command_payload(&AdminCommands::TnkSettlement(AdminTnkSettlementArgs {
                 tx: test_admin_tx_args(),
+                freeze_only: false,
+                close_only: false,
+                output_id: None,
                 settlement_json: Some(settlement_payload.to_string()),
                 settlement_file: None,
                 epoch: None,
@@ -107540,6 +107819,9 @@ status: linked
         assert_eq!(
             admin_fiat_settlement_payload(&AdminFiatSettlementArgs {
                 tx: test_admin_tx_args(),
+                freeze_only: false,
+                close_only: false,
+                output_id: None,
                 settlement_json: Some(fiat_settlement_payload.to_string()),
                 settlement_file: None,
                 epoch: None,
@@ -107566,6 +107848,9 @@ status: linked
         assert_eq!(
             admin_command_payload(&AdminCommands::FiatSettlement(AdminFiatSettlementArgs {
                 tx: test_admin_tx_args(),
+                freeze_only: false,
+                close_only: false,
+                output_id: None,
                 settlement_json: Some(fiat_settlement_payload.to_string()),
                 settlement_file: None,
                 epoch: None,

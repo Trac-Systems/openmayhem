@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import Contract30 from '../contract/v30.js';
+import { inventory, advanceHead } from './helpers/payout-history.js';
 import Contract27 from '../contract/history/v27.js';
 import Contract28 from '../contract/history/v28.js';
 import { fiatFenceKey, fiatRecoveryFeatureKey, fiatResolutionKey } from '../contract/fiat-recovery.js';
@@ -41,14 +43,15 @@ async function submitControl(ctx, value, featureKeyMethod) {
   );
 }
 
-async function planValue(ctx, epoch = 1, anchor = applyHash) {
+async function planValue(ctx, epoch = 1, anchor = applyHash, carry = []) {
+  const outcome = ctx.outputs.length ? 'payouts' : carry.length ? 'carry' : 'no_work';
   const outputsRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-outputs-v1',
     { rail: 'fiat', epoch, outputs: ctx.outputs }
   );
   const carryRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-carry-v1',
-    { rail: 'fiat', epoch, carry: [] }
+    { rail: 'fiat', epoch, carry }
   );
   const planRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-plan-v1',
@@ -58,7 +61,7 @@ async function planValue(ctx, epoch = 1, anchor = applyHash) {
       at: 90_000,
       epoch_apply_hash: anchor,
       snapshot_signed_length: 220,
-      outcome: 'payouts',
+      outcome,
       outputs_root: outputsRoot,
       carry_root: carryRoot,
     }
@@ -71,9 +74,9 @@ async function planValue(ctx, epoch = 1, anchor = applyHash) {
     at: 90_000,
     epoch_apply_hash: anchor,
     snapshot_signed_length: 220,
-    outcome: 'payouts',
+    outcome,
     outputs: ctx.outputs,
-    carry: [],
+    carry,
     outputs_root: outputsRoot,
     carry_root: carryRoot,
     plan_root: planRoot,
@@ -1011,6 +1014,7 @@ test('508/542 recovers its reservation and permits subsequent provider and fee p
     ...frozen.outputs[2], economic_op_id: '8'.repeat(64),
     liability_au: String(newFee), paid_au: String(newFee), source_amount_minor: '9',
   };
+  await inventory(ctx, 'fiat');
   const later = await freezeFiatEpoch(ctx, 543, 'c'.repeat(64), [...providerOutputs, feeOutput]);
   for (const output of later.outputs) {
     const ref = output.role === 'operator_fee' ? 'platform_balance:fixture:543' : 'tr_fixture_later_' + output.output_index;
@@ -1035,10 +1039,15 @@ test('508/542 recovers its reservation and permits subsequent provider and fee p
 
 test('508 fence holds the original fee even if a runner already prepared or finalized its retention', async () => {
   const { ctx, prior } = await overlapFixture();
+  const current = ctx.contract;
+  ctx.contract = new Contract28(current.protocol, {});
+  ctx.version = 28;
   const fee = prior.outputs[1];
   assert.equal((await prepareEconomicOutput(ctx, prior, fee)).ok, true);
   const attempt = await prepareAttempt(ctx, prior, fee, 1);
   assert.equal(attempt.result.ok, true);
+  ctx.contract = current;
+  delete ctx.version;
   const evidence = transferEvidence(fee, attempt.value, 'platform_balance:fixture:508');
   const saved = ctx.storage.snapshotBytes();
   for (const finalized of [false, true]) {
@@ -1148,4 +1157,162 @@ test('conflicting evidence and a bad nested signature cannot release either rese
   assert.equal(await ctx.storage.get(ctx.contract.targetedFiatAttemptEffectKey(transfer.ref)), null);
   assert.equal(await ctx.storage.get(fiatResolutionKey(old.economic_op_id)), null);
   assert.equal(await ctx.storage.get(ctx.contract.payoutPreparationRecordKey('fiat', next.economic_op_id)), null);
+});
+
+for (const legacy of [false, true]) {
+  test(`FIAT independently accounts frozen revisions and later earnings with an open ${legacy ? 'v30' : 'v31'} attempt`, async () => {
+    const ctx = await setup();
+    const current = ctx.contract;
+    if (legacy) {
+      ctx.contract = new Contract30(current.protocol, {});
+      ctx.version = 30;
+    }
+    const [first, fee] = ctx.outputs;
+    const read = async key => (await ctx.storage.get(key))?.value ?? null;
+    const second = { ...first, payout_revision: '2'.repeat(64), economic_op_id: '3'.repeat(64),
+      aggregate_paid_cum_au_before: first.paid_au, output_index: 1, to: 'acct_rotated' };
+    const keyFor = out => `payout/liability/fiat/${out.provider}/${out.payout_revision}`;
+    const binding = `payout/binding/fiat/${first.provider}/`;
+    await ctx.storage.put(binding+second.payout_revision, { ...await read(binding+first.payout_revision),
+      revision: second.payout_revision, target: second.to });
+    await ctx.storage.put(keyFor(second), { ...await read(keyFor(first)), revision: second.payout_revision, target: second.to });
+    const index = await read('payout/liability-index/fiat');
+    await ctx.storage.put('payout/liability-index/fiat', { ...index, entries: [...index.entries,
+      { provider: second.provider, payout_revision: second.payout_revision }] });
+    const aggregate = `earn/fiat/${first.provider}`;
+    const earning = await read(aggregate);
+    await ctx.storage.put(aggregate, { ...earning, total_au: String(2n*BigInt(earning.total_au)) });
+    ctx.outputs = [first, second, { ...fee, output_index: 2 }];
+    const plan = await buildPlan(ctx);
+    const prep = await prepareEconomicOutput(ctx, plan, first);
+    assert.equal(prep.ok, true, prep.message);
+    const oldAttempt = await prepareAttempt(ctx, plan, first, 1);
+    assert.equal(oldAttempt.result.ok, true, oldAttempt.result.message);
+    const prepKey = `payout/preparation/fiat/${first.economic_op_id}`;
+    const snapshot = structuredClone(await read(prepKey));
+    ctx.contract = current;
+    delete ctx.version;
+    await inventory(ctx, 'fiat');
+    async function pay(plan, output, ref) {
+      const prep = await prepareEconomicOutput(ctx, plan, output);
+      assert.equal(prep.ok, true, prep.message);
+      const attempt = await prepareAttempt(ctx, plan, output, 1);
+      assert.equal(attempt.result.ok, true, attempt.result.message);
+      const evidence = transferEvidence(output, attempt.value, ref);
+      const final = await finalizeAttempt(ctx, attempt.value, 'succeeded', evidence);
+      assert.equal(final.result.ok, true, final.result.message);
+      const confirmed = await settleOutput(ctx, plan, output, attempt.value, evidence);
+      assert.equal(confirmed.result.ok, true, confirmed.result.message);
+    }
+    await pay(plan, second, 'tr_second_rev');
+    await pay(plan, plan.outputs[2], 'platform_balance:selected_fee');
+    assert.deepEqual(await read(prepKey), snapshot);
+    assert.match((await closeEpoch(ctx, plan)).message, /unsettled/);
+    // Pay another full tranche on the original revision. Its half-cent dust is
+    // still part of the first frozen liability and cannot be booked twice.
+    for (const k of [aggregate, keyFor(first)]) {
+      const row = await read(k);
+      await ctx.storage.put(k, { ...row, total_au: String(BigInt(row.total_au)+BigInt(first.liability_au)), updated_epoch: 2 });
+    }
+    const other = await read(keyFor(second));
+    // The fixture's payout minimum is tiny, so its residual is still eligible.
+    const dust = { ...second, economic_op_id: '4'.repeat(64), paid_cum_au_before: second.paid_au,
+      liability_au: second.dust_au, paid_au: second.dust_au, dust_au: '0', rounding_au: '0',
+      aggregate_paid_cum_au_before: String(3n*BigInt(first.paid_au)) };
+    assert.equal(other.paid_cum_au, second.paid_au);
+    const tranche = { ...first, economic_op_id: '5'.repeat(64), paid_cum_au_before: first.paid_au,
+      aggregate_paid_cum_au_before: String(2n*BigInt(first.paid_au)) };
+    const later = await freezeFiatEpoch(ctx, 2, 'c'.repeat(64), [tranche, dust]);
+    await pay(later, tranche, 'tr_new_tranche');
+    await pay(later, dust, 'tr_residual');
+    assert.equal((await closeEpoch(ctx, later)).ok, true);
+    assert.deepEqual(await read(prepKey), snapshot);
+    const oldEvidence = transferEvidence(first, oldAttempt.value, 'tr_original');
+    assert.equal((await finalizeAttempt(ctx, oldAttempt.value, 'succeeded', oldEvidence)).result.ok, true);
+    const old = await settleOutput(ctx, plan, first, oldAttempt.value, oldEvidence);
+    assert.equal(old.result.ok, true, old.result.message);
+    assert.equal((await settleOutput(ctx, plan, first, oldAttempt.value, oldEvidence)).result.idempotent, true);
+    assert.equal((await closeEpoch(ctx, plan)).ok, true);
+    assert.equal((await read(keyFor(first))).paid_cum_au, String(2n*BigInt(first.paid_au)));
+    const final = await read(aggregate);
+    assert.equal(final.paid_cum_au, String(3n*BigInt(first.paid_au) + BigInt(second.dust_au)));
+    assert.equal(final.last_targeted_settlement_epoch, 2);
+    assert.equal(BigInt(final.total_au)-BigInt(final.paid_cum_au), 2n*BigInt(first.dust_au));
+  });
+}
+
+test('FIAT carry preserves each unquoted liability and permits an independent provider to settle', async () => {
+  const ctx = await setup();
+  const [payee, fee] = ctx.outputs;
+  const other = (await makeIdentity()).publicKey;
+  const key = (role, who) => `payout/${role}/fiat/${who}/${payee.payout_revision}`;
+  const read = async k => (await ctx.storage.get(k))?.value ?? null;
+  for (const source of [`prov/${payee.provider}`, `earn/fiat/${payee.provider}`,
+    key('binding', payee.provider), key('liability', payee.provider)]) {
+    const row = { ...await read(source), provider: other };
+    if (row.target) row.target = 'acct_without_terms';
+    await ctx.storage.put(source.replace(payee.provider, other), row);
+  }
+  const index = await read('payout/liability-index/fiat');
+  await ctx.storage.put('payout/liability-index/fiat', { ...index, entries: [...index.entries,
+    { provider: other, payout_revision: payee.payout_revision }].sort((a,b) => a.provider.localeCompare(b.provider)) });
+  ctx.outputs = [payee];
+  const carry = [
+    { role: 'provider', provider: other, payout_revision: payee.payout_revision,
+      liability_au: payee.liability_au, reason: 'awaiting_processor_terms' },
+    { role: 'operator_fee', liability_au: fee.liability_au, reason: 'awaiting_processor_terms' },
+  ];
+  for (const i of [0, 1]) {
+    const bad = structuredClone(carry);
+    bad[i].liability_au = '1';
+    const reject = await submitControl(ctx, await planValue(ctx, 1, applyHash, bad), 'targetedPayoutEpochFeatureKey');
+    assert.ok(reject instanceof Error);
+  }
+  const plan = await planValue(ctx, 1, applyHash, carry);
+  const frozen = await submitControl(ctx, plan, 'targetedPayoutEpochFeatureKey');
+  assert.equal(frozen.ok, true, frozen.message);
+  assert.equal((await prepareEconomicOutput(ctx, plan, payee)).ok, true);
+  const attempt = await prepareAttempt(ctx, plan, payee, 1);
+  const evidence = transferEvidence(payee, attempt.value, 'tr_payable_sibling');
+  assert.equal((await finalizeAttempt(ctx, attempt.value, 'succeeded', evidence)).result.ok, true);
+  assert.equal((await settleOutput(ctx, plan, payee, attempt.value, evidence)).result.ok, true);
+  assert.equal((await closeEpoch(ctx, plan)).ok, true);
+  assert.equal((await read(key('liability', other))).paid_cum_au, '0');
+  assert.equal((await read('fee/fiat/cum')).swept_cum_au, '0');
+  assert.equal(await read('payout/booked/fiat/fee'), null);
+
+  // Terms become available at the next epoch. The signed carry did not pay
+  // the other provider or sweep the fee. Reclassify the first payee's dust.
+  const hash = 'b'.repeat(64);
+  await advanceHead(ctx.storage, 2, hash);
+  const residual = { role: 'provider', provider: payee.provider, payout_revision: payee.payout_revision,
+    liability_au: payee.dust_au, reason: 'awaiting_processor_terms' };
+  const available = { ...payee, provider: other, to: 'acct_without_terms', economic_op_id: '8'.repeat(64) };
+  ctx.outputs = [available, fee];
+  const later = await planValue(ctx, 2, hash, [residual]);
+  const result = await submitControl(ctx, later, 'targetedPayoutEpochFeatureKey');
+  assert.equal(result.ok, true, result.message);
+  assert.equal((await prepareEconomicOutput(ctx, later, available)).ok, true);
+  assert.equal((await prepareEconomicOutput(ctx, later, fee)).ok, true);
+});
+
+test('indexed overlapping 508/542 preparations still require and accept the original reviewed resolution', async () => {
+  const { ctx, old, next, frozen } = await overlapFixture();
+  const before = await reviewedFeature(ctx, 'fence');
+  await inventory(ctx, 'fiat');
+  const group = `payout/legacy/fiat/revision/${old.provider}/${old.payout_revision}`;
+  assert.equal((await ctx.storage.get(group)).value.owner, old.economic_op_id);
+  assert.match((await prepareEconomicOutput(ctx, frozen, next)).message, /Conflicting historical payout reservation/);
+  const fence = await submitRecovery(ctx, before);
+  assert.equal(fence.ok, true, fence.message);
+  const repaired = await submitRecovery(ctx, await reviewedFeature(ctx, 'supersede_absent'));
+  assert.equal(repaired.ok, true, repaired.message);
+  assert.equal((await ctx.storage.get(group)).value.owner, next.economic_op_id);
+  const attempt = await prepareAttempt(ctx, frozen, next, 1);
+  const evidence = transferEvidence(next, attempt.value, 'tr_reviewed_replacement');
+  assert.equal((await finalizeAttempt(ctx, attempt.value, 'succeeded', evidence)).result.ok, true);
+  const paid = await settleOutput(ctx, frozen, next, attempt.value, evidence);
+  assert.equal(paid.result.ok, true, paid.result.message);
+  assert.equal((await closeEpoch(ctx, frozen)).ok, true);
+  assert.equal(await ctx.storage.get('settle/targeted/fiat/508'), null);
 });

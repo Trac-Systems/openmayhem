@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import Contract30 from '../contract/v30.js';
+import { inventory, advanceHead } from './helpers/payout-history.js';
 import b4a from 'b4a';
 
 import MayhemContract, {
@@ -44,23 +46,23 @@ async function submitControl(ctx, value, featureKeyMethod) {
   );
 }
 
-async function buildPlan(ctx, outputs, carry = [], { expectOk = true } = {}) {
+async function buildPlan(ctx, outputs, carry = [], { expectOk = true, epoch = 1, hash = applyHash } = {}) {
   const outcome = outputs.length > 0 ? 'payouts' : carry.length > 0 ? 'carry' : 'no_work';
   const outputsRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-outputs-v1',
-    { rail: 'tnk', epoch: 1, outputs }
+    { rail: 'tnk', epoch, outputs }
   );
   const carryRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-carry-v1',
-    { rail: 'tnk', epoch: 1, carry }
+    { rail: 'tnk', epoch, carry }
   );
   const planRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-plan-v1',
     {
       rail: 'tnk',
-      epoch: 1,
+      epoch,
       at: 90_000,
-      epoch_apply_hash: applyHash,
+      epoch_apply_hash: hash,
       snapshot_signed_length: 120,
       outcome,
       outputs_root: outputsRoot,
@@ -69,11 +71,11 @@ async function buildPlan(ctx, outputs, carry = [], { expectOk = true } = {}) {
   );
   const value = {
     op: 'prepare_targeted_payout_epoch',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'tnk',
-    epoch: 1,
+    epoch,
     at: 90_000,
-    epoch_apply_hash: applyHash,
+    epoch_apply_hash: hash,
     snapshot_signed_length: 120,
     outcome,
     outputs,
@@ -109,8 +111,8 @@ async function prepareOutput(ctx, plan, output, txHash) {
   const payload = {
     settlement_op: 'settle_targeted_tnk_output',
     rail: 'tnk',
-    epoch: 1,
-    epoch_apply_hash: applyHash,
+    epoch: plan.epoch,
+    epoch_apply_hash: plan.epoch_apply_hash,
     plan_root: plan.plan_root,
     economic_op_id: output.economic_op_id,
     output_index: output.output_index,
@@ -138,11 +140,11 @@ async function prepareOutput(ctx, plan, output, txHash) {
     : null;
   const value = {
     op: 'prepare_targeted_payout',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     economic_op_id: output.economic_op_id,
     rail: 'tnk',
-    epoch: 1,
-    epoch_apply_hash: applyHash,
+    epoch: plan.epoch,
+    epoch_apply_hash: plan.epoch_apply_hash,
     prepared_at: 90_000,
     kind: output.role === 'provider' ? 'liability' : 'fee',
     output_index: output.output_index,
@@ -151,8 +153,8 @@ async function prepareOutput(ctx, plan, output, txHash) {
       {
         economic_op_id: output.economic_op_id,
         rail: 'tnk',
-        epoch: 1,
-        epoch_apply_hash: applyHash,
+        epoch: plan.epoch,
+        epoch_apply_hash: plan.epoch_apply_hash,
         kind: output.role === 'provider' ? 'liability' : 'fee',
         output_index: output.output_index,
         payload,
@@ -180,11 +182,11 @@ async function prepareOutput(ctx, plan, output, txHash) {
 async function settleOutput(ctx, plan, output, txHash) {
   const value = {
     op: 'settle_targeted_tnk_output',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'tnk',
-    epoch: 1,
+    epoch: plan.epoch,
     at: 90_000,
-    epoch_apply_hash: applyHash,
+    epoch_apply_hash: plan.epoch_apply_hash,
     plan_root: plan.plan_root,
     economic_op_id: output.economic_op_id,
     output_index: output.output_index,
@@ -212,11 +214,11 @@ async function settleOutput(ctx, plan, output, txHash) {
 async function closeEpoch(ctx, plan) {
   const value = {
     op: 'close_targeted_payout_epoch',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'tnk',
-    epoch: 1,
+    epoch: plan.epoch,
     at: 90_000,
-    epoch_apply_hash: applyHash,
+    epoch_apply_hash: plan.epoch_apply_hash,
     plan_root: plan.plan_root,
     admin: ctx.admin.publicKey,
     admin_sig: '0'.repeat(128),
@@ -531,3 +533,67 @@ test('TNK epoch plans fail closed when payable or carried liabilities are omitte
     /explicitly carry every held or below-minimum liability/i
   );
 });
+
+for (const legacy of [false, true]) {
+  test(`TNK settles disjoint later tranches before original ${legacy ? 'v30' : 'v31'} transfers`, async () => {
+    const ctx = await setup();
+    const current = ctx.contract;
+    if (legacy) {
+      ctx.contract = new Contract30(current.protocol, {});
+      ctx.version = 30;
+    }
+    const [original, fee] = ctx.outputs;
+    const oldPlan = await buildPlan(ctx, ctx.outputs);
+    const oldHash = '4'.repeat(64);
+    assert.equal((await prepareOutput(ctx, oldPlan, original, oldHash)).ok, true);
+    const prepKey = `payout/preparation/tnk/${original.economic_op_id}`;
+    const read = async key => (await ctx.storage.get(key))?.value ?? null;
+    const originalPrep = structuredClone(await read(prepKey));
+    ctx.contract = current;
+    delete ctx.version;
+    await inventory(ctx, 'tnk');
+    const revision = `payout/liability/tnk/${original.provider}/${original.payout_revision}`;
+    const aggregate = `earn/tnk/${original.provider}`;
+    for (const key of [revision, aggregate]) {
+      const row = await read(key);
+      await ctx.storage.put(key, { ...row, total_au: String(BigInt(row.total_au) + 100n), updated_epoch: 2 });
+    }
+    const fees = await read('fee/tnk/cum');
+    await ctx.storage.put('fee/tnk/cum', { ...fees, updated_epoch: 2, cum_au: String(BigInt(fees.cum_au)+50n),
+      settled_cum_au: String(BigInt(fees.settled_cum_au)+50n) });
+    const hash = 'c'.repeat(64);
+    await advanceHead(ctx.storage, 2, hash);
+    const later = { ...original, economic_op_id: '5'.repeat(64), au: '100', tnk_e18: '2000',
+      paid_cum_au_before: original.au, aggregate_paid_cum_au_before: original.au };
+    const laterFee = { ...fee, economic_op_id: '6'.repeat(64), au: '50', tnk_e18: '1000' };
+    const options = { epoch: 2, hash };
+    const overlap = await buildPlan(ctx, [{ ...later, paid_cum_au_before: '0' }, laterFee], [],
+      { ...options, expectOk: false });
+    assert.match(overlap.result.message, /every payable canonical liability/);
+    const plan = await buildPlan(ctx, [later, laterFee], [], options);
+    const feeHash = '7'.repeat(64);
+    assert.equal((await prepareOutput(ctx, plan, laterFee, feeHash)).ok, true);
+    assert.equal((await settleOutput(ctx, plan, laterFee, feeHash)).result.ok, true);
+    const laterHash = '8'.repeat(64);
+    assert.equal((await prepareOutput(ctx, plan, later, laterHash)).ok, true);
+    assert.match((await settleOutput(ctx, plan, later, oldHash)).result.message, /preparation|effect/i);
+    assert.equal((await settleOutput(ctx, plan, later, laterHash)).result.ok, true);
+    assert.equal((await closeEpoch(ctx, plan)).ok, true);
+    assert.deepEqual(await read(prepKey), originalPrep);
+    assert.equal((await read(revision)).paid_cum_au, '100');
+    assert.match((await closeEpoch(ctx, oldPlan)).message, /unsettled/);
+    const first = await settleOutput(ctx, oldPlan, original, oldHash);
+    assert.equal(first.result.ok, true, first.result.message);
+    assert.equal((await settleOutput(ctx, oldPlan, original, oldHash)).result.idempotent, true);
+    const oldFeeHash = '9'.repeat(64);
+    assert.equal((await prepareOutput(ctx, oldPlan, fee, oldFeeHash)).ok, true);
+    assert.equal((await settleOutput(ctx, oldPlan, fee, oldFeeHash)).result.ok, true);
+    assert.equal((await closeEpoch(ctx, oldPlan)).ok, true);
+    assert.equal((await read(revision)).paid_cum_au, String(BigInt(original.au)+100n));
+    assert.equal((await read(revision)).last_settlement_epoch, 2);
+    assert.equal((await read(revision)).last_settlement_transfer, laterHash);
+    assert.equal((await read(aggregate)).last_holdback_release_epoch, 2);
+    assert.equal((await read('fee/tnk/cum')).last_targeted_settlement_transfer, feeHash);
+    assert.equal((await read(`payout/booked/tnk/revision/${original.provider}/${ctx.revision}`)).pending_au, '0');
+  });
+}

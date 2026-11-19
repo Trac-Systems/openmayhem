@@ -177,48 +177,31 @@ fn attempt_fixture() -> (Value, Value, Value, Value, Value) {
 }
 
 #[test]
-fn fiat_funding_wait_preserves_provider_watermark_order_and_original_indices() {
-    let outputs = vec![
-        json!({"provider":"A","aggregate_paid_cum_au_before":"0","paid_au":"27"}),
-        json!({"provider":"A","aggregate_paid_cum_au_before":"27","paid_au":"5"}),
-        json!({"provider":"B","aggregate_paid_cum_au_before":"300","paid_au":"10"}),
-        json!({"role":"operator_fee"}),
-    ];
-    assert_eq!(next_independent_fiat_output(&outputs, 0).unwrap(), 2);
-    assert_eq!(next_independent_fiat_output(&outputs, 1).unwrap(), 2);
-    assert_eq!(next_independent_fiat_output(&outputs, 2).unwrap(), 3);
-    assert!(check_fiat_output_aggregate(&outputs[1], 0, None).is_err());
-    assert!(check_fiat_output_aggregate(&outputs[1], 27, None).is_ok());
-    assert!(check_fiat_output_aggregate(&outputs[2], 300, None).is_ok());
+fn frozen_reservations_exclude_dust_and_keep_issue_watermarks_monotonic() {
+    let book = BookedPayout { paid: 60, dust: 9, through: 100 };
+    assert_eq!(book.available(79, 4).unwrap(), (10, 4, 6));
+    assert_eq!(book.available(79, 25).unwrap(), (10, 10, 0));
+    assert_eq!(book.available(10, 0).unwrap(), (0, 0, 0));
+    assert_eq!(book.cursor(0).unwrap(), 100);
+    assert_eq!(book.cursor(50).unwrap(), 110);
+    assert!(book.cursor(u128::MAX).is_err());
 }
 
 #[test]
-fn fiat_aggregate_preflight_resumes_only_the_exact_open_tail() {
-    let op = "a".repeat(64);
-    let output = json!({"economic_op_id":op,"aggregate_paid_cum_au_before":"11","paid_au":"3"});
-    let own = json!({"economic_op_id":op,"consumed":false,
-        "paid_cum_au_before":"11","paid_cum_au_after":"14"});
-    assert!(check_fiat_output_aggregate(&output, 11, Some(&own)).is_ok());
-    assert!(check_fiat_output_aggregate(&output, 14, Some(&own)).is_err());
-    for (field, changed) in [
-        ("economic_op_id", json!("b".repeat(64))),
-        ("consumed", json!("false")),
-        ("paid_cum_au_before", json!("10")),
-        ("paid_cum_au_after", json!("13")),
-    ] {
-        let mut different = own.clone();
-        different[field] = changed;
-        assert!(
-            check_fiat_output_aggregate(&output, 11, Some(&different)).is_err(),
-            "{field}"
-        );
+fn payout_selection_accepts_one_canonical_id_and_conflicts_with_bulk_dispatch() {
+    let id = "a".repeat(64);
+    for cmd in ["fiat-settlement", "tnk-settlement"] {
+        let prefix = ["mayhem","admin",cmd,"--epoch","3"];
+        let parse = |flags: &[&str]| Cli::try_parse_from(prefix.iter().copied().chain(flags.iter().copied()));
+        assert!(parse(&["--submit","--freeze-only"]).is_ok());
+        assert!(parse(&["--submit","--submit-transfer","--output-id",&id]).is_ok());
+        for invalid in [
+            vec!["--freeze-only"], vec!["--output-id",&id], vec!["--submit","--freeze-only","--submit-transfer"],
+            vec!["--submit","--submit-transfer","--output-id","BAD"],
+            vec!["--submit","--submit-transfer","--output-id",&id,"--output-id",&id],
+            vec!["--submit","--submit-transfer","--output-id",&id,"--settlement-file","fixture"],
+        ] { assert!(parse(&invalid).is_err(), "{cmd} {invalid:?}"); }
     }
-    let mut prior = json!({"economic_op_id":"b".repeat(64),"consumed":false,
-        "paid_cum_au_before":"8","paid_cum_au_after":"11"});
-    assert!(check_fiat_output_aggregate(&output, 8, Some(&prior)).is_err());
-    prior["consumed"] = json!(true);
-    assert!(check_fiat_output_aggregate(&output, 11, Some(&prior)).is_ok());
-    assert!(check_fiat_output_aggregate(&output, 10, Some(&prior)).is_err());
 }
 
 #[test]
