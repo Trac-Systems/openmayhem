@@ -78,7 +78,7 @@ function fixture() {
         if (key !== null) {
           reads.push(key);
           assert(!q.has('prefix'));
-          assert(state.has(key) || /^(?:params\/|disp\/provider-open\/|probe\/pass\/|auditor\/|epoch\/apply-anchor\/)/.test(key),
+          assert(state.has(key) || /^(?:params\/|payout\/preparation-tail\/tap\/|disp\/provider-open\/|probe\/pass\/|auditor\/|epoch\/apply-anchor\/)/.test(key),
             `Unexpected key: ${key}`);
           Object.assign(body, { key, value: state.get(key) ?? null });
         } else {
@@ -355,4 +355,32 @@ test('bounds probe fetch fan-out and streamed response bytes before returning an
   await assert.rejects(f.run(), /read limit/);
   assert(f.reads.length < auditors.length);
   await assert.rejects(f.run({}, () => new Response(new Uint8Array(8 * 1024 * 1024 + 1))), /byte limit/);
+});
+
+test('a reserved provider and an unverified binding leave other TAP entitlements payable', async () => {
+  const f = fixture();
+  const b = 'd'.repeat(64), c = 'e'.repeat(64);
+  const aRow = f.add(1);
+  f.add(1, {provider:b});
+  const cRow = f.add(1, {provider:c});
+  cRow.binding.verified = false;
+  const tail = 'payout/preparation-tail/tap/' + PROVIDER;
+  const op = id(123);
+  f.state.set(tail, {economic_op_id:op, consumed:false, paid_cum_au_before:'13', paid_cum_au_after:'16'});
+  const record = {type:'targeted_payout_preparation', kind:'liability', economic_op_id:op, consumed:false,
+    rail:'tap', liability:{provider:PROVIDER,payout_revision:aRow.revision,aggregate_paid_cum_au_before:'13',paid_au:'3'}};
+  f.state.set('payout/preparation/tap/' + op, record);
+  const page = await f.run({schemaVersion:2});
+  assert.deepEqual(page.liabilities.map(row => row.provider), [b]);
+  assert.deepEqual(page.deferred, [
+    {provider:PROVIDER,payout_revision:aRow.revision,reason:'outstanding_preparation',economic_op_id:op},
+    {provider:c,payout_revision:cRow.revision,reason:'unverified_binding'}
+  ]);
+  record.liability.paid_au = '4';
+  await assert.rejects(f.run({schemaVersion:2}), /matching outstanding liability/);
+  f.state.set(tail, null);
+  cRow.binding.verified = true;
+  const next = await f.run({schemaVersion:2});
+  assert.deepEqual(next.liabilities.map(row => row.provider), [PROVIDER,b,c]);
+  assert.deepEqual(next.deferred, []);
 });

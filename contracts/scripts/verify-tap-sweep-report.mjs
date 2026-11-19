@@ -116,7 +116,7 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
   }
   const selector = bundle.tap_liability_sweep;
   requireEvidence(selector && isDeepStrictEqual(Object.keys(selector).sort(), ['after', 'schema_version', 'signed_length']) &&
-    selector.schema_version === 1 && Number.isSafeInteger(selector.signed_length) && selector.signed_length > 0 &&
+    [1, 2].includes(selector.schema_version) && Number.isSafeInteger(selector.signed_length) && selector.signed_length > 0 &&
     (selector.after === null || (typeof selector.after === 'string' && cursorPattern.test(selector.after))),
   'invalid frozen page selector');
   requireEvidence(bundle.rail === 'tap' && Number.isSafeInteger(bundle.epoch) && bundle.epoch > 0 &&
@@ -134,14 +134,15 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
   const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
   const signal = AbortSignal.timeout(60_000);
   const page = await resolveTapLiabilitySweep({ peerRpcUrl, epoch: bundle.epoch, epochApplyHash: bundle.epoch_apply_hash,
-    at, signedLength: selector.signed_length, after: selector.after,
+    at, signedLength: selector.signed_length, after: selector.after, schemaVersion: selector.schema_version,
     fetchImpl: (url, options) => fetchImpl(url, { ...options, signal }) });
   requireEvidence(page.signed_length === selector.signed_length && page.after === selector.after &&
     (page.next_after === null || (typeof page.next_after === 'string' && cursorPattern.test(page.next_after))) &&
     Array.isArray(page.liabilities) && Number.isSafeInteger(page.max_outputs) && page.max_outputs > 0 &&
     page.liabilities.length <= page.max_outputs, 'resolved page bounds');
   requireEvidence(isDeepStrictEqual(report.tap_liability_sweep, { ...selector, next_after: page.next_after,
-    eligible_count: page.liabilities.length, at }), 'page cursor, timestamp or eligible count');
+    eligible_count: page.liabilities.length, at,
+    ...(selector.schema_version === 2 ? { deferred: page.deferred } : {}) }), 'page cursor, timestamp or eligible count');
   const minimum = report.payout_minimum_lock;
   requireEvidence(report.payout_min_au === page.payout_min_au &&
     minimum?.type === 'tap_payout_minimum_lock' && minimum.key === 'params/payout_min_au' &&

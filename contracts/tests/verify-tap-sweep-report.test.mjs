@@ -298,3 +298,12 @@ test('finalized zero-receipt roller report passes both existing payment gates on
   report.preparation_ids = [];
   await assert.rejects(verifyTapSweepReport({ ...ctx, report, confirmed: true }), /preparation_ids/);
 });
+
+test('the sweep verifier reconstructs every deferred obligation from its signed page', async () => {
+  const ctx = fixture();
+  ctx.bundle.tap_liability_sweep.schema_version = 2;
+  Object.assign(ctx.report.tap_liability_sweep, { schema_version: 2, deferred: [] });
+  await verifyTapSweepReport(ctx);
+  ctx.report.tap_liability_sweep.deferred.push({ provider, payout_revision: revision, reason: 'unverified_binding' });
+  await assert.rejects(verifyTapSweepReport(ctx), /eligible count/);
+});

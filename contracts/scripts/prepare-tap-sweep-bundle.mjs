@@ -32,14 +32,14 @@ function durableWrite(file, obj, replace) {
 function loadCursor(spool) {
   if (!fs.existsSync(cursorFile(spool))) return null;
   const value = load(cursorFile(spool));
-  assert(value.schema_version === 1 && positive(value.epoch) && hash32.test(value.epoch_apply_hash) &&
+  assert([1, 2].includes(value.schema_version) && positive(value.epoch) && hash32.test(value.epoch_apply_hash) &&
     positive(value.signed_length) && validCursor(value.after) && validCursor(value.next_after) &&
     hash32.test(value.report_sha256), 'Invalid saved TAP sweep cursor');
   return value;
 }
 
 function validateIntent(intent, epoch, anchor) {
-  assert(intent.schema_version === 1 && intent.epoch === epoch && intent.epoch_apply_hash === anchor &&
+  assert([1, 2].includes(intent.schema_version) && intent.epoch === epoch && intent.epoch_apply_hash === anchor &&
     positive(intent.signed_length) && positive(intent.at) && validCursor(intent.after) &&
     Number.isSafeInteger(intent.params?.fee_bps) && intent.params.fee_bps >= 0 &&
     /^(0|[1-9][0-9]*)$/.test(intent.params?.payout_min_au) && typeof intent.params.payout_min_au === 'string',
@@ -78,7 +78,7 @@ async function captureIntent({ epoch, anchor, spool, peer, empty, fetchImpl }) {
   if (validation instanceof Error) throw validation;
   const cursor = loadCursor(spool);
   assert(!cursor || cursor.epoch < epoch, 'TAP sweep epoch already used or out of order');
-  return { schema_version: 1, epoch, epoch_apply_hash: anchor, signed_length: head.signed_length,
+  return { schema_version: 2, epoch, epoch_apply_hash: anchor, signed_length: head.signed_length,
     at, after: cursor?.next_after ?? null, params, empty };
 }
 
@@ -100,7 +100,7 @@ export async function prepareSweep({ epoch, anchor, dir, spool, peer, file, empt
   if (bundle.at !== undefined) assert.equal(bundle.at, intent.at, 'TAP bundle preparation timestamp changed');
   bundle.at = intent.at;
   bundle.params = { ...bundle.params, ...intent.params };
-  bundle.tap_liability_sweep = { schema_version:1, signed_length:intent.signed_length, after:intent.after };
+  bundle.tap_liability_sweep = { schema_version:intent.schema_version, signed_length:intent.signed_length, after:intent.after };
   if (!fs.existsSync(stored)) durableWrite(stored, intent, false);
   durableWrite(file, bundle, true);
 }
@@ -126,10 +126,10 @@ export function advanceSweep({ epoch, anchor, dir, spool, marker }) {
     assert(reconciliation.type === 'canonical_tap_settlement_reconciliation' &&
       reconciliation.processed_report_sha256 === sha(reportRaw), 'TAP payment lacks an exact reconciled report');
   }
-  const start = { schema_version:1, signed_length:intent.signed_length, after:intent.after };
+  const start = { schema_version:intent.schema_version, signed_length:intent.signed_length, after:intent.after };
   assert.deepEqual(bundle.tap_liability_sweep, start);
   const page = report.tap_liability_sweep;
-  assert(page?.schema_version === 1 && page.signed_length === intent.signed_length && page.after === intent.after &&
+  assert(page?.schema_version === intent.schema_version && page.signed_length === intent.signed_length && page.after === intent.after &&
     validCursor(page.next_after) && (!page.after || !page.next_after || page.next_after > page.after) &&
     page.at === intent.at && bundle.at === intent.at, 'TAP page did not complete its frozen cursor');
   const record = { ...start, epoch, epoch_apply_hash:anchor, next_after:page.next_after, report_sha256:sha(reportRaw) };

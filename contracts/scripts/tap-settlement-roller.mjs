@@ -975,7 +975,7 @@ function tapSweepPointer(bundle) {
   const pointer = bundle.tap_liability_sweep;
   if (!isObject(pointer) || Object.keys(pointer).length !== 3 ||
       !['schema_version', 'signed_length', 'after'].every(key => hasOwn(pointer, key)) ||
-      pointer.schema_version !== 1 || !Number.isSafeInteger(pointer.signed_length) || pointer.signed_length < 1 ||
+      ![1, 2].includes(pointer.schema_version) || !Number.isSafeInteger(pointer.signed_length) || pointer.signed_length < 1 ||
       !(pointer.after === null || (typeof pointer.after === 'string' && TAP_LIABILITY_CURSOR.test(pointer.after)))) {
     throw new Error('invalid TAP liability sweep pointer');
   }
@@ -994,7 +994,7 @@ async function verifiedTapSweep({ pointer, bundle, epochApplyHash, tapRateLock, 
   const at = tapPreparationAt(bundle, tapRateLock);
   const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
   const page = await resolveTapLiabilitySweep({ peerRpcUrl, epoch: bundle.epoch, epochApplyHash, at,
-    signedLength: pointer.signed_length, after: pointer.after, fetchImpl });
+    signedLength: pointer.signed_length, after: pointer.after, schemaVersion: pointer.schema_version, fetchImpl });
   if (page?.signed_length !== pointer.signed_length || page.after !== pointer.after ||
       !(page.next_after === null || (typeof page.next_after === 'string' && TAP_LIABILITY_CURSOR.test(page.next_after) &&
         (pointer.after === null || page.next_after > pointer.after)))) {
@@ -1017,7 +1017,8 @@ async function verifiedTapSweep({ pointer, bundle, epochApplyHash, tapRateLock, 
       throw new Error('ineligible TAP sweep liability for this pool');
     }
   }
-  return { liabilities, metadata: { ...pointer, next_after: page.next_after, eligible_count: liabilities.size, at } };
+  return { liabilities, metadata: { ...pointer, next_after: page.next_after, eligible_count: liabilities.size, at,
+    ...(pointer.schema_version === 2 ? { deferred: page.deferred } : {}) } };
 }
 
 function ceilDiv(value, divisor) {

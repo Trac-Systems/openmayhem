@@ -165,6 +165,27 @@ async function mainnetPayments(contract) {
   return payments;
 }
 
+async function openProviderPreparation(contract, provider, paid) {
+  const tail = await contract.get(contract.payoutPreparationAggregateTailKey('tap', provider));
+  if (tail === null) return null;
+  requireState(hex32(tail.economic_op_id) && typeof tail.consumed === 'boolean' &&
+    typeof tail.paid_cum_au_after === 'string' && /^(0|[1-9][0-9]*)$/.test(tail.paid_cum_au_after),
+  'Invalid TAP preparation tail');
+  if (tail.consumed) {
+    requireState(tail.paid_cum_au_after === paid, 'Consumed TAP preparation differs from aggregate watermark');
+    return null;
+  }
+  const record = await contract.get(contract.payoutPreparationRecordKey('tap', tail.economic_op_id));
+  requireState(record?.type === 'targeted_payout_preparation' && record.rail === 'tap' &&
+    record.kind === 'liability' && record.consumed === false && record.economic_op_id === tail.economic_op_id &&
+    record.liability?.provider === provider && hex32(record.liability.payout_revision) &&
+    record.liability.aggregate_paid_cum_au_before === tail.paid_cum_au_before &&
+    /^(0|[1-9][0-9]*)$/.test(tail.paid_cum_au_before) && /^[1-9][0-9]*$/.test(record.liability.paid_au) &&
+    BigInt(tail.paid_cum_au_before) + BigInt(record.liability.paid_au) === BigInt(tail.paid_cum_au_after) &&
+    BigInt(paid) <= BigInt(tail.paid_cum_au_before), 'TAP preparation tail has no matching outstanding liability');
+  return tail.economic_op_id;
+}
+
 function verifyBinding(binding, row, payments) {
   requireState(binding?.type === 'provider_payout_binding' && binding.verified === true &&
     binding.provider === row.provider && binding.rail === 'tap' && binding.revision === row.revision &&
@@ -213,11 +234,12 @@ async function providerBudget(contract, provider, epoch, params) {
  * total_au minus held_au minus paid_cum_au. All AU fields are decimal strings.
  */
 export async function resolveTapLiabilitySweep({
-  peerRpcUrl, epoch, epochApplyHash, at, signedLength, after = null, fetchImpl = fetch,
+  peerRpcUrl, epoch, epochApplyHash, at, signedLength, after = null, schemaVersion = 1, fetchImpl = fetch,
 }) {
   requireState(uint(signedLength) && signedLength > 0 && uint(epoch) && epoch > 0 &&
     hex32(epochApplyHash) && uint(at), 'Invalid pinned TAP sweep inputs');
   requireState(after === null || (typeof after === 'string' && KEY.test(after)), 'Invalid TAP sweep after cursor');
+  requireState(schemaVersion === 1 || schemaVersion === 2, 'Unknown TAP liability sweep version');
   const snapshot = snapshotReader(peerRpcUrl, signedLength, fetchImpl);
   // Only read-only reducer methods are used. No peer, wallet or writable storage is constructed.
   const contract = Object.assign(Object.create(MayhemContract.prototype), { get: snapshot.get });
@@ -229,17 +251,31 @@ export async function resolveTapLiabilitySweep({
   const minimum = BigInt(params.payout_min_au);
   const providers = new Map();
   const liabilities = [];
+  const deferred = [];
   for (const { key, value: row } of page.values) {
     const [, provider, revision] = KEY.exec(key);
     checked(contract.guardianValidatePayoutLiabilityRecord(row, provider, 'tap', revision));
     const binding = await contract.get(contract.providerPayoutBindingFeatureKey('tap', provider, revision));
-    verifyBinding(binding, row, payments);
-    if (!providers.has(provider)) providers.set(provider, await providerBudget(contract, provider, epoch, params));
+    const unavailable = schemaVersion === 2 && (binding === null || binding.verified === false);
+    if (!unavailable) verifyBinding(binding, row, payments);
+    if (!providers.has(provider)) {
+      const budget = await providerBudget(contract, provider, epoch, params);
+      if (schemaVersion === 2) budget.preparation = await openProviderPreparation(contract, provider, budget.paid);
+      providers.set(provider, budget);
+    }
     const budget = providers.get(provider);
     const { held, payable } = await refresh(contract, row, epoch, params, budget.gates);
     budget.scannedPaid += BigInt(row.paid_cum_au);
     requireState(budget.scannedPaid <= BigInt(budget.paid), 'Revision paid exceeds aggregate paid watermark');
     if (payable === 0n || payable < minimum) continue;
+    if (unavailable || budget.preparation) {
+      // Keep every held entitlement in the canonical liability ledger. A later sweep
+      // reconsiders it after the binding or the provider's cumulative reservation clears.
+      const reason = unavailable ? { reason: 'unverified_binding' }
+        : { reason: 'outstanding_preparation', economic_op_id: budget.preparation };
+      deferred.push({ provider, payout_revision: revision, ...reason });
+      continue;
+    }
     budget.selected += payable;
     requireState(budget.selected <= budget.payable, 'Selected revisions exceed refreshed aggregate payable');
     liabilities.push({
@@ -251,5 +287,6 @@ export async function resolveTapLiabilitySweep({
   return {
     signed_length: signedLength, after, next_after: page.next_cursor, payout_min_au: params.payout_min_au,
     fee_bps: params.fee_bps, max_outputs: maxOutputs, liabilities,
+    ...(schemaVersion === 2 ? { deferred } : {}),
   };
 }

@@ -2353,7 +2353,7 @@ test('empty-epoch TAP maturity page queues once and retains the same intent acro
   assert(fs.existsSync(spoolFile),interrupted.stderr);
   const raw = fs.readFileSync(spoolFile);
   assert.deepEqual(JSON.parse(raw).receipts,[]);
-  assert.deepEqual(JSON.parse(raw).tap_liability_sweep,{schema_version:1,signed_length:97,after:null});
+  assert.deepEqual(JSON.parse(raw).tap_liability_sweep,{schema_version:2,signed_length:97,after:null});
   assert.equal(fs.existsSync(path.join(work,'tap.complete')),false);
   assert.equal(fs.existsSync(path.join(work,'tap.produced')),false);
   const recovered = runWorker(ctx,{...opts, MAYHEM_TAP_LIABILITY_SWEEP_ENABLED:'0'});

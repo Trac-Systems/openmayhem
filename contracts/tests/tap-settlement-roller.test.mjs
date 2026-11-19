@@ -1250,7 +1250,7 @@ test('TAP sweep bounds output revisions while verifying every off-page receipt a
 test('TAP sweep rejects caller projections, malformed pointers and stale policy or snapshot evidence', async () => {
   const { args, bind, state } = sweepFixture(4);
   const pointer = args.bundle.tap_liability_sweep;
-  for (const malformed of [null, {}, { ...pointer, schema_version: 2 }, { ...pointer, liabilities: [sweepRow] },
+  for (const malformed of [null, {}, { ...pointer, schema_version: 3 }, { ...pointer, liabilities: [sweepRow] },
     { ...pointer, signed_length: '104' }, { ...pointer, signed_length: 0 }, { ...pointer, after: '' },
     { ...pointer, after: sweepKey(sweepRow).toUpperCase() }]) {
     args.bundle.tap_liability_sweep = malformed;

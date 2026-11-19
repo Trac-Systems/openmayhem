@@ -37,7 +37,7 @@ test('a signed empty epoch schedules a liability page without a new receipt; res
   const {args,requests} = fixture(t);
   await prepareSweep(args);
   const first=fs.readFileSync(args.file); const bundle=JSON.parse(first);
-  assert.deepEqual(bundle.receipts,[]);assert.deepEqual(bundle.tap_liability_sweep,{schema_version:1,signed_length:321,after:null});
+  assert.deepEqual(bundle.receipts,[]);assert.deepEqual(bundle.tap_liability_sweep,{schema_version:2,signed_length:321,after:null});
   assert.equal(bundle.at,1234);assert.equal(typeof bundle.params.payout_min_au,'string');
   assert(requests.includes('epoch/seal/7'));
   await prepareSweep({...args,fetchImpl:()=>{throw Error('unexpected network read')}});
@@ -81,4 +81,17 @@ test('the cursor advances only from the exact verified report and replays idempo
   write(marker,{...proof,evidence_sha256:checksum(report)});
   assert.throws(commit,/Conflicting TAP page/);
   assert.deepEqual(fs.readFileSync(cursor),first);
+});
+
+test('restarting a frozen version-one sweep reproduces its original pointer and bundle', async t => {
+  const {args}=fixture(t);
+  await prepareSweep(args);
+  const file=path.join(args.dir,'tap-sweep-intent.json');
+  const legacy={...read(file),schema_version:1};
+  write(file,legacy);
+  await prepareSweep({...args,fetchImpl:()=>{throw Error('unexpected live snapshot')}});
+  const bytes=fs.readFileSync(args.file);
+  assert.deepEqual(JSON.parse(bytes).tap_liability_sweep,{schema_version:1,signed_length:321,after:null});
+  await prepareSweep(args);
+  assert.deepEqual(fs.readFileSync(args.file),bytes);
 });
