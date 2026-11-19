@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { encodeRlp, Interface, toBeHex, toQuantity } from 'ethers';
 import MayhemContract, { CONTRACT_VERSION, payoutPreparationMessage, targetedPayoutControlMessage } from '../../intercom/contract/contract.js';
-import { projectTapAuAlternative, projectTapDebt, tapAlternativeKey, tapDebtBundle, tapDebtEnvelope, tapDebtKey, tapDebtPlan, tapDebtResolutionKey, tapOpeningClaimCeilings, verifyPreparedTapPrice, verifyTapDebtBasis } from '../../intercom/contract/tap-prepared-debt.js';
+import { projectTapAuAlternative, projectTapDebt, tapAlternativeKey, tapDebtBundle, tapDebtEnvelope, tapDebtKey, tapDebtPlan, tapDebtResolutionKey, tapOpeningClaimCeilings, verifyPreparedTapPrice, verifyTapDebtBasis } from '../../intercom/contract/tap-prepared-debt-v32.js';
 import { packTapProof, tapEpochSlot, tapClaimedSlot, tapPoolHeadSlots, tapPendingSlots, verifyPostedTapEpoch, verifySkippedTapEpoch, verifyWinningTapEpoch } from '../../intercom/contract/tap-epoch-proof.js';
 import { distribution } from './merkle.mjs';
 import { cumulativeTapRefunds, guardianPreSignReport, projectTapRefunds, settlementBundleSha256, transferableTapRefunds, verifyTapFinancialPolicy } from './tap-settlement-roller.mjs';
@@ -414,7 +414,7 @@ export async function prepareTapAuAlternative({ contract, source, originalBundle
 // The ordinary owner/governance pool screens still bind the current EVM basis.
 export async function confirmTapAuAlternative({ contract, candidate }) {
   const { plan, feature } = candidate, offer = feature.value;
-  assert(offer.stage === 'authorize_au_alternative' && feature.key === await tapDebtKey(contract, offer), 'Candidate identity mismatch');
+  assert([31, CONTRACT_VERSION].includes(offer.contract_version) && offer.stage === 'authorize_au_alternative' && feature.key === await tapDebtKey(contract, offer), 'Candidate identity mismatch');
   const record = await contract.get(tapAlternativeKey(plan.root_preparation_id));
   assert(record?.submission === feature.key && record.candidate_id === plan.root_preparation_id, 'No confirmed AU alternative');
   assert.deepEqual(record.value, offer, 'Conflicting authorized candidate');
@@ -445,7 +445,7 @@ export async function confirmTapAuAlternative({ contract, candidate }) {
   const canonical = await tapDebtPlan(contract, derived.intent);
   assert.deepEqual(plan, canonical);
   for (const [i,p] of canonical.preparations.entries()) {
-    const envelope = await tapDebtEnvelope(contract, canonical.intent, p, offer.admin, CONTRACT_VERSION);
+    const envelope = await tapDebtEnvelope(contract, canonical.intent, p, offer.admin, offer.contract_version);
     validSignature(offer.admin, payoutPreparationMessage(envelope), offer.preparation_signatures[i]);
   }
   return { status: 'authorized', plan: canonical, opening: derived.opening };

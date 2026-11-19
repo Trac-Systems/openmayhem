@@ -3587,10 +3587,13 @@ function payoutPreparationEvidence(value) {
 
 function exactUnconsumedPreparation(record, value) {
   if (!isObject(record) || record.type !== 'targeted_payout_preparation' || record.consumed !== false) return false;
-  // The v31 roller can resume a confirmed v30 envelope before or after an
-  // EVM proposal. Verify the original signature over the entire planned intent.
-  if (record.contract_version !== value.contract_version &&
-      !(value.contract_version === 31 && record.contract_version === 30 && !value.admin_sig)) return false;
+  // Reuse only confirmed preparations from a supported predecessor. Verify
+  // the original signature over every field before any EVM effect.
+  if (record.contract_version !== value.contract_version) {
+    const predecessor = (value.contract_version === 31 && record.contract_version === 30) ||
+      (value.contract_version === 32 && [30, 31].includes(record.contract_version));
+    if (value.admin_sig || !predecessor) return false;
+  }
   if (!isHexBytes(record.admin_sig, 64)) return false;
   const expected = { ...value, contract_version: record.contract_version };
   const message = 'mayhem-targeted-payout-preparation-v1' + stableJson(payoutPreparationEvidence(expected));

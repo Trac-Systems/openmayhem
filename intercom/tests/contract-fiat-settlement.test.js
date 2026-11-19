@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Contract30 from '../contract/v30.js';
+import Contract31 from '../contract/v31.js';
 import { inventory, advanceHead } from './helpers/payout-history.js';
 import Contract27 from '../contract/history/v27.js';
 import Contract28 from '../contract/history/v28.js';
@@ -1129,10 +1130,17 @@ test('recovery rejects contradictory legacy state and a changed last observation
     fx_quote_id: p.request.fx_quote_id, fx_quote_hash: p.request.fx_quote_hash,
     quote_expires_at: p.quote_expires_at, error_code: 'fx_quote_expired', external_effect_absent: true
   };
+  // These attempts belong to the retained 508 incident history. Generate their
+  // original C31 signatures before inspecting and fencing them under C32.
+  const current = ctx.contract;
+  ctx.contract = new Contract31(current.protocol, {});
+  ctx.version = 31;
   assert.equal((await finalizeAttempt(ctx, p, 'expired_pre_effect', expiry)).result.ok, true);
   const expired = await reviewedFeature(ctx, 'fence');
   const replacement = await prepareAttempt(ctx, prior, old, 2);
   assert.equal(replacement.result.ok, true);
+  ctx.contract = current;
+  delete ctx.version;
   await assert.rejects(reviewedFeature(ctx, 'fence'), /additional 508 attempts/);
   assert.match((await submitRecovery(ctx, expired)).message, /observation/);
   assert.match((await submitRecovery(ctx, feature)).message, /observation/);
@@ -1159,13 +1167,14 @@ test('conflicting evidence and a bad nested signature cannot release either rese
   assert.equal(await ctx.storage.get(ctx.contract.payoutPreparationRecordKey('fiat', next.economic_op_id)), null);
 });
 
-for (const legacy of [false, true]) {
-  test(`FIAT independently accounts frozen revisions and later earnings with an open ${legacy ? 'v30' : 'v31'} attempt`, async () => {
+for (const version of [30, 31, CONTRACT_VERSION]) {
+  test(`FIAT independently accounts frozen revisions and later earnings with an open v${version} attempt`, async () => {
     const ctx = await setup();
     const current = ctx.contract;
-    if (legacy) {
-      ctx.contract = new Contract30(current.protocol, {});
-      ctx.version = 30;
+    if (version !== CONTRACT_VERSION) {
+      const Previous = version === 30 ? Contract30 : Contract31;
+      ctx.contract = new Previous(current.protocol, {});
+      ctx.version = version;
     }
     const [first, fee] = ctx.outputs;
     const read = async key => (await ctx.storage.get(key))?.value ?? null;

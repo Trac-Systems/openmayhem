@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Contract30 from '../contract/v30.js';
+import Contract31 from '../contract/v31.js';
 import { inventory, inventoryPage, advanceHead } from './helpers/payout-history.js';
 import b4a from 'b4a';
 
@@ -562,13 +563,14 @@ test('TNK epoch plans fail closed when payable or carried liabilities are omitte
   );
 });
 
-for (const legacy of [false, true]) {
-  test(`TNK settles disjoint later tranches before original ${legacy ? 'v30' : 'v31'} transfers`, async () => {
+for (const version of [30, 31, CONTRACT_VERSION]) {
+  test(`TNK settles disjoint later tranches before original v${version} transfers`, async () => {
     const ctx = await setup();
     const current = ctx.contract;
-    if (legacy) {
-      ctx.contract = new Contract30(current.protocol, {});
-      ctx.version = 30;
+    if (version !== CONTRACT_VERSION) {
+      const Previous = version === 30 ? Contract30 : Contract31;
+      ctx.contract = new Previous(current.protocol, {});
+      ctx.version = version;
     }
     const [original, fee] = ctx.outputs;
     const oldPlan = await buildPlan(ctx, ctx.outputs);

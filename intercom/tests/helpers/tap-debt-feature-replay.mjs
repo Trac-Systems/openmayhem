@@ -14,7 +14,7 @@ export async function assertTapDebtNativeReplay(t, fixture, snapshot, features) 
     const nonce = String(i + 1).padStart(64, '0');
     const hash = fixture.sign(JSON.stringify(value) + nonce);
     return { type: 'feature', key: 'mayhem_' + key, value: { dispatch: { type: 'mayhem_feature',
-      contract_version: 31, key, address: fixture.admin.publicKey, value, nonce, hash } } };
+      contract_version: value.contract_version, key, address: fixture.admin.publicKey, value, nonce, hash } } };
   });
   const sizes = ops.map(op => Buffer.byteLength(JSON.stringify(op)));
   assert(sizes.every(n => n <= 64_000), 'Signed default-protocol feature size exceeded');

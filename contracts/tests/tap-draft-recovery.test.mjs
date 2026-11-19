@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { ethers, ZeroHash } from 'ethers';
-import MayhemContract from '../../intercom/contract/contract.js';
+import MayhemContract, { CONTRACT_VERSION } from '../../intercom/contract/contract.js';
 import { executeFeature, executeRateFeature, makeIdentity, makeVerifier, MemoryStorage } from '../../intercom/tests/helpers/contract.js';
 import { advanceSweep, loadCursor, prepareSweep, validateQueuedSweep, verifyQueuedTapSweep } from '../scripts/prepare-tap-sweep-bundle.mjs';
 import { digest, handoffFile, journalTapPreparation, sealTapSource, nextRefunds } from '../scripts/tap-draft-files.mjs';
@@ -986,7 +986,7 @@ for (const [mode, name] of [
     assert.equal(fs.existsSync(archive + '.prepare-intent.json'), false);
     lose = true;
     await assert.rejects(tick(), /accepted feature, reply lost/);
-    assert.equal(reservation(sealed.preparation_ids[1]).contract_version, 31);
+    assert.equal(reservation(sealed.preparation_ids[1]).contract_version, CONTRACT_VERSION);
     assert.equal(await tick(), 'original preparation submitted');
     assert.deepEqual(reservation(sealed.preparation_ids[0]), prefix);
     assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);

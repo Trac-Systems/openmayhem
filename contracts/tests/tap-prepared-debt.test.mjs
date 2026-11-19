@@ -4,14 +4,15 @@ import ganache from 'ganache';
 import { BrowserProvider, Contract, ContractFactory, Wallet, toBeHex } from 'ethers';
 import { compileAll } from '../scripts/compile.mjs';
 import { signRootProposal } from '../scripts/pool-governance.mjs';
-import Mayhem, { payoutPreparationMessage, targetedPayoutControlMessage } from '../../intercom/contract/contract.js';
+import Mayhem, { CONTRACT_VERSION, payoutPreparationMessage, targetedPayoutControlMessage } from '../../intercom/contract/contract.js';
 import { assertTapDebtNativeReplay } from '../../intercom/tests/helpers/tap-debt-feature-replay.mjs';
-import { tapDebtEnvelope, tapDebtKey } from '../../intercom/contract/tap-prepared-debt.js';
+import Mayhem31 from '../../intercom/contract/v31.js';
+import { tapDebtEnvelope, tapDebtKey } from '../../intercom/contract/tap-prepared-debt-v32.js';
 import { tapEpochSlot, tapClaimedSlot } from '../../intercom/contract/tap-epoch-proof.js';
 import { MemoryStorage, makeIdentity, makeVerifier, executeFeature, executeRateFeature } from '../../intercom/tests/helpers/contract.js';
 import { collectTapEpochProof, preparedTapReplay, prepareTapDebtRecovery, restoreTapDebtPrefix, verifyPreparedTapFinancialPolicy,
   confirmTapDebtRecovery, prepareTapAuAlternative, confirmTapAuAlternative, settleTapAuAlternative, rebuildPreparedTapSource, certifyTapDebtBasis, postedTapDebtClaims, screenTapAuProposal } from '../scripts/tap-prepared-debt.mjs';
-import { buildCanonicalTapPreparationPlan, settlementBundleSha256 } from '../scripts/tap-settlement-roller.mjs';
+import { buildCanonicalTapPreparationPlan, settlementBundleSha256, submitCanonicalTapPreparationPlan } from '../scripts/tap-settlement-roller.mjs';
 import { MAINNET_POOL as pool, MAINNET_TOKEN as token } from '../scripts/tap-liability-sweep.mjs';
 
 const id = i => toBeHex(i, 32).slice(2);
@@ -24,13 +25,14 @@ const originalBundle = (epoch, refunds = []) => ({ epoch, epoch_apply_hash: id(e
 const included = value => assert.equal(value?.ok, true, value?.message);
 const scope = { chain_id: 1, pool_address: pool, token_address: token, payment_config_ver: 1 };
 
-async function fixture() {
+async function fixture(version = CONTRACT_VERSION) {
+  const Implementation = version === 31 ? Mayhem31 : Mayhem;
   const admin = await makeIdentity();
   const sign = msg => Buffer.from(admin.wallet.sign(Buffer.from(msg))).toString('hex');
-  const contract = new Mayhem({ peer: { wallet: makeVerifier(admin.wallet) } }, {});
+  const contract = new Implementation({ peer: { wallet: makeVerifier(admin.wallet) } }, {});
   const storage = new MemoryStorage({ admin: admin.publicKey, 'payments/current': { ver: 1, denom: 'au_usd',
     set_by: admin.publicKey, set_by_role: 'admin', rails: ['tap'], tnk: { network: 'mainnet' }, tap: { chain_id: 1, pool_address: pool, token_address: token } } });
-  const view = Object.assign(Object.create(Mayhem.prototype), { get: async key => (await storage.get(key))?.value ?? null });
+  const view = Object.assign(Object.create(Implementation.prototype), { get: async key => (await storage.get(key))?.value ?? null });
   const feature = (key, value, sender = admin.publicKey) => executeFeature(contract, storage, 'mayhem_feature', key, value, sender);
   const scopeRows = async (provider, revision, target, total, epoch) => {
     const earning = { provider, rail: 'tap', denom: 'au_usd', total_au: String(total), held_au: '0', paid_cum_au: '0',
@@ -82,7 +84,7 @@ async function fixture() {
   }
   const prepare = async (plan, start = 0, end = plan.preparations.length) => {
     for (const p of plan.preparations.slice(start, end)) {
-      const v = await tapDebtEnvelope(view, plan.intent, p, admin.publicKey, 31);
+      const v = await tapDebtEnvelope(view, plan.intent, p, admin.publicKey, version);
       v.admin_sig = sign(payoutPreparationMessage(v));
       included(await feature(await view.targetedPayoutPreparationFeatureKey(v), v));
     }
@@ -494,6 +496,79 @@ test('one waiting AU payee, doubled market price, no later epoch or business: on
   for (const env of [feature, settle.feature]) included(await executeFeature(c, replay, 'mayhem_feature', env.key, env.value, f.admin.publicKey));
   assert.equal(replay.snapshotBytes(), after);
   await assertTapDebtNativeReplay(t, f, MemoryStorage.fromSnapshotBytes(snapshot), [feature, settle.feature]);
+});
+
+test('C32 roller resumes the exact confirmed C31 liability and root without signing or posting', async () => {
+  const f = await fixture(31);
+  const source = await f.makePlan(1, [[id(41),id(51),address(21),3n*au]]);
+  await f.prepare(source);
+  const args = { plan:source, requireExisting:true, peerRpcUrl:'http://fixture.invalid/v1/',
+    adminSigner:{publicKey:f.admin.publicKey,sign:()=>assert.fail('must reuse original signatures')},
+    fetchImpl:async(url,options)=>{
+      assert.equal(options?.method ?? 'GET','GET');
+      const key=new URL(url).searchParams.get('key');
+      return Response.json({key,confirmed:true,signed_length:70,value:await f.view.get(key)});
+    } };
+  assert.equal((await submitCanonicalTapPreparationPlan(args)).all_existing,true);
+  const key=f.view.payoutPreparationRecordKey('tap',source.preparation_ids[0]);
+  const original=await f.view.get(key);
+  assert.equal(original.contract_version,31);
+  for (const patch of [{contract_version:29},{contract_version:33},{epoch:2},{admin_sig:'00'.repeat(64)}]) {
+    const altered={...original,...patch};
+    if (!patch.admin_sig)altered.admin_sig=f.sign(payoutPreparationMessage(altered));
+    await f.storage.put(key,altered);
+    await assert.rejects(submitCanonicalTapPreparationPlan(args),/conflicts with the planned operation/);
+  }
+});
+
+test('C32 settles a C31 authorized conditional root using only the C31 component signatures', async t => {
+  const f = await fixture(31);
+  const origin = await f.makePlan(1, [[id(41), id(51), address(21), 3n * au]]);
+  await f.prepare(origin);
+  const rate = await f.rate(at(1) + 3000, 2n * au);
+  const candidate = await prepareTapAuAlternative({ contract:f.view, source:origin, originalBundle:originalBundle(1),
+    openingEpoch:0, rateRecordKey:rate.updated_at, financialAt:rate.ts, sign:f.sign });
+  const offer = candidate.feature.value;
+  offer.contract_version = 31;
+  offer.preparation_signatures = [];
+  for (const preparation of candidate.plan.preparations) {
+    const signed = await tapDebtEnvelope(f.view,candidate.plan.intent,preparation,f.admin.publicKey,31);
+    offer.preparation_signatures.push(f.sign(payoutPreparationMessage(signed)));
+  }
+  offer.admin_sig = f.sign(targetedPayoutControlMessage(offer));
+  candidate.feature.key = await tapDebtKey(f.view,offer);
+  included(await f.feature(candidate.feature.key,offer));
+  const upgraded = new Mayhem(f.contract.protocol,{});
+  const reader = Object.assign(Object.create(Mayhem.prototype),{get:key=>f.view.get(key)});
+  const apply = (key,value,storage=f.storage)=>executeFeature(upgraded,storage,'mayhem_feature',key,value,f.admin.publicKey);
+  assert.equal((await confirmTapAuAlternative({contract:reader,candidate})).status,'authorized');
+  const {proof,cp}=await executeAuWinner(t,f,candidate.plan,origin,{candidate});
+  const settle=await settleTapAuAlternative({contract:reader,candidate,checkpoint:cp,executionProof:proof,sign:f.sign});
+  const component = await tapDebtEnvelope(reader,candidate.plan.intent,candidate.plan.preparations[0],f.admin.publicKey,31);
+  component.admin_sig=offer.preparation_signatures[0];
+  assert((await reader.targetedPayoutPreparationFeatureKey(component)) instanceof Error,
+    'a stored conditional authorization cannot open a fresh C31 preparation Feature on C32');
+  const frozen=f.storage.snapshotBytes();
+  const storedKey='payout/recovery/tap/au-candidate/'+candidate.plan.root_preparation_id;
+  for(const field of ['contract_version','preparation_signatures','to']) {
+    const damaged=MemoryStorage.fromSnapshotBytes(frozen);
+    const record=structuredClone((await damaged.get(storedKey)).value);
+    if(field==='contract_version')record.value.contract_version=29;
+    if(field==='preparation_signatures')record.value.preparation_signatures[0]='00'.repeat(64);
+    if(field==='to')record.value.source.intent.outputs[0].to=address(99);
+    await damaged.put(storedKey,record);
+    const afterEdit=damaged.snapshotBytes();
+    assert((await apply(settle.feature.key,settle.feature.value,damaged)) instanceof Error);
+    assert.equal(damaged.snapshotBytes(),afterEdit);
+  }
+  included(await apply(settle.feature.key,settle.feature.value));
+  const paid=await reader.get(reader.payoutPreparationRecordKey('tap',candidate.plan.preparation_ids[0]));
+  assert.equal(paid.contract_version,31);
+  assert.equal(paid.admin_sig,offer.preparation_signatures[0]);
+  assert.equal(paid.consumed,true);
+  const after=f.storage.snapshotBytes();
+  assert.equal((await apply(settle.feature.key,settle.feature.value)).idempotent,true);
+  assert.equal(f.storage.snapshotBytes(),after);
 });
 
 test('timely original wins after conditional AU preparation with a materially different market', async () => {
