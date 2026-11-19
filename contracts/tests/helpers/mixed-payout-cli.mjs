@@ -50,8 +50,12 @@ export async function checkBundledCli(t, f, chain, pool, token, owner, governanc
     response.end(JSON.stringify({ key, confirmed: true, signed_length: 44, value }));
   });
   await listen(ledger); t.after(() => close(ledger));
-  const bundle = path.join(root, 'bundle.json'); fs.writeFileSync(bundle, JSON.stringify(f.bundle), { mode: 0o600 });
-  const options = { '--bundle': bundle, '--tap-rate-lock': path.join(root, 'rate.json'), '--ledger-fee-bps': '1500',
+  const working = path.join(root, 'working');
+  fs.mkdirSync(working, { mode: 0o700 });
+  const stem = path.join(working, `epoch-${f.bundle.epoch}-${f.bundle.epoch_apply_hash}`);
+  const bundle = stem + '.receipts.json';
+  fs.writeFileSync(bundle, JSON.stringify(f.bundle), { mode: 0o600 });
+  const options = { '--bundle': bundle, '--settlement-spool': root, '--tap-rate-lock': stem + '.tap-rate.json', '--ledger-fee-bps': '1500',
     '--peer-rpc': `http://127.0.0.1:${ledger.address().port}/v1`, '--eth-rpc': `http://127.0.0.1:${eth.address().port}`,
     '--pool': await pool.getAddress(), '--operator-address': await treasury.getAddress(), '--json': null };
   const wrapper = fs.readFileSync(path.join(ROOT, 'scripts/ops/run-tap-settlement-roller.sh'), 'utf8');
