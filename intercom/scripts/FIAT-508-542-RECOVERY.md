@@ -141,7 +141,14 @@ the existing worker timer resumes 542 and reconciles its transfer.
    replay protection and fresh route evidence before reopening admission.
    Recheck pending invoices, refunds and permits against their original payment
    evidence. Existing providers keep their entitlement, market ID and price.
-4. Verify a fresh quote and reservation with v31 terms and reconciliation of a
+4. For systems that previously received a targeted payout-worker update, check
+   the effective service command, source directory, executable and imported
+   worker files against the staged release. A lower-priority override may still
+   select an older installation when the temporary override is removed.
+   Preserve settlement cursors, timer scheduling and deposit watcher enablement.
+   Verify the files used by the restarted processes and the next scheduled
+   payout invocation.
+5. Verify a fresh quote and reservation with v31 terms and reconciliation of a
    previously accepted v30 request with its original signed terms. Preserve
    all three payment rails, prior receipt commitments and account watermarks.
 
