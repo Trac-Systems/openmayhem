@@ -3,6 +3,8 @@
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { stableValue } from '../../intercom/scripts/recompute-epoch-roots.mjs';
+import { validateTapSettlementCheckpoint } from '../../scripts/validate-tap-settlement-checkpoint.mjs';
 
 const emptyReason = 'no payable TAP liabilities on this page';
 const thresholdReason = 'provider earnings are below payout minimum';
@@ -11,6 +13,73 @@ const cursorPattern = /^payout\/liability\/tap\/[0-9a-f]{64}\/[0-9a-f]{64}$/;
 
 function requireEvidence(condition, message) {
   if (!condition) throw new Error(`Invalid TAP sweep: ${message}`);
+}
+
+function requireFinalReport(report, checkpoint) {
+  requireEvidence(checkpoint?.root_confirmed === true && report.root_confirmed === true &&
+    report.blocked !== true && report.awaiting_finality !== true && report.root_pending !== true &&
+    (report.posted === true || report.root_already_posted === true) &&
+    report.canonical_preparation_confirmed === true, 'missing finalized prepared root');
+  for (const key of ['epoch', 'epoch_apply_hash', 'root', 'cumulative_spent_wei', 'tap_rate_lock',
+    'preparation_ids', 'root_preparation_id', 'external_effect_ids']) {
+    requireEvidence(isDeepStrictEqual(report[key], checkpoint[key]), `checkpoint differs on ${key}`);
+  }
+  for (const key of ['proposal_tx', 'execution_tx']) {
+    requireEvidence(report[key] == null || report[key] === checkpoint[key], `checkpoint differs on ${key}`);
+  }
+  for (const key of ['operator_fee', 'burn']) {
+    const effect = report[key];
+    requireEvidence(effect?.completed === true && effect.remaining_claimable_wei === '0' &&
+      typeof effect.predicted_claimable_wei === 'string' && /^(0|[1-9]\d*)$/.test(effect.predicted_claimable_wei) &&
+      (effect.predicted_claimable_wei === '0' || (effect.auto_sent === true && /^0x[0-9a-f]{64}$/i.test(effect.tx))),
+      `incomplete ${key} evidence`);
+  }
+  const proof = report.root_confirmation;
+  if (proof != null) {
+    requireEvidence(proof.confirmed === true && proof.onchain_epoch === checkpoint.epoch &&
+      proof.onchain_root === checkpoint.root && proof.onchain_cumulative_spent_wei === checkpoint.cumulative_spent_wei &&
+      proof.proposal?.tx_hash === checkpoint.proposal_tx && proof.proposal.block_number === checkpoint.proposal_block_number &&
+      proof.proposal.block_hash === checkpoint.proposal_block_hash &&
+      (!Object.hasOwn(proof.proposal, 'block_timestamp') || !Object.hasOwn(checkpoint, 'proposal_block_timestamp') ||
+        proof.proposal.block_timestamp === checkpoint.proposal_block_timestamp) &&
+      proof.execution?.tx_hash === checkpoint.execution_tx && proof.execution.status === checkpoint.execution_status &&
+      proof.execution.block_number === checkpoint.execution_block_number && proof.execution.block_hash === checkpoint.execution_block_hash &&
+      ['finalized_block_number', 'confirmation_depth', 'confirmation_policy'].every(key => proof[key] === checkpoint[key]),
+      'conflicting root confirmation');
+  }
+  if (report.tap_liability_sweep) {
+    requireEvidence(checkpoint.at === report.tap_liability_sweep.at, 'checkpoint differs on liability snapshot');
+  }
+}
+
+// Supply the canonical header independently verified against the finalized
+// RootProposed receipt. Inputs are decoded JSON. No reads, writes or defaults.
+export function buildCanonicalTapSubmission({ report, proposalBlock }) {
+  const checkpoint = report?.tap_settlement_checkpoint;
+  requireFinalReport(report, checkpoint);
+  requireEvidence(Number.isSafeInteger(proposalBlock?.number) && proposalBlock.number >= 0 &&
+    /^0x[0-9a-f]{64}$/.test(proposalBlock.hash) &&
+    proposalBlock.number === checkpoint.proposal_block_number && proposalBlock.hash === checkpoint.proposal_block_hash &&
+    Number.isSafeInteger(proposalBlock.timestamp) && proposalBlock.timestamp >= checkpoint.at &&
+    proposalBlock.timestamp >= checkpoint.tap_rate_lock.rate_ts, 'proposal block identity or timestamp');
+  if (report.root_confirmation?.proposal && Object.hasOwn(report.root_confirmation.proposal, 'block_timestamp')) {
+    requireEvidence(report.root_confirmation.proposal.block_timestamp === proposalBlock.timestamp, 'conflicting proposal timestamp');
+  }
+  if (Object.hasOwn(checkpoint, 'proposal_block_timestamp')) {
+    requireEvidence(checkpoint.proposal_block_timestamp === proposalBlock.timestamp, 'recorded proposal timestamp conflicts with header');
+  }
+  const submission = stableValue({ ...checkpoint, proposal_block_timestamp: proposalBlock.timestamp });
+  validateTapSettlementCheckpoint({ tap_settlement_checkpoint: submission });
+  return submission;
+}
+
+async function verifyFinalCheckpoint({ bundle, report, proposalBlock, peerRpcUrl, fetchImpl }) {
+  const submission = buildCanonicalTapSubmission({ report, proposalBlock });
+  const { verifyTapFinancialPolicy, settlementBundleSha256 } = await import('./tap-settlement-roller.mjs');
+  requireEvidence(submission.tap_rate_lock.bundle_sha256 === settlementBundleSha256(bundle),
+    'checkpoint differs from rate-locked bundle');
+  await verifyTapFinancialPolicy({ intent: submission, financialAt: submission.proposal_block_timestamp,
+    peerRpcUrl, fetchImpl });
 }
 
 function amount(value) {
@@ -107,11 +176,15 @@ function verifyPageAmounts(page, report, rateLock) {
 }
 
 export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLock,
-  confirmed = false, fetchImpl = fetch }) {
+  confirmed = false, proposalBlock, fetchImpl = fetch }) {
   if (!Object.hasOwn(bundle, 'tap_liability_sweep')) {
     requireEvidence(!Object.hasOwn(report, 'tap_liability_sweep') && report.reason !== emptyReason &&
       Array.isArray(bundle.receipts) && bundle.receipts.length > 0,
     'page proof required for sweep evidence or a zero-receipt epoch');
+    if (confirmed && (report.tap_settlement_checkpoint != null ||
+        (report.root_confirmed === true && report.awaiting_finality !== true))) {
+      await verifyFinalCheckpoint({ bundle, report, proposalBlock, peerRpcUrl, fetchImpl });
+    }
     return;
   }
   const selector = bundle.tap_liability_sweep;
@@ -129,7 +202,7 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
   requireEvidence(rateLock?.epoch === bundle.epoch && isDeepStrictEqual(rateLock, report.tap_rate_lock) &&
     Number.isSafeInteger(rateLock.rate_ts) && rateLock.rate_ts >= 0 && report.tap_usd_au === rateLock.tap_usd_au,
   'report differs from retained TAP rate lock');
-  const at = bundle.at ?? rateLock.rate_ts;
+  const at = bundle.at;
   requireEvidence(Number.isSafeInteger(at) && at >= 0, 'invalid settlement time');
   const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
   const signal = AbortSignal.timeout(60_000);
@@ -158,12 +231,12 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
     requireEvidence(report.canonical_preparation_confirmed === true, 'missing confirmed Core preparation');
     const checkpoint = report.tap_settlement_checkpoint;
     if (checkpoint != null) {
-      const { validateTapSettlementCheckpoint } = await import('../../scripts/validate-tap-settlement-checkpoint.mjs');
-      validateTapSettlementCheckpoint(report);
-      for (const key of ['epoch', 'epoch_apply_hash', 'root', 'cumulative_spent_wei', 'tap_rate_lock',
-        'preparation_ids', 'root_preparation_id', 'external_effect_ids']) {
-        requireEvidence(isDeepStrictEqual(report[key], checkpoint[key]), `checkpoint differs on ${key}`);
-      }
+      await verifyFinalCheckpoint({ bundle, report, proposalBlock, peerRpcUrl, fetchImpl });
+    } else {
+      requireEvidence(report.blocked !== true && (
+        (report.awaiting_governance_delay === true && report.root_pending === true && report.root_confirmed === false) ||
+        (report.awaiting_finality === true && report.root_pending === false && report.root_confirmed === true)
+      ), 'missing final checkpoint or pending root evidence');
     }
   }
 }
@@ -171,12 +244,20 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
 if (import.meta.main ?? (process.argv[1] && fs.existsSync(process.argv[1]) &&
     fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url))) {
   try {
-    const [bundlePath, reportPath, peerRpcUrl, ratePath, phase] = process.argv.slice(2);
-    requireEvidence(phase === 'dry' || phase === 'confirmed', 'invalid verification phase');
+    const args = process.argv.slice(2);
     const read = path => JSON.parse(fs.readFileSync(path, 'utf8'));
-    const bundle = read(bundlePath);
-    const rateLock = Object.hasOwn(bundle, 'tap_liability_sweep') ? read(ratePath) : undefined;
-    await verifyTapSweepReport({ bundle, report: read(reportPath), peerRpcUrl, rateLock, confirmed: phase === 'confirmed' });
+    if (args[0] === 'submission') {
+      requireEvidence(args.length === 3, 'expected submission REPORT_JSON PROPOSAL_BLOCK_JSON');
+      const value = buildCanonicalTapSubmission({ report: read(args[1]), proposalBlock: read(args[2]) });
+      process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+    } else {
+      const [bundlePath, reportPath, peerRpcUrl, ratePath, phase, blockPath] = args;
+      requireEvidence(phase === 'dry' || phase === 'confirmed', 'invalid verification phase');
+      const bundle = read(bundlePath);
+      const rateLock = Object.hasOwn(bundle, 'tap_liability_sweep') ? read(ratePath) : undefined;
+      await verifyTapSweepReport({ bundle, report: read(reportPath), peerRpcUrl, rateLock,
+        confirmed: phase === 'confirmed', proposalBlock: blockPath ? read(blockPath) : undefined });
+    }
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { verifyTapSweepReport } from '../scripts/verify-tap-sweep-report.mjs';
+import { pricingFixture, rootReceiptFixture } from './helpers/tap-pricing.mjs';
+import { buildCanonicalTapSubmission, verifyTapSweepReport } from '../scripts/verify-tap-sweep-report.mjs';
 
 const hash = '1'.repeat(64);
 const provider = '2'.repeat(64);
@@ -34,8 +35,8 @@ function emptyState() {
   const admin = '5'.repeat(64);
   return {
     admin,
-    'epoch/apply/state': { updated_epoch: 8, last_apply_hash: hash, pending_epoch: null, updated_at: 'tx', last_settlement_unix: 900 },
-    'epoch/apply-anchor/8': { type: 'epoch_apply_anchor', epoch: 8, apply_hash: hash, settlement_unix: 900, applied_at: 'tx' },
+    'epoch/apply/state': { updated_epoch: 8, last_apply_hash: hash, pending_epoch: null, updated_at: 'tx', last_settlement_unix: 940 },
+    'epoch/apply-anchor/8': { type: 'epoch_apply_anchor', epoch: 8, apply_hash: hash, settlement_unix: 940, applied_at: 'tx' },
     'params/payout_min_au': { key: 'payout_min_au', current: { ver: 0, effective_at: 0, value: '1' }, pending: null },
     'payments/current': { ver: 1, rails: ['tap'], denom: 'au_usd', set_by: admin, set_by_role: 'admin',
       tnk: { network: 'mainnet' }, tap: { chain_id: 1,
@@ -119,14 +120,14 @@ test('rejects sweep downgrades, invented work, mismatched epoch, timing, locks o
   }
 });
 
-test('absent bundle time uses the retained rate timestamp and retries the same exclusive cursor', async () => {
+test('an absent liability snapshot cannot be replaced by the rate timestamp', async () => {
   const ctx = fixture();
   delete ctx.bundle.at;
   ctx.bundle.tap_liability_sweep.after = next;
   ctx.report.tap_liability_sweep.after = next;
   ctx.report.tap_liability_sweep.at = ctx.report.payout_minimum_lock.at = ctx.rateLock.rate_ts;
   ctx.fetchImpl = stateReader({ after: next });
-  await verifyTapSweepReport(ctx);
+  await assert.rejects(verifyTapSweepReport(ctx), /settlement time/);
 });
 
 test('eligible dust requires the exact below-wei evidence even on a zero-receipt epoch', async () => {
@@ -249,7 +250,7 @@ complete_tap_processed "$processed/$name.settlement.json" "$processed/$name.rece
   assert.equal(fs.readFileSync(reads, 'utf8'), 'page\npage\n');
 });
 
-test('finalized zero-receipt roller report passes both existing payment gates on replay', async () => {
+test('finalized zero-receipt roller report passes both existing payment gates on replay', async t => {
   const { rollTapSettlement } = await import('../scripts/tap-settlement-roller.mjs');
   const { checkTapSpoolReport, checkTapProcessedReport } = await import('./helpers/tap-spool-report.mjs');
   const { stableJson } = await import('../../intercom/scripts/recompute-epoch-roots.mjs');
@@ -262,10 +263,17 @@ test('finalized zero-receipt roller report passes both existing payment gates on
     bundle_sha256: createHash('sha256').update(stableJson(ctx.bundle)).digest('hex'),
     rate_record_key: 'rate/tap/910/' + hash, posted_by: hash, posted_by_role: 'admin', payment_config_ver: 1,
   });
+  // The price was posted after the pinned liabilities. Final confirmation may
+  // arrive much later still. Pricing reads use a separately confirmed checkout.
+  ctx.rateLock.rate_ts = ctx.bundle.at + 3360;
+  const pricing = pricingFixture(ctx.rateLock);
+  const pageFetch = ctx.fetchImpl;
+  ctx.fetchImpl = url => url.searchParams.get('signed_length') === '23' ? pageFetch(url) : pricing.fetchImpl(url);
   const args = { bundle: ctx.bundle, epochApplyHash: hash, tapRateLock: ctx.rateLock,
     tapUsdAu: ctx.rateLock.tap_usd_au, targetedSessionBindings: {}, canonicalLiabilities: [],
     peerRpcUrl: ctx.peerRpcUrl, fetchImpl: ctx.fetchImpl, settleThroughEpoch: 8 };
   const draft = await rollTapSettlement({ ...args, post: false });
+  const chainEvidence = rootReceiptFixture();
   const pool = {
     epoch: async () => 8, cumulativeSpent: async () => BigInt(draft.cumulative_spent_wei),
     merkleRoot: async () => draft.root, pendingRoot: async () => ({}),
@@ -273,13 +281,30 @@ test('finalized zero-receipt roller report passes both existing payment gates on
     maxEpochDelta: async () => 1000n, operatorWithdrawn: async () => 2n, totalBurned: async () => 2n,
     operatorClaimable: async () => 0n, burnClaimable: async () => 0n,
     filters: { RootPosted: true, RootProposed: true }, queryFilter: assert.fail,
-    runner: { provider: { getNetwork: async () => ({ chainId: 1n }), getBlock: async () => ({ number: 30 }) } },
+    runner: { provider: { getTransactionReceipt: chainEvidence.getTransactionReceipt,
+      getNetwork: async () => ({ chainId: 1n }), getBlock: async tag => ({ number: typeof tag === 'number' ? tag : 30,
+      timestamp: ctx.rateLock.rate_ts + (tag === 10 ? 120 : 86400), hash: '0x' + hash }) } },
   };
-  const report = await rollTapSettlement({ ...args, pool, post: true,
+  const rootEventReader = async ({ name, root, cumulativeSpentWei }) => {
+    const blockNumber = name === 'RootPosted' ? 15 : 10;
+    const tx = '0x' + (name === 'RootPosted' ? provider : revision);
+    const blockHash = '0x' + hash;
+    return chainEvidence.event(name, { address: ctx.rateLock.pool_address, args: { epoch: 8, merkleRoot: root,
+      cumulativeSpent: cumulativeSpentWei, nonce: 1n, executeAfter: ctx.rateLock.rate_ts + 200 },
+      blockNumber, blockHash, transactionHash: tx });
+  };
+  const getBlock = pool.runner.provider.getBlock;
+  for (const mutate of [block => ({ ...block, hash: '0x' + revision }), block => ({ ...block, number: 11 }),
+    block => ({ ...block, timestamp: null })]) {
+    pool.runner.provider.getBlock = async tag => tag === 10 ? mutate(await getBlock(tag)) : getBlock(tag);
+    await assert.rejects(rollTapSettlement({ ...args, pool, rootEventReader, post: false }), /receipt and canonical block/);
+  }
+  pool.runner.provider.getBlock = getBlock;
+  pool.runner.provider.getTransactionReceipt = async tx => ({ ...await chainEvidence.getTransactionReceipt(tx), logs: [] });
+  await assert.rejects(rollTapSettlement({ ...args, pool, rootEventReader, post: false }), /absent or ambiguous/);
+  pool.runner.provider.getTransactionReceipt = chainEvidence.getTransactionReceipt;
+  const report = await rollTapSettlement({ ...args, pool, post: true, rootEventReader,
     ownerSigner: { getAddress: async () => target },
-    rootEventReader: async ({ name }) => ({ args: { nonce: 1n, executeAfter: 900n }, blockNumber: name === 'RootPosted' ? 15 : 10,
-      blockHash: '0x' + hash, transactionHash: '0x' + (name === 'RootPosted' ? provider : revision),
-      getTransactionReceipt: async () => ({ status: 1 }) }),
     canonicalPreparationSubmitter: async ({ plan }) => ({
       all_existing: true, preparation_ids: plan.preparation_ids, root_preparation_id: plan.root_preparation_id,
       external_effect_ids: plan.external_effect_ids, records: plan.preparations.map(entry => ({
@@ -290,11 +315,52 @@ test('finalized zero-receipt roller report passes both existing payment gates on
   assert.equal(report.receipt_count, 0);
   assert.equal(report.root_already_posted, true);
   assert.equal(report.canonical_preparation_confirmed, true);
-  await verifyTapSweepReport({ ...ctx, report, confirmed: true });
+  const header = { number: 10, hash: '0x' + hash, timestamp: ctx.rateLock.rate_ts + 120 };
+  await verifyTapSweepReport({ ...ctx, report, confirmed: true, proposalBlock: header });
+  await assert.rejects(verifyTapSweepReport({ ...ctx, report, confirmed: true }), /proposal block/);
+  await assert.rejects(verifyTapSweepReport({ ...ctx, report: { ...report, tap_settlement_checkpoint: null },
+    confirmed: true }), /missing final checkpoint/);
   const spool = checkTapSpoolReport(ctx.bundle, report);
   assert.equal(spool.finalizable, true, spool.error || spool.gateError);
   const result = checkTapProcessedReport(ctx.bundle, spool.bound);
   assert.equal(result.status, 0, result.error);
+  const archive = structuredClone(report);
+  delete archive.tap_settlement_checkpoint.proposal_block_timestamp;
+  const bytes = JSON.stringify(archive);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tap-submission-cli-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const reportPath = path.join(dir, 'report.json'), blockPath = path.join(dir, 'block.json');
+  fs.writeFileSync(reportPath, bytes);
+  fs.writeFileSync(blockPath, JSON.stringify(header));
+  const command = fileURLToPath(new URL('../scripts/verify-tap-sweep-report.mjs', import.meta.url));
+  const derive = () => spawnSync(process.execPath, [command, 'submission', reportPath, blockPath], { encoding: 'utf8' });
+  const cli = derive();
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.deepEqual(JSON.parse(cli.stdout), report.tap_settlement_checkpoint);
+  assert.equal(derive().stdout, cli.stdout);
+  assert.equal(fs.readFileSync(reportPath, 'utf8'), bytes);
+  const recovered = buildCanonicalTapSubmission({ report: archive, proposalBlock: header });
+  assert.deepEqual(recovered, report.tap_settlement_checkpoint);
+  assert.equal(recovered.at, ctx.bundle.at);
+  assert.equal(JSON.stringify(archive), bytes);
+  await verifyTapSweepReport({ ...ctx, report: archive, confirmed: true, proposalBlock: header });
+  await assert.rejects(verifyTapSweepReport({ ...ctx, report: archive, confirmed: true }), /proposal block/);
+  for (const proposalBlock of [null, { ...header, number: 11 }, { ...header, hash: '0x' + revision },
+    { ...header, timestamp: null }, { ...header, timestamp: ctx.rateLock.rate_ts - 1 }]) {
+    assert.throws(() => buildCanonicalTapSubmission({ report: archive, proposalBlock }), /proposal block/);
+  }
+  assert.throws(() => buildCanonicalTapSubmission({ report, proposalBlock: { ...header, timestamp: header.timestamp + 1 } }),
+    /conflicts with header/);
+  await assert.rejects(verifyTapSweepReport({ ...ctx, report: archive, confirmed: true,
+    proposalBlock: { ...header, timestamp: ctx.rateLock.rate_ts + 2701 } }), /stale/);
+  pricing.state.get('payments/current').ver++;
+  await assert.rejects(verifyTapSweepReport({ ...ctx, report: archive, confirmed: true,
+    proposalBlock: header }), /payment scope mismatch/);
+  pricing.state.set('settle/targeted/tap/8', { ...recovered, type: 'targeted_tap_settlement',
+    settled_by: ctx.rateLock.posted_by, settled_by_role: 'admin' });
+  await verifyTapSweepReport({ ...ctx, report: archive, confirmed: true, proposalBlock: header });
+  await assert.rejects(verifyTapSweepReport({ ...ctx, report: archive, confirmed: true,
+    proposalBlock: { ...header, timestamp: header.timestamp + 1 } }), /conflicts with the canonical checkpoint/);
   report.preparation_ids = [];
   await assert.rejects(verifyTapSweepReport({ ...ctx, report, confirmed: true }), /preparation_ids/);
 });
