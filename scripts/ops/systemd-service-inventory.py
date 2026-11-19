@@ -7,6 +7,7 @@ No secrets, environment variables or command lines are collected.
 """
 import argparse
 import datetime
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -119,11 +120,52 @@ def problems(units, expected):
     return failures
 
 
+
+PAYOUT_WORKER = "mayhem-payout-worker.service"
+PAYOUT_TIMER = "mayhem-payout-worker.timer"
+PAYOUT_BEFORE_FAILURE = f"{PAYOUT_WORKER}: oneshot unhealthy (failed, exit-code)"
+
+
+def local_machine_sha256():
+    return hashlib.sha256(Path("/etc/machine-id").read_bytes()).hexdigest()
+
+
+def validate_before_approval(baseline, snapshot_sha256, evidence, machine_sha256):
+    """Accept one owner-approved, failed writer BEFORE as input to a strict AFTER."""
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "approval", "role", "scope", "unit", "failure", "baseline_sha256", "machine_sha256",
+    }:
+        raise ValueError("Invalid BEFORE approval evidence")
+    if (not isinstance(evidence["approval"], str) or not evidence["approval"].strip()
+            or len(evidence["approval"]) > 256
+            or evidence["role"] != "writer" or evidence["scope"] != "system"
+            or evidence["unit"] != PAYOUT_WORKER or evidence["failure"] != PAYOUT_BEFORE_FAILURE
+            or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
+            or not re.fullmatch(r"[a-f0-9]{64}", machine_sha256)
+            or evidence["baseline_sha256"] != snapshot_sha256 or evidence["machine_sha256"] != machine_sha256):
+        raise ValueError("BEFORE approval does not match the writer, manager, unit and snapshot")
+    expected, units = baseline["expected"], baseline["units"]
+    worker, timer = units.get(PAYOUT_WORKER, {}), units.get(PAYOUT_TIMER, {})
+    if (baseline.get("schema_version") != 1 or baseline.get("scope") != "system"
+            or baseline.get("failures") != [PAYOUT_BEFORE_FAILURE]
+            or problems(units, expected) != [PAYOUT_BEFORE_FAILURE]
+            or expected.get(PAYOUT_WORKER) != "healthy" or expected.get(PAYOUT_TIMER) != "active"
+            or any(worker.get(k) != v for k, v in {"Id": PAYOUT_WORKER, "LoadState": "loaded", "Type": "oneshot",
+                   "ActiveState": "failed", "SubState": "failed", "Result": "exit-code"}.items())
+            or PAYOUT_TIMER not in worker.get("TriggeredBy", "").split()
+            or timer.get("Id") != PAYOUT_TIMER or timer.get("UnitFileState") not in ENABLED
+            or timer.get("LoadState") != "loaded" or timer.get("ActiveState") != "active"):
+        raise ValueError("BEFORE does not show the sole approved, timer-driven writer oneshot failure")
+
+
+
 def main():
     global USER_MANAGER
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--user", action="store_true", help="Inspect the current user's service manager instead of the system manager")
     parser.add_argument("--baseline", type=Path, help="Previously captured inventory; preserve its required/paused set")
+    parser.add_argument("--approved-before-oneshot-evidence", type=Path,
+                        help="Bind the original failed writer BEFORE to the owner-approved machine, snapshot and oneshot")
     parser.add_argument("--output", type=Path, help="Create a private inventory; refuses to overwrite an existing file")
     parser.add_argument("--required-unit", action="append", default=[])
     parser.add_argument("--paused-unit", action="append", default=[], help="Explicitly paused, disabled unit; checked inactive")
@@ -135,10 +177,18 @@ def main():
             parser.error("Invalid OpenMayhem service/timer name")
     if set(args.required_unit) & set(args.paused_unit):
         parser.error("A unit cannot be both required and paused")
+    approved = None
+    if args.approved_before_oneshot_evidence and (not args.baseline or args.user):
+        parser.error("Approved BEFORE evidence requires a system-manager --baseline")
     old = {}
     if args.baseline:
-        baseline = json.loads(args.baseline.read_text())
-        if baseline.get("schema_version") != 1 or baseline.get("failures"):
+        original = args.baseline.read_bytes()
+        baseline = json.loads(original)
+        if args.approved_before_oneshot_evidence:
+            approved = json.loads(args.approved_before_oneshot_evidence.read_bytes())
+            validate_before_approval(baseline, hashlib.sha256(original).hexdigest(), approved,
+                                     local_machine_sha256())
+        elif baseline.get("schema_version") != 1 or baseline.get("failures") != []:
             parser.error("Baseline must be a successful version-1 acceptance snapshot")
         if baseline.get("scope") != scope:
             parser.error("Baseline must belong to the same system/user manager scope")
@@ -158,6 +208,13 @@ def main():
     failures = problems(units, expected)
     result = {"schema_version": 1, "scope": scope, "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "units": units, "expected": expected, "failures": failures}
+    if approved is not None:
+        # The original failed observation remains visible. No entry is removed from AFTER failures.
+        result["approved_before_oneshot"] = approved
+        worker = units.get(PAYOUT_WORKER, {})
+        if (worker.get("Type") != "oneshot" or worker.get("Result") != "success"
+                or PAYOUT_TIMER not in worker.get("TriggeredBy", "").split()):
+            failures.append(f"{PAYOUT_WORKER}: restored oneshot lacks its timer relationship or successful result")
     encoded = json.dumps(result, sort_keys=True, indent=2) + "\n"
     if args.output:
         import os

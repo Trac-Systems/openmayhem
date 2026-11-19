@@ -30,6 +30,14 @@ The gate deliberately refuses masked/unloaded units rather than assuming their
 configuration can be inspected. Resolve or explicitly inventory those holds
 before capturing acceptance; never turn a failed gate into a healthy baseline.
 
+For the owner-approved writer payout incident, keep the original unsuccessful
+BEFORE intact. On the writer system manager only, supply its explicit approval
+file with `--baseline BEFORE.json --approved-before-oneshot-evidence APPROVAL.json`.
+The approval records the writer machine-ID SHA-256, the exact BEFORE file
+SHA-256, the payout unit and its failed exit-code result. The flag accepts
+only that sole timer-driven oneshot BEFORE failure. AFTER retains every original
+expectation, includes the approval for audit and must report zero failures.
+
 The TAP deposit watcher is wanted by `mayhem-stack.service` when enabled. This
 restores it on stack startup after its existing `Requires=` relationship stopped
 it. After installing its unit, run `systemctl daemon-reload` and

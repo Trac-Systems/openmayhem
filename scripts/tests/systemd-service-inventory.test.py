@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Exercise acceptance using a fake systemctl, with no live-service mutations."""
+import contextlib
+import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ops/systemd-service-inventory.py"
 STACK = "mayhem-stack.service"
@@ -124,6 +129,63 @@ else:
         self.assertEqual(r.returncode, 1)
         r, _ = self.run_gate({TAP: unit(TAP)}, "--baseline", self.baseline)
         self.assertEqual(r.returncode, 2)
+
+    def test_approved_writer_oneshot_preserves_original_before_and_all_after_checks(self):
+        spec = importlib.util.spec_from_file_location("service_inventory", SCRIPT)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        machine = "1" * 64
+        units = {TIMER: unit(TIMER, kind=""), TAP: unit(TAP),
+                 ONESHOT: unit(ONESHOT, "failed", "static", "oneshot",
+                              TriggeredBy=TIMER, Result="exit-code", SubState="failed")}
+        r, before = self.run_gate(units, "--output", self.baseline)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        raw = self.baseline.read_bytes()
+        approval = {"approval": "Owner-approved writer BEFORE", "role": "writer", "scope": "system",
+                    "unit": ONESHOT, "failure": before["failures"][0],
+                    "baseline_sha256": hashlib.sha256(raw).hexdigest(), "machine_sha256": machine}
+        proof = self.root / "approval.json"
+
+        def after(evidence, manager=(), fingerprint=machine):
+            proof.write_text(json.dumps(evidence))
+            self.fixture.write_text(json.dumps(units))
+            argv = [str(SCRIPT), "--baseline", str(self.baseline), "--approved-before-oneshot-evidence", str(proof), *manager]
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self.env), mock.patch("sys.argv", argv), \
+                    mock.patch.object(gate, "local_machine_sha256", return_value=fingerprint), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                code = gate.main()
+            return code, json.loads(output.getvalue())
+
+        code, unhealthy = after(approval)
+        self.assertEqual(code, 1)
+        self.assertIn(before["failures"][0], unhealthy["failures"])
+        units[ONESHOT].update(ActiveState="inactive", SubState="dead", Result="success")
+        code, healthy = after(approval)
+        self.assertEqual(code, 0)
+        self.assertEqual(healthy["approved_before_oneshot"], approval)
+        self.assertEqual(healthy["expected"], before["expected"])
+        self.assertEqual(healthy["failures"], [])
+        self.assertEqual(self.baseline.read_bytes(), raw)
+        units[TAP]["ActiveState"] = "inactive"
+        self.assertNotEqual(after(approval)[0], 0)
+        units[TAP]["ActiveState"] = "active"
+        units[ONESHOT]["Result"] = "exit-code"
+        self.assertNotEqual(after(approval)[0], 0)
+        for modified in [dict(approval, baseline_sha256="0" * 64), dict(approval, role="helper"),
+                         dict(approval, unit=TAP), dict(approval, failure="unrelated failure")]:
+            with self.assertRaises(ValueError):
+                after(modified)
+        with self.assertRaises(ValueError):
+            after(approval, fingerprint="2" * 64)
+        with self.assertRaises(SystemExit):
+            after(approval, manager=("--user",))
+        # Even an approval bound to the bytes cannot hide a second actual BEFORE failure.
+        before["units"][TAP]["ActiveState"] = "inactive"
+        altered = json.dumps(before).encode()
+        self.baseline.write_bytes(altered)
+        with self.assertRaises(ValueError):
+            after(dict(approval, baseline_sha256=hashlib.sha256(altered).hexdigest()))
 
     def test_pause_checks_transitive_dependencies_outside_mayhem_names(self):
         helper = "custom-worker-group.target"
