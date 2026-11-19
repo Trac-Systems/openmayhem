@@ -44,6 +44,7 @@ RELEASE_ASSET_SOURCE_ALLOWLIST=(
   contracts/package-lock.json
   contracts/scripts
   contracts/src
+  scripts/validate-tap-settlement-checkpoint.mjs
   crates/mayhem-cli/src/msb-transfer-helper.mjs
 )
 
