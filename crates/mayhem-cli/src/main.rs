@@ -37573,6 +37573,62 @@ fn admin_fiat_dust_sweep_payload(args: &AdminFiatDustSweepArgs) -> Result<Value>
     }))
 }
 
+// Later revisions of the same provider spend the aggregate left by this one.
+// The immutable plan orders them contiguously, ahead of the operator fee.
+fn next_fiat_output_after_funding_wait(outputs: &[Value], index: usize) -> Result<usize> {
+    let provider = outputs[index]["provider"]
+        .as_str()
+        .context("fiat funding wait requires a provider output")?;
+    let dependent = outputs[index + 1..]
+        .iter()
+        .take_while(|output| output["provider"].as_str() == Some(provider))
+        .count();
+    Ok(index + 1 + dependent)
+}
+
+fn check_fiat_output_aggregate(
+    output: &Value,
+    earning_paid: MoneyAu,
+    tail: Option<&Value>,
+) -> Result<()> {
+    let before = value_money_au(&output["aggregate_paid_cum_au_before"])
+        .context("invalid planned fiat aggregate watermark")?;
+    if let Some(tail) = tail {
+        let after = value_money_au(&tail["paid_cum_au_after"])
+            .context("invalid fiat preparation tail watermark")?;
+        let owner = tail["economic_op_id"]
+            .as_str()
+            .filter(|id| is_hex_len(id, 64))
+            .context("invalid fiat preparation tail operation")?;
+        if tail["consumed"]
+            .as_bool()
+            .context("invalid fiat preparation tail status")?
+        {
+            ensure!(
+                after == earning_paid,
+                "consumed fiat preparation {owner} ends at {after} AU but earnings show {earning_paid} AU"
+            );
+        } else {
+            // Per-output settlement must consume its own preparation tail.
+            ensure!(
+                Some(owner) == output["economic_op_id"].as_str(),
+                "open fiat preparation {owner} reserves through {after} AU; earnings show {earning_paid} AU and this output starts at {before} AU"
+            );
+            let paid = value_money_au(&output["paid_au"]).context("invalid planned fiat paid AU")?;
+            ensure!(
+                value_money_au(&tail["paid_cum_au_before"]) == Some(before)
+                    && before.checked_add(paid) == Some(after),
+                "open fiat preparation {owner} disagrees with its immutable output"
+            );
+        }
+    }
+    ensure!(
+        earning_paid == before,
+        "immutable fiat output starts at {before} aggregate AU but confirmed earnings show {earning_paid} AU"
+    );
+    Ok(())
+}
+
 async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
@@ -37742,7 +37798,10 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .and_then(Value::as_array)
             .cloned()
             .context("canonical fiat plan is missing outputs")?;
-        for (index, output) in outputs.iter().enumerate() {
+        let mut next_index = 0;
+        while let Some(output) = outputs.get(next_index) {
+            let index = next_index;
+            next_index += 1;
             let economic_op_id = output
                 .get("economic_op_id")
                 .and_then(Value::as_str)
@@ -37762,25 +37821,37 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 continue;
             }
             let output_result: Result<()> = async {
-                // Do not freeze a short-lived quote/attempt while funds are pending.
-                // Existing attempts must instead reconcile external effects first.
-                if output.get("role").and_then(Value::as_str) == Some("provider")
-                    && read_confirmed_state_value(
+                if output["role"] == "provider" {
+                    let provider = output["provider"].as_str().context("missing fiat provider")?;
+                    let length = confirmed_snapshot_signed_length(&rpc, "earn/fiat/").await?;
+                    let tail_key = format!("payout/preparation-tail/fiat/{provider}");
+                    let (earning_paid, tail) = tokio::try_join!(
+                        aggregate_provider_paid_cum_au(&rpc, provider, "fiat", length),
+                        read_state_value_at(&rpc, &tail_key, length)
+                    )?;
+                    check_fiat_output_aggregate(output, earning_paid, tail.as_ref())
+                        .with_context(|| format!(
+                            "checking fiat output {} ({economic_op_id}) for provider {provider} at signed length {length}",
+                            index + 1
+                        ))?;
+                    // Existing attempts reconcile any external effect before checking funds.
+                    if read_confirmed_state_value(
                         &rpc,
                         &format!("payout/attempt/fiat/{economic_op_id}/latest"),
                     )
                     .await?
                     .is_none()
-                {
-                    require_fiat_output_funding(
-                        client,
-                        api_base_url,
-                        secret_key,
-                        output,
-                        args.stripe_transfer_max_attempts,
-                        args.stripe_transfer_retry_ms,
-                    )
-                    .await?;
+                    {
+                        require_fiat_output_funding(
+                            client,
+                            api_base_url,
+                            secret_key,
+                            output,
+                            args.stripe_transfer_max_attempts,
+                            args.stripe_transfer_retry_ms,
+                        )
+                        .await?;
+                    }
                 }
                 let liability = targeted_payout_output_liability("fiat", &plan.payload, output)?;
                 let kind = if liability.is_some() {
@@ -37979,6 +38050,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .await;
             if let Err(error) = output_result {
                 if let Some(wait) = error.downcast_ref::<FiatFundingWait>() {
+                    next_index = next_fiat_output_after_funding_wait(&outputs, index)?;
                     pending_outputs.push(json!({
                         "economic_op_id": economic_op_id,
                         "output_index": index,
@@ -56302,9 +56374,13 @@ async fn stripe_find_existing_transfer(
         for attempt in 1..=max_attempts {
             let mut query = vec![
                 ("transfer_group".to_owned(), transfer_group.to_owned()),
-                ("destination".to_owned(), output.to.clone()),
                 ("limit".to_owned(), "100".to_owned()),
             ];
+            // A pre-revision transfer may have used a former destination for
+            // this provider. Search the whole group before a targeted effect.
+            if expected_attempt_id.is_none() {
+                query.push(("destination".to_owned(), output.to.clone()));
+            }
             if let Some(cursor) = starting_after.as_ref() {
                 query.push(("starting_after".to_owned(), cursor.clone()));
             }
@@ -56350,7 +56426,7 @@ async fn stripe_find_existing_transfer(
             .and_then(Value::as_array)
             .context("Stripe transfer reconciliation missing data")?;
         for candidate in transfers {
-            if stripe_transfer_metadata_has_liability_identity(
+            if stripe_transfer_metadata_matches_liability(
                 candidate,
                 provider,
                 payout_revision,
@@ -56361,7 +56437,7 @@ async fn stripe_find_existing_transfer(
                 output_index,
                 epoch_apply_hash,
                 expected_attempt_id,
-            ) {
+            )? {
                 ensure!(
                     found.is_none(),
                     "Stripe has duplicate transfers for one Mayhem settlement output"
@@ -56369,7 +56445,10 @@ async fn stripe_find_existing_transfer(
                 found = Some(stripe_transfer_result(candidate, 0)?);
             }
         }
-        if value.get("has_more").and_then(Value::as_bool) != Some(true) {
+        if !value["has_more"]
+            .as_bool()
+            .context("Stripe transfer reconciliation missing pagination status")?
+        {
             return Ok(found);
         }
         let next = transfers
@@ -56389,7 +56468,7 @@ async fn stripe_find_existing_transfer(
     unreachable!("bounded Stripe pagination returns or fails")
 }
 
-fn stripe_transfer_metadata_has_liability_identity(
+fn stripe_transfer_metadata_matches_liability(
     value: &Value,
     provider: &str,
     payout_revision: &str,
@@ -56400,12 +56479,12 @@ fn stripe_transfer_metadata_has_liability_identity(
     output_index: usize,
     epoch_apply_hash: &str,
     expected_attempt_id: Option<&str>,
-) -> bool {
+) -> Result<bool> {
     let liability_au = liability_au.to_string();
     let paid_cum_au_before = paid_cum_au_before.to_string();
     let epoch = epoch.to_string();
     let output_index = output_index.to_string();
-    value
+    let exact = value
         .pointer("/metadata/mayhem_schema")
         .and_then(Value::as_str)
         == Some("fiat_fx_v1")
@@ -56446,7 +56525,30 @@ fn stripe_transfer_metadata_has_liability_identity(
                 .pointer("/metadata/mayhem_attempt_id")
                 .and_then(Value::as_str)
                 == Some(attempt_id)
-        })
+        });
+    if exact {
+        return Ok(true);
+    }
+    if let Some(attempt_id) = expected_attempt_id {
+        // Older runners could transfer before recording the batch. They may
+        // have neither a revision nor an attempt ID at their original index.
+        let metadata = &value["metadata"];
+        let distinct = |field: &str, expected: &str| {
+            metadata[field]
+                .as_str()
+                .is_some_and(|id| is_hex_len(id, 64) && !id.eq_ignore_ascii_case(expected))
+        };
+        ensure!(
+            metadata["mayhem_operation_hash"].as_str() != Some(operation_hash)
+                && metadata["mayhem_attempt_id"].as_str() != Some(attempt_id)
+                && (distinct("mayhem_provider", provider)
+                    || (metadata["mayhem_provider"].as_str() == Some(provider)
+                        && distinct("mayhem_payout_revision", payout_revision))),
+            "Stripe transfer {} in the epoch group may already pay provider {provider} revision {payout_revision} and does not match canonical attempt {attempt_id}; reconcile the original transfer before retrying",
+            value["id"].as_str().filter(|id| id.starts_with("tr_") && is_safe_key_part(id)).unwrap_or("(invalid ID)")
+        );
+    }
+    Ok(false)
 }
 
 fn stripe_transfer_has_identity(
@@ -107808,7 +107910,7 @@ status: linked
             json!({
                 "object": "list",
                 "has_more": true,
-                "data": [{"id": "tr_page_cursor"}]
+                "data": [{"id": "tr_page_cursor", "metadata": {"mayhem_provider": "11".repeat(32)}}]
             })
             .to_string(),
             json!({
@@ -107893,6 +107995,7 @@ status: linked
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /v1/transfers?"));
+        assert!(!requests[0].contains("destination="));
         assert!(requests[1].contains("starting_after=tr_page_cursor"));
     }
 

@@ -176,6 +176,94 @@ fn attempt_fixture() -> (Value, Value, Value, Value, Value) {
     (output, record, transfer, payment, transaction)
 }
 
+#[test]
+fn fiat_funding_wait_preserves_provider_watermark_order_and_original_indices() {
+    let outputs = vec![
+        json!({"provider":"A","aggregate_paid_cum_au_before":"0","paid_au":"27"}),
+        json!({"provider":"A","aggregate_paid_cum_au_before":"27","paid_au":"5"}),
+        json!({"provider":"B","aggregate_paid_cum_au_before":"300","paid_au":"10"}),
+        json!({"role":"operator_fee"}),
+    ];
+    assert_eq!(next_fiat_output_after_funding_wait(&outputs, 0).unwrap(), 2);
+    assert_eq!(next_fiat_output_after_funding_wait(&outputs, 1).unwrap(), 2);
+    assert_eq!(next_fiat_output_after_funding_wait(&outputs, 2).unwrap(), 3);
+    assert!(check_fiat_output_aggregate(&outputs[1], 0, None).is_err());
+    assert!(check_fiat_output_aggregate(&outputs[1], 27, None).is_ok());
+    assert!(check_fiat_output_aggregate(&outputs[2], 300, None).is_ok());
+}
+
+#[test]
+fn fiat_aggregate_preflight_resumes_only_the_exact_open_tail() {
+    let op = "a".repeat(64);
+    let output = json!({"economic_op_id":op,"aggregate_paid_cum_au_before":"11","paid_au":"3"});
+    let own = json!({"economic_op_id":op,"consumed":false,
+        "paid_cum_au_before":"11","paid_cum_au_after":"14"});
+    assert!(check_fiat_output_aggregate(&output, 11, Some(&own)).is_ok());
+    assert!(check_fiat_output_aggregate(&output, 14, Some(&own)).is_err());
+    for (field, changed) in [
+        ("economic_op_id", json!("b".repeat(64))),
+        ("consumed", json!("false")),
+        ("paid_cum_au_before", json!("10")),
+        ("paid_cum_au_after", json!("13")),
+    ] {
+        let mut different = own.clone();
+        different[field] = changed;
+        assert!(
+            check_fiat_output_aggregate(&output, 11, Some(&different)).is_err(),
+            "{field}"
+        );
+    }
+    let mut prior = json!({"economic_op_id":"b".repeat(64),"consumed":false,
+        "paid_cum_au_before":"8","paid_cum_au_after":"11"});
+    assert!(check_fiat_output_aggregate(&output, 8, Some(&prior)).is_err());
+    prior["consumed"] = json!(true);
+    assert!(check_fiat_output_aggregate(&output, 11, Some(&prior)).is_ok());
+    assert!(check_fiat_output_aggregate(&output, 10, Some(&prior)).is_err());
+}
+
+#[test]
+fn fiat_transfer_recovery_blocks_ambiguous_pre_targeted_effects() {
+    let (_, _, transfer, _, _) = attempt_fixture();
+    let classify = |candidate: &Value| {
+        stripe_transfer_metadata_matches_liability(
+            candidate,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            0,
+            AU_PER_USD,
+            7,
+            0,
+            &"e".repeat(64),
+            Some(&"d".repeat(64)),
+        )
+    };
+    assert!(classify(&transfer).unwrap());
+    let mut legacy = transfer.clone();
+    let metadata = legacy["metadata"].as_object_mut().unwrap();
+    for key in [
+        "mayhem_operation_hash",
+        "mayhem_attempt_id",
+        "mayhem_paid_cum_au_before",
+    ] {
+        metadata.remove(key);
+    }
+    legacy["metadata"]["mayhem_output_index"] = json!("4");
+    assert!(classify(&legacy).is_err());
+    legacy["metadata"]["mayhem_payout_revision"] = json!("f".repeat(64));
+    assert!(!classify(&legacy).unwrap());
+    legacy["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mayhem_payout_revision");
+    assert!(classify(&legacy).is_err());
+    legacy["metadata"]["mayhem_provider"] = json!("f".repeat(64));
+    assert!(!classify(&legacy).unwrap());
+    let mut other_attempt = transfer;
+    other_attempt["metadata"]["mayhem_attempt_id"] = json!("f".repeat(64));
+    assert!(classify(&other_attempt).is_err());
+}
+
 #[tokio::test]
 async fn funding_then_restart_pays_once_and_recovers_without_balance() {
     let (output, record, transfer, payment, transaction) = attempt_fixture();
