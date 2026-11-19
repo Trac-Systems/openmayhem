@@ -18,13 +18,15 @@ import ContractV26 from './history/v26.js';
 import ContractV27 from './history/v27.js';
 import ContractV28 from './history/v28.js';
 import ContractV29 from './history/v29.js';
+import ContractV30 from './v30.js';
+import { applyFiatRecovery, fiat508FeeHeld, fiatFenceKey } from './fiat-recovery.js';
 import { ProxyValidationError, isProxyPublication } from './proxy-protocol.js';
 import { proxyRuntimeContext, proxyAppliedEpoch } from './proxy-context.js';
 import { prepareProxyPublication, proxyPublicationFeatureKey } from './proxy-publication.js';
 import { normalizeProxySpendSessionRecord, validateProxyCanonicalReceiptHead } from './proxy-reservations.js';
 import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
 
-export const CONTRACT_VERSION = 30;
+export const CONTRACT_VERSION = 31;
 // Only authenticated canonical replay can select these exact prior reducers.
 const HISTORICAL_CONTRACTS = new Map([
   [17, ContractV17],
@@ -40,11 +42,12 @@ const HISTORICAL_CONTRACTS = new Map([
   [27, ContractV27],
   [28, ContractV28],
   [29, ContractV29],
+  [30, ContractV30],
 ]);
-// Recovery is limited to receipt evidence already signed by v23-v29
+// Recovery is limited to receipt evidence already signed by v23-v30
 // participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28, 29]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28, 29, 30]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -1802,6 +1805,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'recover_fiat_preparation') {
+      const result = await applyFiatRecovery(this, key, value, CONTRACT_VERSION);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     if (value.op === 'prepare_targeted_payout') {
       const result = await this.applyTargetedPayoutPreparationFeature(key, value);
       this._mayhemLastFeatureResult = result;
@@ -3379,7 +3387,7 @@ class MayhemContract extends Contract {
       'record usage receipt envelope'
     );
     if (receiptShapeError) return receiptShapeError;
-    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28, 29].includes(value.contract_version)
+    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28, 29, 30].includes(value.contract_version)
       ? SESSION_RECEIPT_SCHEMA_VERSION
       : 11;
     const receipt = await this.normalizeReceiptEnvelope(value.receipt, {
@@ -5536,7 +5544,7 @@ class MayhemContract extends Contract {
     return `payout/preparation-effect/${rail}/${effectId}`;
   }
 
-  async validatePayoutPreparationLiability(value) {
+  async validatePayoutPreparationLiability(value, replaces = null) {
     const liability = value.liability;
     const binding = await this.get(
       this.providerPayoutBindingFeatureKey(
@@ -5622,7 +5630,9 @@ class MayhemContract extends Contract {
         tail.paid_cum_au_after !== earning.paid_cum_au) {
       return new Error('Consumed payout preparation tail does not match aggregate earnings.');
     }
-    const expectedAggregateBefore = tail?.consumed === false
+    if (replaces !== null && (value.rail !== 'fiat' || tail?.consumed !== false ||
+        tail.economic_op_id !== replaces)) return new Error('FIAT recovery tail changed.');
+    const expectedAggregateBefore = tail?.consumed === false && replaces === null
       ? tail.paid_cum_au_after
       : earning.paid_cum_au;
     if (liability.aggregate_paid_cum_au_before !== expectedAggregateBefore) {
@@ -5640,7 +5650,7 @@ class MayhemContract extends Contract {
     };
   }
 
-  async applyTargetedPayoutPreparationFeature(key, value) {
+  async applyTargetedPayoutPreparationFeature(key, value, replaces = null) {
     const normalized = await this.normalizeTargetedPayoutPreparationValue(value);
     if (normalized instanceof Error) return normalized;
     const expectedKey = await this.targetedPayoutPreparationFeatureKey(normalized);
@@ -5660,6 +5670,8 @@ class MayhemContract extends Contract {
         ) !== true) {
       return new Error('Invalid targeted payout preparation admin signature.');
     }
+    if (normalized.rail === 'fiat' && normalized.epoch === 508 && normalized.kind === 'fee' &&
+        await fiat508FeeHeld(this, normalized.economic_op_id)) return new Error('FIAT recovery holds the 508 fee.');
     const applyAnchor = await this.requireEpochApplyAnchor(
       normalized.epoch,
       normalized.epoch_apply_hash,
@@ -5729,13 +5741,14 @@ class MayhemContract extends Contract {
     }
     let liabilityState = null;
     if (normalized.liability !== null) {
-      liabilityState = await this.validatePayoutPreparationLiability(normalized);
+      liabilityState = await this.validatePayoutPreparationLiability(normalized, replaces);
       if (liabilityState instanceof Error) return liabilityState;
       const lockKey = this.payoutPreparationLiabilityLockKey(
         normalized.rail,
         normalized.liability
       );
-      if ((await this.get(lockKey)) !== null) {
+      const lock = await this.get(lockKey);
+      if (replaces === null ? lock !== null : lock?.economic_op_id !== replaces) {
         return new Error('Targeted payout liability watermark already has a preparation.');
       }
     }
@@ -6672,6 +6685,11 @@ class MayhemContract extends Contract {
         stableJson(preparation.payload?.output) !== stableJson(output)) {
       return new Error('Targeted fiat attempt requires its unconsumed economic preparation.');
     }
+    if (normalized.epoch === 508 && await this.get(fiatFenceKey(normalized.economic_op_id))) {
+      return new Error('FIAT recovery fenced this preparation.');
+    }
+    if (normalized.epoch === 508 && output.role === 'operator_fee' &&
+        await fiat508FeeHeld(this, normalized.economic_op_id, plan)) return new Error('FIAT recovery holds the 508 fee.');
     const expectedKind = output.role === 'provider'
       ? 'stripe_transfer'
       : 'platform_balance';
@@ -6862,7 +6880,7 @@ class MayhemContract extends Contract {
       : new Error('Targeted fiat attempt finalization must be canonical.');
   }
 
-  async applyFinalizeTargetedFiatAttemptFeature(key, value) {
+  async applyFinalizeTargetedFiatAttemptFeature(key, value, verifiedRecovery = false) {
     const normalized = this.normalizeFinalizeTargetedFiatAttemptValue(value);
     if (normalized instanceof Error) return normalized;
     const expectedKey = await this.finalizeTargetedFiatAttemptFeatureKey(normalized);
@@ -6875,6 +6893,10 @@ class MayhemContract extends Contract {
       'Targeted fiat attempt finalization'
     );
     if (adminError) return adminError;
+    if (!verifiedRecovery && normalized.epoch === 508 &&
+        await this.get(fiatFenceKey(normalized.economic_op_id))) {
+      return new Error('FIAT recovery fenced this attempt.');
+    }
     const recordKey = this.targetedFiatAttemptRecordKey(
       normalized.economic_op_id,
       normalized.attempt_id
@@ -6885,7 +6907,9 @@ class MayhemContract extends Contract {
         record.preparation.epoch !== normalized.epoch) {
       return new Error('Targeted fiat attempt preparation not found.');
     }
-    if (record.status !== 'prepared') {
+    if (normalized.epoch === 508 && record.preparation.request.kind === 'platform_balance' &&
+        await fiat508FeeHeld(this, normalized.economic_op_id)) return new Error('FIAT recovery holds the 508 fee.');
+    if (record.status !== 'prepared' && !(verifiedRecovery && record.status === 'recovery_fenced')) {
       if (record.status === normalized.status &&
           stableJson(record.result) === stableJson(normalized)) {
         return {
@@ -7301,12 +7325,15 @@ class MayhemContract extends Contract {
     }
     const planned = await this.targetedPayoutPlannedOutput(normalized, 'fiat');
     if (planned instanceof Error) return planned;
+    if (normalized.epoch === 508 && planned.output.role === 'operator_fee' &&
+        await fiat508FeeHeld(this, normalized.economic_op_id, planned.plan)) return new Error('FIAT recovery holds the 508 fee.');
     const preparation = await this.targetedPayoutPreparationForOutput(
       normalized,
       planned.output,
       'fiat'
     );
     if (preparation instanceof Error) return preparation;
+    if (preparation.superseded_by !== undefined) return new Error('FIAT preparation was superseded.');
     const attemptKey = this.targetedFiatAttemptRecordKey(
       normalized.economic_op_id,
       normalized.attempt_id

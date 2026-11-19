@@ -54,6 +54,7 @@ export const mayhemFeatureParticipant = (value) => {
   if ([
     'prepare_targeted_payout',
     'prepare_targeted_payout_epoch',
+    'recover_fiat_preparation',
     'prepare_targeted_fiat_attempt',
     'finalize_targeted_fiat_attempt',
     'settle_targeted_tnk_output',
@@ -433,6 +434,7 @@ class MayhemProtocol extends Protocol {
       json?.op === 'spend_reserve_targeted' ||
       json?.op === 'prepare_targeted_payout' ||
       json?.op === 'prepare_targeted_payout_epoch' ||
+      json?.op === 'recover_fiat_preparation' ||
       json?.op === 'prepare_targeted_fiat_attempt' ||
       json?.op === 'finalize_targeted_fiat_attempt' ||
       json?.op === 'settle_targeted_tap' ||

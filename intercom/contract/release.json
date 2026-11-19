@@ -1,12 +1,16 @@
 {
   "schema": 1,
-  "release_version": "0.2.308",
-  "contract_version": 30,
-  "contract_code_sha256": "30ece4a2cb7fcd5a2bec359a4d3b1a15216ebc9241645d4f78fd4cf35443596a",
+  "release_version": "0.2.313",
+  "contract_version": 31,
+  "contract_code_sha256": "2f6ad6d678d3fd00458cfee7c16bbb1d29dc641e59d1c5d24de1df5e41409909",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "bd499c64b5d9ce0d8faf9712c7c1b867439b30eeb244393b1096a283877885a3"
+      "sha256": "7fea991998f3e21d4018fdb4de3200d1367b94635851175ef8a16efd15e3a3f0"
+    },
+    {
+      "path": "contract/fiat-recovery.js",
+      "sha256": "ef4a3edc541ef660e80deff7198f70d2ac921ee76fb872eb5125edb6c86fe53a"
     },
     {
       "path": "contract/history/v17.js",
@@ -62,7 +66,7 @@
     },
     {
       "path": "contract/protocol.js",
-      "sha256": "2cb27f01fdd1a7345f7d7923410710d757ee6e566bcf70c3491be2777cb2885a"
+      "sha256": "5bdb5fb70a67ee7e711b5383f6d2a8b2c6fd49e8b61edc8004ff1a7dc1743504"
     },
     {
       "path": "contract/proxy-closure.js",
@@ -109,8 +113,12 @@
       "sha256": "3bbb52be30d4d8352026753ef91b0a1c291f4e997cbb6824afd9c12e6a94a78f"
     },
     {
+      "path": "contract/v30.js",
+      "sha256": "bd499c64b5d9ce0d8faf9712c7c1b867439b30eeb244393b1096a283877885a3"
+    },
+    {
       "path": "features/mayhem/index.js",
-      "sha256": "570434556c21f6b78818f4371bbcb1ea91368988fc2a6d7157aabd858ad9dbff"
+      "sha256": "2e1902c8b371c3cb3cbc380dfd587ee628bc6fc82c4cd0628e1cef9a970203af"
     },
     {
       "path": "features/mayhem/proxy-admission.js",

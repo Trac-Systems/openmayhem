@@ -15,6 +15,7 @@ import { FeatureOperation, FeatureCheck } from 'trac-peer/src/operations/feature
 import { canonicalReplayContext, consumeCanonicalReplayContext, canonicalReplayView } from 'trac-peer/src/base/canonical-replay.js';
 import {adminWriterDiagnostics,appliedViewProof} from '../src/rpc.js';
 import MayhemContract from '../contract/contract.js';
+import Contract30 from '../contract/v30.js';
 import Contract17 from '../contract/history/v17.js';
 import Contract18 from '../contract/history/v18.js';
 import Contract19 from '../contract/history/v19.js';
@@ -23,7 +24,7 @@ import Contract21 from '../contract/history/v21.js';
 import Contract22 from '../contract/history/v22.js';
 import Contract23 from '../contract/history/v23.js';import Contract24 from '../contract/history/v24.js';import Contract25 from '../contract/history/v25.js';import Contract26 from '../contract/history/v26.js';import Contract27 from '../contract/history/v27.js';import Contract28 from '../contract/history/v28.js';import Contract29 from '../contract/history/v29.js';
 import { MemoryStorage } from './helpers/contract.js';
-const historicalContracts=new Map([[17,Contract17],[18,Contract18],[19,Contract19],[20,Contract20],[21,Contract21],[22,Contract22],[23,Contract23],[24,Contract24],[25,Contract25],[26,Contract26],[27,Contract27],[28,Contract28],[29,Contract29]]);
+const historicalContracts=new Map([[17,Contract17],[18,Contract18],[19,Contract19],[20,Contract20],[21,Contract21],[22,Contract22],[23,Contract23],[24,Contract24],[25,Contract25],[26,Contract26],[27,Contract27],[28,Contract28],[29,Contract29],[30,Contract30]]);
 const versions=[...historicalContracts.keys()];
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const protocol={featMaxBytes:()=>1e6};
@@ -57,23 +58,23 @@ async function fixture(version,kind='feature'){
  async function replay(){const replayStore=new Corestore(path.join(dir,'replay'));const view=new Hyperbee(replayStore.get({name:'view'}),{extension:false,keyEncoding:'utf-8',valueEncoding:'json'});await view.ready();await view.put('admin',wallet.publicKey);const batch=view.batch();const current=new MayhemContract(proto,{});await applyHandler(current,base.view).handle(op,batch,base,node);await batch.flush();await batch.close();assert.equal((await view.core.treeHash()).toString('hex'),expectedHash,'Full authenticated tree must match historical writer');const once=view.core.length;const duplicate=view.batch();await applyHandler(current,base.view).handle(op,duplicate,base,node);await duplicate.flush();await duplicate.close();assert.equal(view.core.length,once);const state=await collect(view);await view.close();await replayStore.close();return state;}
  return {wallet,op,node,proto,replay,get view(){return base.view;},expected,before:()=>new MemoryStorage({admin:wallet.publicKey}),async close(){await base.close();await store.close();fs.rmSync(dir,{recursive:true,force:true});}};
 }
-for(const version of versions)for(const kind of ['feature','tx'])test(`persisted signed v${version} ${kind} history preserves full tree under30 exactly once`,async()=>{
+for(const version of versions)for(const kind of ['feature','tx'])test(`persisted signed v${version} ${kind} history preserves full tree under31 exactly once`,async()=>{
  const f=await fixture(version,kind);try{const replayed=await f.replay();assert.equal(replayed.snapshotBytes(),f.expected.snapshotBytes());if(kind==='tx')assert.equal((await replayed.get('params/price_min_bps')).value.pending.value,version>=25?2500:1,'Historical pricing bound must not be reinterpreted');}finally{await f.close();}
 });
-for (const version of [17,22,24]) test(`fresh, unbound, mutated and wrong-version v${version} Feature calls remain rejected`,async()=>{
+for (const version of [17,22,24,30]) test(`fresh, unbound, mutated and wrong-version v${version} Feature calls remain rejected`,async()=>{
  const f=await fixture(version);try{const c=new MayhemContract({},{});
- await assert.rejects(c.execute(f.op,f.before()),new RegExp('expected CONTRACT_VERSION 30, got '+version));
- await assert.rejects(c.execute(f.op,f.before(),{replay:true}),new RegExp('expected CONTRACT_VERSION 30, got '+version));
+ await assert.rejects(c.execute(f.op,f.before()),new RegExp('expected CONTRACT_VERSION 31, got '+version));
+ await assert.rejects(c.execute(f.op,f.before(),{replay:true}),new RegExp('expected CONTRACT_VERSION 31, got '+version));
  const fresh=structuredClone(f.op);fresh.value.dispatch.nonce='fresh';fresh.value.dispatch.hash=f.wallet.sign(JSON.stringify(fresh.value.dispatch.value)+'fresh');
- const unsignedNode={...f.node,value:fresh};await assert.rejects(handler(f.wallet,c,f.view).handle(fresh,f.before(),{},unsignedNode),new RegExp('expected CONTRACT_VERSION 30, got '+version));
- const bad=structuredClone(f.op);bad.value.dispatch.contract_version=23;await assert.rejects(handler(f.wallet,c,f.view).handle(bad,f.before(),{},{...f.node,value:bad}),/expected CONTRACT_VERSION 30, got 23/);
+ const unsignedNode={...f.node,value:fresh};await assert.rejects(handler(f.wallet,c,f.view).handle(fresh,f.before(),{},unsignedNode),new RegExp('expected CONTRACT_VERSION 31, got '+version));
+ const bad=structuredClone(f.op);bad.value.dispatch.contract_version=23;await assert.rejects(handler(f.wallet,c,f.view).handle(bad,f.before(),{},{...f.node,value:bad}),/expected CONTRACT_VERSION 31, got 23/);
  const storage=f.before(),token=await canonicalReplayContext(f.op,storage,f.node,f.view);assert(token);assert.equal(consumeCanonicalReplayContext(token,f.op,f.before()),false);assert.equal(consumeCanonicalReplayContext(token,f.op,storage),false,'failed use consumes capability');
  const token2=await canonicalReplayContext(f.op,storage,f.node,f.view);f.op.value.dispatch.key+='tampered';assert.equal(consumeCanonicalReplayContext(token2,f.op,storage),false);
  }finally{await f.close();}
 });
 
-for (const version of [17,22,24]) test(`ordinary v${version} TX requires exact canonical index and original signed bytes`,async()=>{
- const f=await fixture(version,'tx');try{const c=new MayhemContract(f.proto,{}),storage=f.before();await assert.rejects(c.execute(f.op,storage),new RegExp('expected CONTRACT_VERSION 30, got '+version));
+for (const version of [17,22,24,30]) test(`ordinary v${version} TX requires exact canonical index and original signed bytes`,async()=>{
+ const f=await fixture(version,'tx');try{const c=new MayhemContract(f.proto,{}),storage=f.before();await assert.rejects(c.execute(f.op,storage),new RegExp('expected CONTRACT_VERSION 31, got '+version));
  const noIndex={core:f.view.core,checkout:length=>{const view=f.view.checkout(length);return {close:()=>view.close(),get:async key=>key.startsWith('tx/')?null:view.get(key)};}};
  assert.equal(await canonicalReplayContext(f.op,storage,f.node,noIndex),null);
  const badRecord={core:f.view.core,checkout:length=>{const view=f.view.checkout(length);return {close:()=>view.close(),get:async key=>{const row=await view.get(key);return key.startsWith('txi/')?{...row,value:{...row.value,ipk:'00'.repeat(32)}}:row;}};}};
@@ -125,7 +126,7 @@ for (const version of versions) test(`persisted remote v${version} Feature reads
   await writer.base.append(op);await writer.base.update();
   const expected=(await writer.base.view.core.treeHash()).toString('hex');
   const broken=await open('broken',writer.base.key,new MayhemContract(protocol,{}),true);const disconnectBroken=connect(writer,broken);
-  await until(()=>broken.error);assert.match(broken.error.message,new RegExp('expected CONTRACT_VERSION 30, got '+version));
+  await until(()=>broken.error);assert.match(broken.error.message,new RegExp('expected CONTRACT_VERSION 31, got '+version));
   assert(broken.observations.some(x=>x.remote&&x.inputSignedLength>=x.nodeLength&&x.publicLength===x.applyLength));
   disconnectBroken();await close(broken);
   const current=new MayhemContract(protocol,{}),fixed=await open('fixed',writer.base.key,current);connect(writer,fixed);

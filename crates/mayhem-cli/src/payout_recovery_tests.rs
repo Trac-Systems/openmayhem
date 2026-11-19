@@ -298,6 +298,7 @@ async fn funding_then_restart_pays_once_and_recovers_without_balance() {
     let (base, server) = stripe_fixture(responses).await;
     let client = reqwest::Client::new();
     let first = execute_canonical_stripe_attempt(
+        None,
         &client,
         &base,
         "sk_test_fixture",
@@ -316,6 +317,7 @@ async fn funding_then_restart_pays_once_and_recovers_without_balance() {
     for _ in 0..2 {
         assert!(matches!(
             execute_canonical_stripe_attempt(
+                None,
                 &reqwest::Client::new(),
                 &base,
                 "sk_test_fixture",
@@ -355,6 +357,7 @@ async fn stale_unconfirmed_payment_checks_history_without_requesting_a_transfer(
     let empty = json!({"object":"list","has_more":false,"data":[]});
     let (base, server) = stripe_fixture(vec![("GET /v1/transfers?", 200, empty)]).await;
     let result = execute_canonical_stripe_attempt(
+        None,
         &reqwest::Client::new(),
         &base,
         "sk_test_fixture",
@@ -427,6 +430,7 @@ async fn expired_valuation_quote_can_reconcile_paid_output_without_more_cash() {
     ])
     .await;
     match execute_canonical_stripe_attempt(
+        None,
         &reqwest::Client::new(),
         &base,
         "sk_test_fixture",
@@ -472,4 +476,28 @@ fn withdraw_uses_the_proofs_historical_epoch_and_rejects_conflicts() {
     ] {
         assert!(withdraw_root_epoch(&json!({"epoch":invalid}), None).is_err());
     }
+}
+
+#[test]
+fn fiat_508_sender_holds_the_whole_batch_before_stripe_and_rechecks_before_post() {
+    let source = json!({"role":"provider", "provider":"p", "payout_revision":"r",
+        "paid_cum_au_before":"8028518251457218441","paid_au":"1021701396860965955"});
+    let outputs = json!([{}, {"role":"provider","provider":"p","payout_revision":"r",
+        "paid_cum_au_before":"8028518251457218441","paid_au":"1877278632791707922"}]);
+    let root = "a".repeat(64);
+    let record = json!({"type":"targeted_payout_epoch_plan","rail":"fiat","epoch":542,"plan_root":root,
+        "value":{"op":"prepare_targeted_payout_epoch","rail":"fiat","epoch":542,"contract_version":28,
+            "plan_root":root,"outputs":outputs,"outputs_root":opaque_hash("mayhem-targeted-payout-epoch-outputs-v1",
+                &json!({"rail":"fiat","epoch":542,"outputs":outputs}))}});
+    let mut response = json!({"key":"payout/epoch-plan/fiat/542","confirmed":true,"signed_length":17,"value":record});
+    assert!(check_fiat_508_sender_open(&source, &response).is_err());
+    let independent = json!({"role":"provider","provider":"other","payout_revision":"r","paid_cum_au_before":"0"});
+    assert!(check_fiat_508_sender_open(&independent, &response).is_ok());
+    response["value"]["value"]["outputs"][1]["provider"] = json!("other");
+    assert!(check_fiat_508_sender_open(&source, &response).is_err());
+    response["value"] = Value::Null;
+    assert!(check_fiat_508_sender_open(&source, &response).is_err());
+    assert!(check_fiat_508_sender_open(&independent, &response).is_ok());
+    response.as_object_mut().unwrap().remove("value");
+    assert!(check_fiat_508_sender_open(&independent, &response).is_err());
 }

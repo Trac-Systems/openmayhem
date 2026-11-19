@@ -2038,7 +2038,7 @@ test('canonical receipt metadata rejects count and revision overflow', async () 
 
 
 test('current contract settles retained v23-v29 receipts without rewriting signatures or billing', async () => {
-  for (const contractVersion of [23, 24, 25, 26, 27, 28, 29, CONTRACT_VERSION]) {
+  for (const contractVersion of [23, 24, 25, 26, 27, 28, 29, 30, CONTRACT_VERSION]) {
     const ctx = await setupContract();
     const reservation = await submitReservation(ctx);
     const value = receiptValue(ctx, reservation, {

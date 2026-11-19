@@ -6,6 +6,7 @@ export const RELEASE_MANIFEST_PATH = 'contract/release.json';
 export const INTERCOM_BUNDLE_ASSET_PREFIX = 'share/mayhem/intercom/';
 export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/contract.js',
+  'contract/fiat-recovery.js',
   'contract/history/v17.js',
   'contract/history/v18.js',
   'contract/history/v19.js',
@@ -31,6 +32,7 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/proxy-registry.js',
   'contract/proxy-reservations.js',
   'contract/reference-demand.js',
+  'contract/v30.js',
   'features/mayhem/index.js',
   'features/mayhem/proxy-admission.js',
   'features/mayhem/proxy-canonical-view.js',

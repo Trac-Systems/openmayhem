@@ -1,7 +1,8 @@
 # Retained contract implementations
 
 These files execute authenticated historical operations using their original
-version rules. The current contract remains version 30. New submissions must
+version rules. The current contract is version 31. The byte-identical v30 reducer lives at
+`../v30.js` to preserve its relative imports. New submissions must
 still use the current version; an old version number alone never grants replay.
 
 `origins-17-22.json` records the original source commits and SHA-256 hashes for

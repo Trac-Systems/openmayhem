@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import Contract27 from '../contract/history/v27.js';
+import Contract28 from '../contract/history/v28.js';
+import { fiatFenceKey, fiatRecoveryFeatureKey, fiatResolutionKey } from '../contract/fiat-recovery.js';
+import { buildRecoveryFeature, buildVerifiedSettlement, inspectOverlap, snapshotContract } from '../scripts/fiat-preparation-recovery.mjs';
 import b4a from 'b4a';
 
 import MayhemContract, {
@@ -37,22 +41,22 @@ async function submitControl(ctx, value, featureKeyMethod) {
   );
 }
 
-async function planValue(ctx) {
+async function planValue(ctx, epoch = 1, anchor = applyHash) {
   const outputsRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-outputs-v1',
-    { rail: 'fiat', epoch: 1, outputs: ctx.outputs }
+    { rail: 'fiat', epoch, outputs: ctx.outputs }
   );
   const carryRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-carry-v1',
-    { rail: 'fiat', epoch: 1, carry: [] }
+    { rail: 'fiat', epoch, carry: [] }
   );
   const planRoot = await ctx.contract.opaqueHash(
     'mayhem-targeted-payout-epoch-plan-v1',
     {
       rail: 'fiat',
-      epoch: 1,
+      epoch,
       at: 90_000,
-      epoch_apply_hash: applyHash,
+      epoch_apply_hash: anchor,
       snapshot_signed_length: 220,
       outcome: 'payouts',
       outputs_root: outputsRoot,
@@ -61,11 +65,11 @@ async function planValue(ctx) {
   );
   return {
     op: 'prepare_targeted_payout_epoch',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'fiat',
-    epoch: 1,
+    epoch,
     at: 90_000,
-    epoch_apply_hash: applyHash,
+    epoch_apply_hash: anchor,
     snapshot_signed_length: 220,
     outcome: 'payouts',
     outputs: ctx.outputs,
@@ -91,8 +95,8 @@ async function prepareEconomicOutput(ctx, plan, output) {
     plan_root: plan.plan_root,
     economic_op_id: output.economic_op_id,
     rail: 'fiat',
-    epoch: 1,
-    epoch_apply_hash: applyHash,
+    epoch: plan.epoch,
+    epoch_apply_hash: plan.epoch_apply_hash,
     output_index: output.output_index,
     output,
     processor: 'stripe',
@@ -114,11 +118,11 @@ async function prepareEconomicOutput(ctx, plan, output) {
   const kind = output.role === 'provider' ? 'liability' : 'fee';
   const value = {
     op: 'prepare_targeted_payout',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     economic_op_id: output.economic_op_id,
     rail: 'fiat',
-    epoch: 1,
-    epoch_apply_hash: applyHash,
+    epoch: plan.epoch,
+    epoch_apply_hash: plan.epoch_apply_hash,
     prepared_at: 90_000,
     kind,
     output_index: output.output_index,
@@ -127,8 +131,8 @@ async function prepareEconomicOutput(ctx, plan, output) {
       {
         economic_op_id: output.economic_op_id,
         rail: 'fiat',
-        epoch: 1,
-        epoch_apply_hash: applyHash,
+        epoch: plan.epoch,
+        epoch_apply_hash: plan.epoch_apply_hash,
         kind,
         output_index: output.output_index,
         payload,
@@ -153,7 +157,7 @@ async function prepareEconomicOutput(ctx, plan, output) {
   );
 }
 
-function attemptRequest(output, attemptNo) {
+function attemptRequest(output, attemptNo, plan) {
   const identityDigit = (
     output.output_index * 4 + attemptNo + 5
   ).toString(16);
@@ -182,15 +186,15 @@ function attemptRequest(output, attemptNo) {
     destination_currency: output.destination_currency,
     destination_amount_min_minor: output.destination_amount_min_minor,
     destination_amount_max_minor: output.destination_amount_max_minor,
-    fx_quote_id: `fxq_attempt_${attemptNo}`,
+    fx_quote_id: `fxq_attempt_${plan.epoch}_${output.output_index}_${attemptNo}`,
     fx_quote_hash: (attemptNo + 6).toString(16).repeat(64),
-    transfer_group: `mayhem_fiat_epoch_1_${applyHash.slice(0, 16)}`,
+    transfer_group: `mayhem_fiat_epoch_${plan.epoch}_${plan.epoch_apply_hash.slice(0, 16)}`,
     metadata_hash: identityDigit.repeat(64),
   };
 }
 
 async function attemptValue(ctx, plan, output, attemptNo) {
-  const request = attemptRequest(output, attemptNo);
+  const request = attemptRequest(output, attemptNo, plan);
   const attemptId = await ctx.contract.targetedFiatAttemptId(
     output.economic_op_id,
     attemptNo,
@@ -198,10 +202,10 @@ async function attemptValue(ctx, plan, output, attemptNo) {
   );
   return {
     op: 'prepare_targeted_fiat_attempt',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'fiat',
-    epoch: 1,
-    epoch_apply_hash: applyHash,
+    epoch: plan.epoch,
+    epoch_apply_hash: plan.epoch_apply_hash,
     plan_root: plan.plan_root,
     economic_op_id: output.economic_op_id,
     output_index: output.output_index,
@@ -267,9 +271,9 @@ function transferEvidence(output, attempt, ref) {
 function finalizationValue(ctx, attempt, status, evidence) {
   return {
     op: 'finalize_targeted_fiat_attempt',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'fiat',
-    epoch: 1,
+    epoch: attempt.epoch,
     economic_op_id: attempt.economic_op_id,
     attempt_id: attempt.attempt_id,
     status,
@@ -295,11 +299,11 @@ async function finalizeAttempt(ctx, attempt, status, evidence) {
 function outputSettlementValue(ctx, plan, output, attempt, transfer) {
   return {
     op: 'settle_targeted_fiat_output',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'fiat',
-    epoch: 1,
+    epoch: plan.epoch,
     at: 90_050,
-    epoch_apply_hash: applyHash,
+    epoch_apply_hash: plan.epoch_apply_hash,
     plan_root: plan.plan_root,
     economic_op_id: output.economic_op_id,
     output_index: output.output_index,
@@ -322,11 +326,11 @@ async function settleOutput(ctx, plan, output, attempt, transfer) {
 async function closeEpoch(ctx, plan) {
   const value = {
     op: 'close_targeted_payout_epoch',
-    contract_version: CONTRACT_VERSION,
+    contract_version: ctx.version ?? CONTRACT_VERSION,
     rail: 'fiat',
-    epoch: 1,
+    epoch: plan.epoch,
     at: 90_050,
-    epoch_apply_hash: applyHash,
+    epoch_apply_hash: plan.epoch_apply_hash,
     plan_root: plan.plan_root,
     admin: ctx.admin.publicKey,
     admin_sig: '0'.repeat(128),
@@ -334,9 +338,9 @@ async function closeEpoch(ctx, plan) {
   return await submitControl(ctx, value, 'closeTargetedPayoutEpochFeatureKey');
 }
 
-async function setup() {
+async function setup(provider = null) {
   const admin = await makeIdentity();
-  const provider = await makeIdentity();
+  provider ??= await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
   const contract = new MayhemContract(
     { peer: { wallet: makeVerifier(admin.wallet) } },
@@ -759,4 +763,334 @@ test('fiat attempt finalization rejects a globally duplicated external effect', 
   );
   const finalized = await finalizeAttempt(ctx, attempt.value, 'succeeded', transfer);
   assert.match(finalized.result.message, /external effect was already finalized/i);
+});
+
+const overlapStart = '8028518251457218441';
+const paid508 = '1021701396860965955';
+const paid542 = '1877278632791707922';
+
+async function overlapFixture(withAttempt = true) {
+  const people = (await Promise.all([makeIdentity(), makeIdentity()]))
+    .sort((a, b) => a.publicKey.localeCompare(b.publicKey));
+  const ctx = await setup(people[1]);
+  const { storage, provider, revision } = ctx;
+  const proto = { peer: { wallet: makeVerifier(ctx.admin.wallet) } };
+  ctx.contract = new Contract27(proto, {});
+  ctx.version = 27;
+  const get = async k => (await storage.get(k))?.value ?? null;
+  const earningKey = `earn/fiat/${provider.publicKey}`;
+  const liabilityKey = `payout/liability/fiat/${provider.publicKey}/${revision}`;
+  const fee = await get('fee/fiat/cum');
+  const oldFee = {
+    ...ctx.outputs[1], economic_op_id: '4'.repeat(64),
+    paid_au: '9473747554087500', liability_au: '9473747554087500', source_amount_minor: '1'
+  };
+  await storage.put('fee/fiat/cum', { ...fee, cum_au: oldFee.paid_au, settled_cum_au: oldFee.paid_au });
+  const old = {
+    ...ctx.outputs[0], paid_cum_au_before: overlapStart, aggregate_paid_cum_au_before: overlapStart,
+    destination_currency: 'eur', source_currency: 'eur', source_amount_minor: '89',
+    destination_amount_min_minor: '89', destination_amount_max_minor: '89',
+    paid_au: paid508, liability_au: '1028501115410039184', dust_au: '6799718549073229', rounding_au: '6799718549073229'
+  };
+  const bindingKey = `payout/binding/fiat/${provider.publicKey}/${revision}`;
+  await storage.put(bindingKey, { ...await get(bindingKey), currency: 'eur' });
+  async function updateBalances(epoch, out) {
+    const total = String(BigInt(overlapStart) + BigInt(out.liability_au));
+    for (const k of [earningKey, liabilityKey]) {
+      await storage.put(k, {
+        ...await get(k), ...(k === liabilityKey ? { currency: 'eur' } : {}),
+        paid_cum_au: overlapStart, total_au: total, updated_epoch: epoch
+      });
+    }
+  }
+  async function freeze(epoch, anchor, outputs) {
+    const update = `epoch/targeted/${epoch}/apply`;
+    await storage.put(`epoch/apply-anchor/${epoch}`, {
+      type: 'epoch_apply_anchor', epoch, apply_hash: anchor, settlement_unix: 90_000, applied_at: update
+    });
+    await storage.put('epoch/apply/state', {
+      updated_epoch: epoch, updated_at: update, last_apply_hash: anchor, last_settlement_unix: 90_000
+    });
+    ctx.outputs = outputs;
+    const value = await planValue(ctx, epoch, anchor);
+    const r = await submitControl(ctx, value, 'targetedPayoutEpochFeatureKey');
+    assert.equal(r.ok, true, r.message);
+    return value;
+  }
+  await updateBalances(508, old);
+  const prior = await freeze(508, 'a'.repeat(64), [old, oldFee]);
+  const pre = await prepareEconomicOutput(ctx, prior, old);
+  assert.equal(pre.ok, true, pre.message);
+  const attempt = withAttempt ? await prepareAttempt(ctx, prior, old, 1) : null;
+  if (attempt) assert.equal(attempt.result.ok, true, attempt.result.message);
+  ctx.contract = new Contract28(proto, {});
+  ctx.version = 28;
+  const first = {
+    ...old, economic_op_id: '2'.repeat(64), provider: people[0].publicKey, to: 'acct_fixture_other',
+    source_amount_minor: '678', destination_amount_min_minor: '678', destination_amount_max_minor: '678',
+    paid_cum_au_before: '0', aggregate_paid_cum_au_before: '0', paid_au: '7760944591663280315',
+    liability_au: '7767070390800905355', dust_au: '6125799137625040', rounding_au: '6125799137625040'
+  };
+  const next = {
+    ...old, economic_op_id: '3'.repeat(64), output_index: 1, source_amount_minor: '164',
+    destination_amount_min_minor: '164', destination_amount_max_minor: '164', paid_au: paid542,
+    liability_au: '1882503406878845184', dust_au: '5224774087137262', rounding_au: '5224774087137262'
+  };
+  await updateBalances(542, next);
+  for (const key of [`prov/${provider.publicKey}`, earningKey, liabilityKey, bindingKey]) {
+    const row = { ...await get(key) };
+    if ('provider' in row) row.provider = first.provider;
+    if ('target' in row) row.target = first.to;
+    if ('total_au' in row) Object.assign(row, { total_au: first.liability_au, paid_cum_au: '0' });
+    await storage.put(key.replace(provider.publicKey, first.provider), row);
+  }
+  const index = await get('payout/liability-index/fiat');
+  await storage.put('payout/liability-index/fiat', {
+    ...index, entries: [
+      { provider: first.provider, payout_revision: revision }, ...index.entries]
+  });
+  const retainedFee = {
+    ...oldFee, output_index: 2, economic_op_id: '5'.repeat(64), source_amount_minor: '58',
+    paid_au: '654219431548440044', liability_au: '654219431548440044'
+  };
+  await storage.put('fee/fiat/cum', { ...fee, cum_au: retainedFee.paid_au, settled_cum_au: retainedFee.paid_au });
+  const frozen = await freeze(542, 'b'.repeat(64), [first, next, retainedFee]);
+  assert.equal((await prepareEconomicOutput(ctx, frozen, first)).ok, true);
+  const paidAttempt = await prepareAttempt(ctx, frozen, first, 1);
+  assert.equal(paidAttempt.result.ok, true, paidAttempt.result.message);
+  const paidTransfer = transferEvidence(first, paidAttempt.value, 'tr_other_output');
+  assert.equal((await finalizeAttempt(ctx, paidAttempt.value, 'succeeded', paidTransfer)).result.ok, true);
+  assert.equal((await settleOutput(ctx, frozen, first, paidAttempt.value, paidTransfer)).result.ok, true);
+  assert.equal((await prepareEconomicOutput(ctx, frozen, retainedFee)).ok, true);
+  const feeAttempt = await prepareAttempt(ctx, frozen, retainedFee, 1);
+  assert.equal(feeAttempt.result.ok, true, feeAttempt.result.message);
+  const feeEvidence = transferEvidence(retainedFee, feeAttempt.value, 'platform_balance:fixture:542');
+  assert.equal((await finalizeAttempt(ctx, feeAttempt.value, 'succeeded', feeEvidence)).result.ok, true);
+  assert.equal((await settleOutput(ctx, frozen, retainedFee, feeAttempt.value, feeEvidence)).result.ok, true);
+  const blocked = await prepareEconomicOutput(ctx, frozen, next);
+  assert.match(blocked.message, /watermark/);
+  ctx.contract = new MayhemContract(proto, {});
+  delete ctx.version;
+  return { ctx, old, next, first, prior, frozen, attempt, earningKey, liabilityKey, proto };
+}
+
+function stateReader(ctx) {
+  const c = new MayhemContract(ctx.contract.protocol, {});
+  c.get = async k => (await ctx.storage.get(k))?.value ?? null;
+  return c;
+}
+
+async function reviewedFeature(ctx, stage, transfer = null) {
+  const length = stage === 'fence' ? 1000 : 1001;
+  const c = stateReader(ctx);
+  const state = await inspectOverlap(c, length);
+  const digest = '5'.repeat(64);
+  const review = {
+    old_operation: state.old_operation, new_operation: state.new_operation, admin: state.admin,
+    state_hash: state.state_hash, signed_length: length, stage, at: stage === 'fence' ? 100000 : 200000,
+    attestation: stage === 'fence' ? null : {
+      fence_key: state.fence_key, sends_drained_at: 110000,
+      history_from: 0, history_through: 199999, destination_history_complete: true, in_flight_requests: 0,
+      verified_sibling_ref: state.verified_sibling_ref, retained_fee_ref: state.retained_fee_ref, old_effect: transfer?.ref ?? 'absent', new_effect: 'absent', evidence_sha256: digest
+    },
+    ...(transfer ? { stripe_transfer: transfer } : {}),
+  };
+  // Capture explicit nulls and populated rows exactly as the pinned state RPC returns them.
+  // First collect all reads on an independent in-memory copy for the offline preflight.
+  const rows = new Map();
+  const mem = MemoryStorage.fromSnapshotBytes(ctx.storage.snapshotBytes());
+  c.get = async k => {
+    const value = (await mem.get(k))?.value ?? null;
+    if (!rows.has(k)) rows.set(k, { key: k, confirmed: true, signed_length: length, value });
+    return value;
+  };
+  c.put = (k, v) => mem.put(k, v);
+  const sign = async message => signHex(ctx.admin.wallet, message);
+  const evidence = stage === 'fence' ? null : digest;
+  await buildRecoveryFeature(c, length, review, evidence, sign);
+  const snapshot = { signed_length: length, rows: [...rows.values()] };
+  const recreated = await buildRecoveryFeature(snapshotContract(snapshot), length, review, evidence, sign);
+  assert.throws(() => snapshotContract({ ...snapshot, rows: [...snapshot.rows, snapshot.rows[0]] }), /Duplicate/);
+  await assert.rejects(buildRecoveryFeature(snapshotContract(snapshot), length, { ...review, state_hash: '0'.repeat(64) }, evidence, sign), /Review/);
+  return recreated;
+}
+
+async function submitRecovery(ctx, feature, sender = ctx.admin.publicKey) {
+  return executeFeature(ctx.contract, ctx.storage, 'mayhem_feature', feature.key, feature.value, sender);
+}
+async function resignRecovery(ctx, feature, change) {
+  const value = structuredClone(feature.value);
+  change(value);
+  value.admin_sig = signHex(ctx.admin.wallet, targetedPayoutControlMessage(value));
+  return { value, key: await fiatRecoveryFeatureKey(ctx.contract, value) };
+}
+
+test('508/542 transfers only the unused reservation and preserves both paid siblings', async () => {
+  const { ctx, old, next, first, prior, frozen, attempt, earningKey, liabilityKey, proto } = await overlapFixture();
+  const read = async k => (await ctx.storage.get(k))?.value ?? null;
+  const originalRows = new Map(ctx.storage.values);
+  const firstPaidKey = ctx.contract.targetedPayoutOutputRecordKey('fiat', 542, first.economic_op_id);
+  const oldPaidKey = ctx.contract.targetedPayoutOutputRecordKey('fiat', 508, old.economic_op_id);
+  const fence = await reviewedFeature(ctx, 'fence');
+  assert.match((await submitRecovery(ctx, fence, first.provider)).message, /admin|authority/i);
+  assert.equal((await submitRecovery(ctx, fence)).ok, true);
+  assert.equal((await submitRecovery(ctx, fence)).idempotent, true);
+  assert.match((await prepareAttempt(ctx, prior, old, 2)).result.message, /fenced/);
+  const uncertain = transferEvidence(old, attempt.value, 'tr_uncertain');
+  assert.match((await finalizeAttempt(ctx, attempt.value, 'succeeded', uncertain)).result.message, /fenced/);
+  const repair = await reviewedFeature(ctx, 'supersede_absent');
+  for (const change of [
+    v => { v.attestation.in_flight_requests = 1; },
+    v => { v.attestation.destination_history_complete = false; },
+    v => { v.attestation.new_effect = 'unknown'; },
+    v => { v.attestation.old_effect = 'unknown'; },
+    v => { v.attestation.history_from = 100000; },
+    v => { v.instruction.payload.output.paid_au = paid508; },
+    v => { v.state_hash = '0'.repeat(64); },
+  ]) {
+    const invalid = await resignRecovery(ctx, repair, change);
+    assert.ok((await submitRecovery(ctx, invalid)) instanceof Error);
+    assert.equal(await read(fiatResolutionKey(old.economic_op_id)), null);
+  }
+  assert.equal((await submitRecovery(ctx, repair)).ok, true);
+  ctx.storage = MemoryStorage.fromSnapshotBytes(ctx.storage.snapshotBytes());
+  ctx.contract = new MayhemContract(proto, {});
+  assert.equal((await submitRecovery(ctx, repair)).idempotent, true);
+  for (const [k, v] of originalRows) {
+    if (k.startsWith('earn/') || k.startsWith('payout/liability/') || k.startsWith('fee/') ||
+      k.startsWith('settle/') || k.startsWith('payout/epoch-plan/') ||
+      k.includes(first.economic_op_id) || k.includes('tr_other_output')) assert.deepEqual(await read(k), v, k);
+  }
+  assert.equal(await read(oldPaidKey), null);
+  assert.match((await closeEpoch(ctx, prior)).message, /unsettled/);
+  assert.match((await closeEpoch(ctx, frozen)).message, /unsettled/);
+  const replacement = await prepareAttempt(ctx, frozen, next, 1);
+  assert.equal(replacement.result.ok, true, replacement.result.message);
+  const t = transferEvidence(next, replacement.value, 'tr_fixture_new');
+  assert.equal((await finalizeAttempt(ctx, replacement.value, 'succeeded', t)).result.ok, true);
+  assert.equal((await settleOutput(ctx, frozen, next, replacement.value, t)).result.ok, true);
+  assert.equal((await closeEpoch(ctx, frozen)).ok, true);
+  assert.match((await closeEpoch(ctx, prior)).message, /unsettled/);
+  assert.equal(await read('settle/targeted/fiat/508'), null);
+  assert.equal(await read(oldPaidKey), null);
+  for (const k of [earningKey, liabilityKey]) assert.equal((await read(k)).paid_cum_au, String(BigInt(overlapStart) + BigInt(paid542)));
+  assert.deepEqual(await read(firstPaidKey), originalRows.get(firstPaidKey));
+  assert.equal((await submitRecovery(ctx, repair)).idempotent, true);
+});
+
+test('508 fence holds the original fee even if a runner already prepared or finalized its retention', async () => {
+  const { ctx, prior } = await overlapFixture();
+  const fee = prior.outputs[1];
+  assert.equal((await prepareEconomicOutput(ctx, prior, fee)).ok, true);
+  const attempt = await prepareAttempt(ctx, prior, fee, 1);
+  assert.equal(attempt.result.ok, true);
+  const evidence = transferEvidence(fee, attempt.value, 'platform_balance:fixture:508');
+  const saved = ctx.storage.snapshotBytes();
+  for (const finalized of [false, true]) {
+    ctx.storage = MemoryStorage.fromSnapshotBytes(saved);
+    if (finalized) assert.equal((await finalizeAttempt(ctx, attempt.value, 'succeeded', evidence)).result.ok, true);
+    const feeKey = ctx.contract.feeCumKey('fiat');
+    const before = await ctx.storage.get(feeKey);
+    assert.equal((await submitRecovery(ctx, await reviewedFeature(ctx, 'fence'))).ok, true);
+    assert.match((await prepareEconomicOutput(ctx, prior, fee)).message, /holds the 508 fee/);
+    assert.match((await prepareAttempt(ctx, prior, fee, 1)).result.message, /holds the 508 fee/);
+    assert.match((await finalizeAttempt(ctx, attempt.value, 'succeeded', evidence)).result.message, /holds the 508 fee/);
+    assert.match((await settleOutput(ctx, prior, fee, attempt.value, evidence)).result.message, /holds the 508 fee/);
+    assert.equal((await submitRecovery(ctx, await reviewedFeature(ctx, 'supersede_absent'))).ok, true);
+    assert.match((await settleOutput(ctx, prior, fee, attempt.value, evidence)).result.message, /holds the 508 fee/);
+    assert.deepEqual(await ctx.storage.get(feeKey), before);
+  }
+});
+
+test('missing last 508 attempt cannot authorize a fence or absence resolution', async () => {
+  const { ctx } = await overlapFixture(false);
+  await assert.rejects(reviewedFeature(ctx, 'fence'), /missing last 508 attempt/);
+});
+
+test('verified 508 effect follows its original attempt and leaves frozen 542 blocked', async () => {
+  const { ctx, old, next, prior, frozen, attempt, earningKey } = await overlapFixture();
+  assert.equal((await submitRecovery(ctx, await reviewedFeature(ctx, 'fence'))).ok, true);
+  const transfer = transferEvidence(old, attempt.value, 'tr_fixture_observed');
+  const feature = await reviewedFeature(ctx, 'reconcile_verified', transfer);
+  assert.equal((await submitRecovery(ctx, feature)).ok, true);
+  assert.equal((await submitRecovery(ctx, feature)).idempotent, true);
+  assert.equal((await ctx.storage.get(earningKey)).value.paid_cum_au, overlapStart);
+  const reader = stateReader(ctx);
+  const localWrites = new Map();
+  const read = reader.get;
+  reader.get = k => localWrites.has(k) ? localWrites.get(k) : read(k);
+  reader.put = (k, v) => localWrites.set(k, v);
+  const paid = await buildVerifiedSettlement(reader, 1002, feature, async m => signHex(ctx.admin.wallet, m));
+  const submitPaid = () => executeFeature(ctx.contract, ctx.storage, 'mayhem_feature', paid.key, paid.value, ctx.admin.publicKey);
+  assert.equal((await submitPaid()).ok, true);
+  assert.equal((await submitPaid()).idempotent, true);
+  assert.equal((await ctx.storage.get(earningKey)).value.paid_cum_au, String(BigInt(overlapStart) + BigInt(paid508)));
+  assert.match((await prepareEconomicOutput(ctx, frozen, next)).message, /watermark/);
+  assert.match((await closeEpoch(ctx, frozen)).message, /unsettled/);
+});
+
+test('recovery rejects contradictory legacy state and a changed last observation', async () => {
+  const { ctx, old, next, prior, attempt, first } = await overlapFixture();
+  const saved = ctx.storage.snapshotBytes();
+  const feature = await reviewedFeature(ctx, 'fence');
+  const id = old.economic_op_id;
+  const attemptKey = ctx.contract.targetedFiatAttemptRecordKey(id, attempt.value.attempt_id);
+  const tailKey = ctx.contract.targetedFiatAttemptTailKey(id);
+  const lockKey = ctx.contract.payoutPreparationLiabilityLockKey('fiat', old);
+  const reservationKey = ctx.contract.payoutPreparationAggregateTailKey('fiat', old.provider);
+  const siblingKey = ctx.contract.targetedPayoutOutputRecordKey('fiat', 542, first.economic_op_id);
+  for (const [key, patch] of [
+    [tailKey, { attempt_id: '4'.repeat(64) }],
+    [attemptKey, { consumed: true }],
+    [attemptKey, { status: 'prepared', result: { status: 'succeeded' } }],
+    [attemptKey, { preparation: { ...attempt.value, request_hash: 'e'.repeat(64) } }],
+    [lockKey, { economic_op_id: next.economic_op_id }],
+    [reservationKey, { paid_cum_au_after: overlapStart }],
+    [siblingKey, { economic_op_id: next.economic_op_id }],
+    [ctx.contract.targetedFiatAttemptTailKey(next.economic_op_id), { status: 'prepared' }],
+    [ctx.contract.payoutPreparationRecordKey('fiat', id), { external_effect_ids: ['9'.repeat(64)] }],
+    [ctx.contract.targetedFiatAttemptEffectKey('tr_other_output'), { consumed: false }],
+  ]) {
+    ctx.storage = MemoryStorage.fromSnapshotBytes(saved);
+    const before = await ctx.storage.get(key);
+    await ctx.storage.put(key, { ...before?.value, ...patch });
+    assert.ok((await submitRecovery(ctx, feature)) instanceof Error, key);
+    assert.equal(await ctx.storage.get(fiatFenceKey(id)), null);
+  }
+  // A definitive expiry plus renewal changes the signed observation. Neither
+  // the old fence nor an absence instruction for the expired attempt can win.
+  ctx.storage = MemoryStorage.fromSnapshotBytes(saved);
+  const p = attempt.value;
+  const expiry = {
+    fx_quote_id: p.request.fx_quote_id, fx_quote_hash: p.request.fx_quote_hash,
+    quote_expires_at: p.quote_expires_at, error_code: 'fx_quote_expired', external_effect_absent: true
+  };
+  assert.equal((await finalizeAttempt(ctx, p, 'expired_pre_effect', expiry)).result.ok, true);
+  const expired = await reviewedFeature(ctx, 'fence');
+  const replacement = await prepareAttempt(ctx, prior, old, 2);
+  assert.equal(replacement.result.ok, true);
+  await assert.rejects(reviewedFeature(ctx, 'fence'), /additional 508 attempts/);
+  assert.match((await submitRecovery(ctx, expired)).message, /observation/);
+  assert.match((await submitRecovery(ctx, feature)).message, /observation/);
+  const verified = transferEvidence(old, replacement.value, 'tr_fixture_already_found');
+  assert.equal((await finalizeAttempt(ctx, replacement.value, 'succeeded', verified)).result.ok, true);
+  assert.ok((await submitRecovery(ctx, feature)) instanceof Error);
+  assert.equal(await ctx.storage.get(fiatFenceKey(id)), null);
+});
+
+test('conflicting evidence and a bad nested signature cannot release either reservation', async () => {
+  const { ctx, old, next, attempt } = await overlapFixture();
+  assert.equal((await submitRecovery(ctx, await reviewedFeature(ctx, 'fence'))).ok, true);
+  const absent = await reviewedFeature(ctx, 'supersede_absent');
+  const signedIncorrectly = await resignRecovery(ctx, absent, v => { v.instruction.admin_sig = '0'.repeat(128); });
+  assert.match((await submitRecovery(ctx, signedIncorrectly)).message, /signature/);
+  const changedSibling = await resignRecovery(ctx, absent, v => { v.attestation.verified_sibling_ref = 'tr_wrong_output'; });
+  assert.match((await submitRecovery(ctx, changedSibling)).message, /evidence/);
+  const transfer = transferEvidence(old, attempt.value, 'tr_verified_fixture');
+  const positive = await reviewedFeature(ctx, 'reconcile_verified', transfer);
+  await ctx.storage.put(ctx.contract.stripeDestinationPaymentSeenKey(transfer), { economic_op_id: 'e'.repeat(64) });
+  assert.match((await submitRecovery(ctx, positive)).message, /already consumed/);
+  assert.equal(await ctx.storage.get(ctx.contract.targetedFiatAttemptEffectKey(transfer.ref)), null);
+  assert.equal(await ctx.storage.get(fiatResolutionKey(old.economic_op_id)), null);
+  assert.equal(await ctx.storage.get(ctx.contract.payoutPreparationRecordKey('fiat', next.economic_op_id)), null);
 });

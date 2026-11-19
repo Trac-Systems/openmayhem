@@ -37633,6 +37633,57 @@ fn check_fiat_output_aggregate(
     Ok(())
 }
 
+/// Read both frozen plans before any Stripe access. Once an overlapping 542
+/// plan exists, replaying the entire 508 batch could also retain its fee twice.
+async fn require_fiat_508_sender_open(rpc: &PeerRpcClient, old_output: &Value) -> Result<()> {
+    let key = "payout/epoch-plan/fiat/542";
+    let state = rpc.state(Some(key), Some(true)).await?;
+    check_fiat_508_sender_open(old_output, &state)
+}
+
+fn check_fiat_508_sender_open(old_output: &Value, state: &Value) -> Result<()> {
+    ensure!(
+        state["key"] == "payout/epoch-plan/fiat/542"
+            && state["confirmed"] == true
+            && state["signed_length"].as_u64().is_some_and(|n| n > 0),
+        "invalid confirmed FIAT 542 plan readback"
+    );
+    let record = state
+        .get("value")
+        .context("missing FIAT 542 plan readback")?;
+    if record.is_null() {
+        // A stale peer may not have reached 542. The incident interval is
+        // permanently read-only even when its covering plan cannot be read.
+        ensure!(
+            old_output["paid_cum_au_before"] != "8028518251457218441"
+                || old_output["paid_au"] != "1021701396860965955",
+            "cannot establish the disposition of the held FIAT 508 provider interval"
+        );
+        return Ok(());
+    }
+    let plan = canonical_targeted_payout_plan(record, "fiat", 542)?;
+    let outputs = plan["outputs"]
+        .as_array()
+        .context("missing FIAT 542 outputs")?;
+    ensure!(
+        plan["outputs_root"]
+            == opaque_hash(
+                "mayhem-targeted-payout-epoch-outputs-v1",
+                &json!({"rail":"fiat","epoch":542,"outputs":outputs})
+            ),
+        "invalid FIAT 542 frozen output commitment"
+    );
+    if let Some(next) = outputs.get(1) {
+        ensure!(
+            !(old_output["role"] == "provider" && next["role"] == "provider"
+                && ["provider", "payout_revision", "paid_cum_au_before"].iter()
+                    .all(|field| old_output[*field] == next[*field])),
+            "FIAT 508 overlaps the frozen 542 provider interval. Its batch and fee remain on hold; use the signed FIAT recovery procedure"
+        );
+    }
+    Ok(())
+}
+
 async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
@@ -37682,6 +37733,17 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         bail!(
             "--submit requires --submit-transfer when the canonical fiat plan has payable outputs"
         );
+    }
+
+    if epoch == 508 && args.tx.submit && plan.already_settled.is_none() {
+        for output in plan.payload["outputs"]
+            .as_array()
+            .context("missing FIAT 508 outputs")?
+        {
+            if output["role"] == "provider" {
+                require_fiat_508_sender_open(&rpc, output).await?;
+            }
+        }
     }
 
     let mut initial_attempt_quotes = Vec::<Option<StripeFxQuote>>::new();
@@ -37950,6 +38012,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                     match attempt_record.get("status").and_then(Value::as_str) {
                         Some("prepared") => {
                             match execute_canonical_stripe_attempt(
+                                Some(&rpc),
                                 client,
                                 api_base_url,
                                 secret_key,
@@ -57869,6 +57932,7 @@ fn within_stripe_attempt_window(prepared_at: u64, now: u64) -> bool {
 }
 
 async fn execute_canonical_stripe_attempt(
+    rpc: Option<&PeerRpcClient>,
     client: &reqwest::Client,
     api_base_url: &str,
     secret_key: &str,
@@ -58045,6 +58109,13 @@ async fn execute_canonical_stripe_attempt(
             // POST is safe only while Stripe still deduplicates this attempt.
             if !within_stripe_attempt_window(prepared_at, now_unix_seconds()?) {
                 return Ok(CanonicalFiatAttemptExecution::NeedsReconciliation);
+            }
+            if epoch == 508 {
+                let rpc = rpc.context("FIAT 508 requires a confirmed overlap check")?;
+                require_fiat_508_sender_open(rpc, output).await?;
+                if !within_stripe_attempt_window(prepared_at, now_unix_seconds()?) {
+                    return Ok(CanonicalFiatAttemptExecution::NeedsReconciliation);
+                }
             }
             let response = client
                 .post(format!(
@@ -108630,7 +108701,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 30);
+        assert_eq!(CONTRACT_VERSION, 31);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 12);
         assert_eq!(SPEND_VOUCHER_SCHEMA_VERSION, 11);
