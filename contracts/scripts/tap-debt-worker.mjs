@@ -8,7 +8,7 @@ import { ZeroHash } from 'ethers';
 import { safeErrorMessage } from './safe-output.mjs';
 import { digestFile, durableWrite, holdTapLock, indexedDebt, readDraftFile, registerFencedDebt, syncDirectory, tapPlanSource, verifyTapSourceSeal } from './tap-draft-files.mjs';
 import { confirmedTapContract, MAINNET_POOL, MAINNET_TOKEN, tapContractAt, verifyPriorTapClaims } from './tap-liability-sweep.mjs';
-import { connectTapSettlementPool, cumulativeTapRefunds, lookupProposedRoot, projectTapRefunds, rollPreparedTapSettlement, rollTapAuAlternative, settlementBundleSha256,
+import { connectTapSettlementPool, cumulativeTapRefunds, lookupProposedRoot, observePreparedTapCheckpoint, projectTapRefunds, rollPreparedTapSettlement, rollTapAuAlternative, settlementBundleSha256,
   submitCanonicalTapPreparationPlan, tapPreparationAdminSignerFromEnv } from './tap-settlement-roller.mjs';
 import { fencedSourceEvidence } from './tap-draft-recovery.mjs';
 import { tapRootEventReader } from './tap-root-events.mjs';
@@ -81,7 +81,20 @@ async function sourceEvidence({ spool, name, ticket, cert, bundle, contract, poo
     opening = cp;
     prior = { ...value, providers: cp.provider_entries, tap_settlement_checkpoint: value };
   }
-  const evidence = cert.debt_evidence ?? await fencedSourceEvidence({ bundle, prior, companions, peerRpcUrl, fetchImpl,
+  let evidence = cert.debt_evidence;
+  const journal = companions['.prepare-intent.json'];
+  if (journal && !companions['.sealed-plan.json'] && bundle.at === cert.at && bundle.tap_liability_sweep) {
+    const { rebuildPreparedTapSource } = await import('./tap-prepared-debt.mjs');
+    const rebuilt = await rebuildPreparedTapSource({ contract: oldContract, sealed: json(journal),
+      originalBundle: bundle, openingEpoch: basis.epoch, frozenFetch: frozenStateFetch(peerRpcUrl, fetchImpl) });
+    const source = tapPlanSource(rebuilt);
+    if (evidence) assert.deepEqual(evidence.source, source);
+    else {
+      const rows = await Promise.all(rebuilt.preparations.map(p => oldContract.get(oldContract.payoutPreparationRecordKey('tap', p.economic_op_id))));
+      evidence = { source, opening_checkpoint: opening, records: rows.filter(Boolean) };
+    }
+  }
+  evidence ??= await fencedSourceEvidence({ bundle, prior, companions, peerRpcUrl, fetchImpl,
     proof: { contract: oldContract, basis, at: cert.at, lock: json(archive + '.tap-rate.json'), reservations: cert.observed_liability_preparations } });
   assert.deepEqual(evidence.opening_checkpoint, opening);
   const source = evidence.source, intent = source.intent;
@@ -106,6 +119,14 @@ async function sourceEvidence({ spool, name, ticket, cert, bundle, contract, poo
     checked(await oldContract.guardianRequireHistoricalTapRateLock(intent.tap_rate_lock, selected.timestamp));
   }
   return { source, evidence, plan, archive };
+}
+
+function frozenStateFetch(peerRpcUrl, fetchImpl) {
+  return (url, init) => {
+    const target = new URL('state', peerRpcUrl.replace(/\/+$/, '') + '/');
+    target.search = url.search;
+    return fetchImpl(target, init);
+  };
 }
 
 // The rate accepted for an already pending or mined effect must precede its
@@ -147,9 +168,12 @@ async function epochProofRead(cp, read, method, params) {
 
 async function postFeature(peerRpcUrl, fetchImpl, feature) {
   const url = new URL('contract/feature', peerRpcUrl.replace(/\/+$/, '') + '/');
+  const body = JSON.stringify({ feature: 'mayhem', ...feature });
   const res = await fetchImpl(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30_000),
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ feature: 'mayhem', ...feature }) });
-  assert(res.ok && (await res.json()).ok === true, 'TAP debt Core submission was not acknowledged');
+    headers: { 'content-type': 'application/json' }, body });
+  const result = res.ok ? await res.json() : null;
+  assert(res.ok && result?.ok === true,
+    `Core did not acknowledge ${feature.value.stage ?? feature.value.op} (${Buffer.byteLength(body)} bytes, HTTP ${res.status})`);
 }
 
 function verifyCheckpoint(record, cp, admin) {
@@ -236,11 +260,7 @@ async function restoreOriginalPrefix({ ctx, contract, source, cert, archive, bun
   const { restoreTapDebtPrefix } = await import('./tap-prepared-debt.mjs');
   const { features } = await restoreTapDebtPrefix({ contract, source, sealed: ids, originalBundle: bundle,
     openingEpoch: cert.pool_basis.epoch, basisEpoch, previousEpoch, skippedEpochProof: proof,
-    sign: message => adminSigner.sign(message), frozenFetch: (url, init) => {
-      const target = new URL('state', peerRpcUrl.replace(/\/+$/, '') + '/');
-      target.search = url.search;
-      return fetchImpl(target, init);
-    } });
+    sign: message => adminSigner.sign(message), frozenFetch: frozenStateFetch(peerRpcUrl, fetchImpl) });
   assert(features.length, 'No missing original preparation at the pinned checkout');
   await postFeature(peerRpcUrl, fetchImpl, features[0]);
   return 'original preparation submitted';
@@ -320,13 +340,16 @@ async function dispatchDebt(ctx, name, ticket) {
   const intent = source.intent;
   const read = (method, params) => pool.runner.provider.send(method, params);
   const latestFile = path.join(spool, 'processed/latest.json');
-  const prior = exists(latestFile) ? json(latestFile) : null;
+  let prior = exists(latestFile) ? json(latestFile) : null;
   const state = await contract.get('settle/targeted/tap/state/1/' + MAINNET_POOL);
   const basisEpoch = state?.last_epoch ?? 0;
   Object.assign(ctx.facts, { signed_length: contract.signedLength, original_epoch: intent.epoch,
     original_root: intent.root, original_preparation: source.root_preparation_id,
     observed_reservations: evidence.records.map(r => r.economic_op_id), opening_epoch: cert.pool_basis.epoch,
     basis_epoch: basisEpoch, basis_root: state?.last_root ?? ZeroHash });
+  const q = loadCursor(spool)?.refund_queue;
+  if (cert.refunds.length) Object.assign(ctx.facts, { refund_source_index: cert.refund_queue.tail,
+    refund_head: q?.head ?? 0, refund_offset: q?.offset ?? 0, refund_input_count: cert.refunds.length });
   const slotFile = path.join(spool, 'debt/pool-slot.json');
   const resultFile = base + '.result.json';
   const transferFile = base + '.transfer.json';
@@ -360,7 +383,8 @@ async function dispatchDebt(ctx, name, ticket) {
       }
       const resolution = await contract.get(resolutionKey(source));
       assert(admitted.status === 'settled' && resolution?.candidate_submission === candidate.feature.key &&
-        resolution.root_preparation_id === candidate_id && resolution.submission === json(winnerFile).key,
+        resolution.root_preparation_id === candidate_id && resolution.epoch === cp.epoch &&
+        (!exists(winnerFile) || resolution.submission === json(winnerFile).key),
         'Missing Core resolution for the finalized AU winner');
     } else {
       assert(cp.root_preparation_id === root_preparation_id ||
@@ -376,7 +400,10 @@ async function dispatchDebt(ctx, name, ticket) {
     const history = path.join(spool, 'processed', nameFor(cp.epoch, cp.epoch_apply_hash) + '.debt-settlement.json');
     immutable(history, report);
     if (!prior || prior.epoch < cp.epoch) durableWrite(latestFile, report, true);
-    else if (prior.epoch === cp.epoch) assert.deepEqual(prior, report);
+    else if (prior.epoch === cp.epoch) {
+      assert.deepEqual(prior.tap_settlement_checkpoint, cp, 'Conflicting reconciled TAP predecessor');
+      await verifyPriorTapClaims(contract, prior);
+    }
     immutable(finished, { source: source.root_preparation_id, epoch: cp.epoch, root: cp.root,
       checkpoint: cp.root_preparation_id, anchor: cp.epoch_apply_hash, fence_sha256: ticket.proof_sha256, report_sha256: digestFile(history), refund });
     return 'settled';
@@ -407,8 +434,59 @@ async function dispatchDebt(ctx, name, ticket) {
     originalId: plan.root_preparation_id, at, proposal });
   const rateRecordKey = (await contract.get('tap/rate/latest'))?.updated_at;
   Object.assign(ctx.facts, { head: head.hash, financial_at: head.timestamp, observed_rate_key: rateRecordKey ?? null });
+  // An original proposal may appear long after a lost response. Its mined
+  // clock decides which operation is legal, including if a third party has
+  // already executed it. Never propose another root to repair that outcome.
+  let originalSettled = false;
+  if (!submitted && posted === intent.root) {
+    const { postedTapDebtClaims, preparedTapReplay } = await import('./tap-prepared-debt.mjs');
+    const savedFile = base + '.posted-claims.json';
+    let observed;
+    try { observed = await observePreparedTapCheckpoint({ pool, plan: original, rootEventReader: await eventsFor(base, pool, intent) }); }
+    catch (error) { if (error.code === 'TAP_FINALITY_PENDING') return 'finality'; throw error; }
+    const accepted = await contract.get(recordKey(intent.epoch));
+    const preselected = await proposalRate({ contract, base, pool, originalId: source.root_preparation_id,
+      at: observed.proposal_block_timestamp, proposal: await lookupProposedRoot({ pool, epoch: intent.epoch, root: intent.root,
+        cumulativeSpentWei: BigInt(intent.cumulative_spent_wei), tapRateLock: intent.tap_rate_lock, throughBlock: head.number,
+        rootEventReader: await eventsFor(base, pool, intent) }) });
+    try {
+      const replay = await preparedTapReplay({ contract, source, financialAt: observed.proposal_block_timestamp, rateRecordKey: preselected });
+      originalSettled = Boolean(replay.checkpoint);
+    } catch (error) {
+      if (!(changesAmount(error) || /oracle is stale|TAP quote renewal requires|TAP renewal lacks/.test(error.message))) throw error;
+      const originalRate = await contract.guardianRequireHistoricalTapRateLock(intent.tap_rate_lock, observed.proposal_block_timestamp);
+      if (accepted || originalRate?.message !== 'Guardian TAP settlement rate invariant failed: oracle is stale.') throw error;
+      const saved = exists(savedFile) ? json(savedFile) : null;
+      const cp = saved?.checkpoint ?? observed;
+      assert.deepEqual({ ...observed, finalized_block_number: cp.finalized_block_number,
+        confirmation_depth: cp.confirmation_depth }, cp, 'Conflicting historical TAP execution evidence');
+      const { collectTapEpochProof } = await import('./tap-prepared-debt.mjs');
+      const proof = saved?.execution_proof ?? await collectTapEpochProof({ checkpoint: cp, source, openingCheckpoint: evidence.opening_checkpoint,
+        read: (method, params) => epochProofRead(cp, read, method, params) });
+      const claims = await postedTapDebtClaims({ contract, source, checkpoint: cp, openingEpoch: cert.pool_basis.epoch, executionProof: proof });
+      immutable(savedFile, { checkpoint: cp, execution_proof: proof, ...claims });
+      Object.assign(ctx.facts, { posted_epoch: cp.epoch, posted_root: cp.root, execution_tx: cp.execution_tx,
+        proposal_at: cp.proposal_block_timestamp, original_quote: claims.original_quote, reason: safeErrorMessage(error) });
+      if (exists(slotFile) && json(slotFile).name === name) { fs.unlinkSync(slotFile); syncDirectory(path.dirname(slotFile)); }
+      return 'posted original claims';
+    }
+  }
+  if (originalSettled && basisEpoch > intent.epoch) {
+    assert(prior?.epoch === basisEpoch && prior.root === state.last_root, 'Later checkpoint has not reached the local spool');
+    await verifyPriorTapClaims(contract, prior);
+    const record = await contract.get(recordKey(intent.epoch));
+    const { type, settled_by, settled_by_role, ...cp } = record;
+    verifyCheckpoint(record, cp, admin);
+    await verifyFinalizedTapProposal({ report: { ...cp, tap_settlement_checkpoint: cp }, chainId: 1, pool: MAINNET_POOL, read });
+    const file = base + '.confirmed-checkpoint.json';
+    immutable(file, cp);
+    const refund = refundDisposition({ cert, source, bundle, archive, prior: evidence.opening_checkpoint, plan: original, spool, evidence });
+    immutable(finished, { source: source.root_preparation_id, epoch: cp.epoch, root: cp.root, checkpoint: cp.root_preparation_id,
+      anchor: cp.epoch_apply_hash, fence_sha256: ticket.proof_sha256, checkpoint_sha256: digestFile(file), refund });
+    return 'settled';
+  }
   let plan = original, paymentBundle = bundle;
-  if (basisEpoch > intent.epoch || submitted) {
+  if ((basisEpoch > intent.epoch && !originalSettled) || submitted) {
     let transfer = submitted;
     if (!transfer) {
       const target = loadCursor(spool);
@@ -461,9 +539,15 @@ async function dispatchDebt(ctx, name, ticket) {
     plan = confirmed.plan;
     paymentBundle = transfer.bundle;
   } else {
-    assert(basisEpoch === cert.pool_basis.epoch, 'Original TAP predecessor changed');
+    const installedWinner = offer && (await contract.get(recordKey(intent.epoch)))?.root_preparation_id === offer.plan.root_preparation_id;
+    assert(basisEpoch === cert.pool_basis.epoch || originalSettled || installedWinner,
+      'Original TAP predecessor changed');
   }
   if (prior) await verifyPriorTapClaims(contract, prior);
+  if (prior?.epoch >= plan.intent.epoch && !submitted) {
+    const opening = evidence.opening_checkpoint;
+    prior = opening ? { ...opening, providers: opening.provider_entries, tap_settlement_checkpoint: opening } : null;
+  }
   const have = await Promise.all(plan.preparations.map(p => contract.get(contract.payoutPreparationRecordKey('tap', p.economic_op_id))));
   if (have.some(row => row === null)) {
     assert(plan === original && have.some(row => row?.consumed === false), 'Missing original TAP reservations');
@@ -579,7 +663,7 @@ export async function dispatchFencedTapTick({ spool, payout, peerRpcUrl, fetchIm
   } finally { await ctx.close?.(); }
 }
 
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const [spool, payoutState, peerRpcUrl] = process.argv.slice(2);
     holdTapLock(path.join(spool, 'roller.lock'), 8);

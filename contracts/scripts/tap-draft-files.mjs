@@ -274,8 +274,14 @@ export function nextRefunds(spool, q) {
     if (marker.refund) {
       assert(marker.refund.index === index && Array.isArray(marker.refund.unpaid) &&
         marker.fence_sha256 === ticket.proof_sha256, 'Conflicting TAP refund recovery');
-      const paid = path.join(spool, 'processed', 'epoch-' + marker.epoch + '-' + marker.anchor + '.debt-settlement.json');
-      assert(digestFile(paid) === marker.report_sha256, 'Recovered refund checkpoint changed');
+      if (marker.checkpoint_sha256) {
+        const file = path.join(spool, 'debt', name + '.confirmed-checkpoint.json');
+        assert(digestFile(file) === marker.checkpoint_sha256 && JSON.parse(readDraftFile(file)).root_preparation_id === marker.checkpoint,
+          'Conflicting reconciled historical refund evidence');
+      } else {
+        const paid = path.join(spool, 'processed', 'epoch-' + marker.epoch + '-' + marker.anchor + '.debt-settlement.json');
+        assert(digestFile(paid) === marker.report_sha256, 'Recovered refund checkpoint changed');
+      }
       recovered = marker.checkpoint;
       rows = marker.refund.unpaid;
       assert(q.offset === 0 || q.offset < rows.length);

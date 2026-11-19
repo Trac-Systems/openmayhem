@@ -14,7 +14,7 @@ import { proveUnpreparedTapDraft, recoverDraft } from '../scripts/tap-draft-reco
 import { runDebtTimer } from './helpers/tap-debt-timer.mjs';
 import { dispatchFencedTapTick } from '../scripts/tap-debt-worker.mjs';
 import { confirmedTapContract, preflightTapSweepPreparations, verifyPriorTapClaims } from '../scripts/tap-liability-sweep.mjs';
-import { buildCanonicalTapPreparationPlan, guardianPreSignReport, projectTapRefunds, rollTapSettlement,
+import { buildCanonicalTapPreparationPlan, guardianPreSignReport, observePreparedTapCheckpoint, projectTapRefunds, rollTapSettlement,
   resolveTapSettlementPayoutMinimum, resolveTargetedTapPayoutsFromLedger, submitCanonicalTapPreparationPlan, tapRateRecordToLock } from '../scripts/tap-settlement-roller.mjs';
 import { distribution } from '../scripts/merkle.mjs';
 import { oracleRecord } from './helpers/tap-pricing.mjs';
@@ -731,6 +731,28 @@ test('a confirmed reservation is fenced after expiry and restart while a newer p
   assert.equal(await eth.token.balanceOf(addr(9)), 12n);
   finishPage(after, refundReport, 'settled');
   assert.equal(nextRefunds(f.spool, loadCursor(f.spool).refund_queue), null);
+  // This archive predates whole-plan refund assignment. A disjoint root has
+  // already credited and paid both original AU inputs at its own quote.
+  write(path.join(f.spool, 'processed/latest.json'), refundReport);
+  f.epoch(7);
+  await oracle(rateValue);
+  const last = await f.freeze(7);
+  const empty = await run(last);
+  finishPage(last, empty, 'carry');
+  const tick = () => runDebtTimer({ ...f, ...eth, adminSigner });
+  assert.equal(await tick(), 'historical checkpoint submitted');
+  assert.equal(await tick(), 'historical checkpoint confirmed');
+  await assert.rejects(tick(), /intervening entitlement|TAP (epoch|pool|Ethereum)|Merkle|evidence proof|state proof/);
+  const held = read(path.join(f.spool, 'debt', work.name + '.status.json'));
+  assert.equal(held.status, 'pending');
+  assert.equal(held.original_preparation, journal.root_preparation_id);
+  assert.equal(held.history_next_epoch, 6);
+  assert(held.refund_head >= held.refund_source_index);
+  assert.equal(held.history_execution_block, refundCheckpoint.execution_block_hash);
+  assert.equal(await eth.token.balanceOf(addr(9)), 12n);
+  assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, 2);
+  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+  assert.equal(fs.existsSync(path.join(f.spool, 'debt/pool-slot.json')), false);
   assert.deepEqual(rows(), reserved);
 });
 
@@ -841,6 +863,8 @@ test('a v30 pre-journal mixed receipt job with a lost Core acknowledgement requi
 for (const [mode, name] of [
   ['immutable', 'unattended timer replays the sole frozen provider, restores the mined quote and closes paid refund inputs'],
   ['alternative', 'unattended timer settles a repriced AU winner at the original epoch without other business'],
+  ['external', 'unattended timer adopts the positive original Core checkpoint before its local report exists'],
+  ['posted', 'unattended timer publishes verified claim proofs for an already executed out-of-policy original'],
   ['original-wins', 'unattended timer reconciles the delayed original send after a competing AU offer'],
   ['prefix', 'unattended timer restores the signed v30 prefix after lost acknowledgement with no submission journal'],
 ]) test(name, async t => {
@@ -893,7 +917,7 @@ for (const [mode, name] of [
   const sealed = read(archive + '.draft.json').debt_evidence.source;
   const reservation = id => f.state.get(f.reducer.payoutPreparationRecordKey('tap', id));
   const prefix = structuredClone(reservation(sealed.preparation_ids[0]));
-  let lose = false, intercept = delayed;
+  let lose = false, intercept = delayed || mode === 'posted';
   const held = [];
   const transport = { send: async (method, params) => {
     if (intercept && method === 'eth_sendTransaction' &&
@@ -911,6 +935,34 @@ for (const [mode, name] of [
       if (lose && o?.method === 'POST') { lose = false; throw Error('accepted feature, reply lost'); }
       return response;
     } });
+  if (mode === 'posted') {
+    await assert.rejects(tick(), /TAP debt recovery will retry/);
+    assert.equal(held.length, 1);
+    intercept = false;
+    await eth.jump(2701);
+    await provider.send('eth_sendTransaction', held[0]);
+    await assert.rejects(tick(), /oracle is stale/);
+    await eth.jump(3601);
+    await (await pool.executeRoot()).wait();
+    for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+    assert.equal(await tick(), 'posted original claims');
+    assert.equal(await tick(), 'posted original claims');
+    const proof = read(path.join(f.spool, 'debt', work.name + '.posted-claims.json'));
+    assert.equal(proof.original_quote, 'expired');
+    assert.equal(proof.checkpoint.root, sealed.intent.root);
+    assert.equal(proof.checkpoint.root_preparation_id, sealed.root_preparation_id);
+    for (const claim of proof.claims) {
+      await (await pool.claim(claim.epoch, claim.account, claim.cumulative_wei, claim.proof)).wait();
+      await assert.rejects(pool.claim.staticCall(claim.epoch, claim.account, claim.cumulative_wei, claim.proof));
+    }
+    assert.equal(await eth.token.balanceOf(addr(1)), 50n);
+    assert.equal(await eth.token.balanceOf(addr(9)), 4n);
+    assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+    assert.equal(reservation(sealed.root_preparation_id).consumed, false);
+    assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 1);
+    assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, 1);
+    return;
+  }
   if (delayed) {
     await assert.rejects(tick(), /TAP debt recovery will retry/);
     await eth.jump(1);
@@ -945,16 +997,28 @@ for (const [mode, name] of [
     assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
   }
   assert.equal(await tick(), 'governance delay');
+  const selectedRate = f.state.get('tap/rate/latest').updated_at;
   assert.equal(await tick(), 'governance delay');
   await eth.jump(3601);
   await quote(rateValue * 3n); // later prices cannot overwrite the mined selection
   assert.equal(await tick(), 'finality');
   for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+  if (mode === 'external') {
+    const cp = await observePreparedTapCheckpoint({ pool, plan: sealed });
+    cp.proposal_rate_record_key = selectedRate;
+    const response = await executeFeature(f.reducer, f.storage, 'mayhem_feature',
+      await f.reducer.targetedTapSettlementFeatureKey(cp), cp, signer.publicKey);
+    assert.equal(response.ok, true, response.message);
+    f.seal();
+    await provider.send('evm_mine', []); // report must retain Core's original finality depth
+  }
   assert.equal(await tick(), 'finalized');
-  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
-  assert.equal(reservation(sealed.root_preparation_id).consumed, false);
-  lose = true;
-  await assert.rejects(tick(), /accepted feature, reply lost/);
+  if (mode !== 'external') {
+    assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+    assert.equal(reservation(sealed.root_preparation_id).consumed, false);
+    lose = true;
+    await assert.rejects(tick(), /accepted feature, reply lost/);
+  }
   assert.equal(await tick(), 'settled');
   assert.equal(await tick(), 'idle');
   const report = read(path.join(f.spool, 'processed/latest.json'));

@@ -578,7 +578,7 @@ export async function confirmTapDebtRecovery({ contract, feature, plan }) {
   return { status: 'prepared', plan: expected };
 }
 
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const [mode, inputs, records] = process.argv.slice(2);
     assert(['posted-claims','certify','rebuild','replay','restore-prefix','successor','confirm','offer-au','confirm-au','settle-au'].includes(mode) && inputs && records,

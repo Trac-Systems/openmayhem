@@ -2097,6 +2097,16 @@ function tapCheckpointPayload({
   };
 }
 
+// Read-only evidence for a posted root. It cannot authorize a proposal or a
+// Core checkpoint by itself; the debt operation checks its financial policy.
+export async function observePreparedTapCheckpoint({ pool, plan, rootEventReader }) {
+  const { epoch, root, cumulative_spent_wei, tap_rate_lock, epoch_apply_hash } = plan.intent;
+  const rootConfirmation = await confirmedRootEventEvidence({ pool, epoch, root, cumulativeSpentWei: BigInt(cumulative_spent_wei),
+    tapRateLock: tap_rate_lock, rootEventReader });
+  return tapCheckpointPayload({ epoch, epochApplyHash: epoch_apply_hash, tapRateLock: tap_rate_lock,
+    rootConfirmation, preparationPlan: plan });
+}
+
 function matchesConfirmedPriorRoot(prior, tapRateLock, chainRoot, chainEpoch, chainSpentWei) {
   const checkpoint = prior?.tap_settlement_checkpoint;
   return checkpoint && tapRateLock && chainRoot && prior.root === chainRoot && checkpoint.root === chainRoot &&
@@ -2396,17 +2406,19 @@ async function rollSettlement(options, prepared, candidate) {
     throw new Error('TAP pool or network differs from its rate lock');
   }
   const poolBasis = { epoch: chainEpoch, root: chainRoot, spent: chainSpentWei };
-  let checkpointFields;
+  let checkpointFields, reconciledCheckpoint;
   const checkPrice = async (financialAt, basis, proposal) => {
     if (candidate) {
       const { verifyTapAuAlternativeFinancialPolicy } = await import('./tap-prepared-debt.mjs');
       const result = await verifyTapAuAlternativeFinancialPolicy({ candidate, financialAt, peerRpcUrl, fetchImpl, poolBasis: basis });
-      if (result.status !== 'authorized') throw new Error('TAP competing outcome already reconciled');
+      if (result.status === 'settled' && rootAlreadyPosted && basis === undefined) reconciledCheckpoint = result.checkpoint;
+      else if (result.status !== 'authorized') throw new Error('TAP competing outcome already reconciled');
     } else if (prepared) {
       const { verifyPreparedTapFinancialPolicy } = await import('./tap-prepared-debt.mjs');
       const auth = await verifyPreparedTapFinancialPolicy({ source: prepared, financialAt, peerRpcUrl, fetchImpl,
         poolBasis: basis, rateRecordKey: await options.proposalRateAt(financialAt, proposal) });
       checkpointFields = auth.checkpoint_fields;
+      reconciledCheckpoint = auth.checkpoint;
     } else {
       await verifyTapFinancialPolicy({ intent: preparationPlan.intent, financialAt, peerRpcUrl, fetchImpl, poolBasis: basis });
     }
@@ -2457,10 +2469,23 @@ async function rollSettlement(options, prepared, candidate) {
   let proposeRootDryRun = null;
   let executeRootDryRun = null;
 
+  const candidateNonce = async () => {
+    const { screenTapAuProposal } = await import('./tap-prepared-debt.mjs');
+    const admitted = await screenTapAuProposal({ candidate, pool, peerRpcUrl, fetchImpl });
+    const p = admitted.proposal;
+    if (admitted.status !== 'ready' || p.merkleRoot !== expectedRoot || p.newEpoch !== screen.epoch ||
+        p.newCumulativeSpent !== String(expectedSpentWei) || p.previousEpoch !== screen.prev_epoch ||
+        p.previousCumulativeSpent !== String(chainSpentWei) || admitted.pending_refund_wei !== settlement.pending_refund_wei) {
+      throw new Error('TAP conditional proposal differs from the independently screened pool basis');
+    }
+    return BigInt(p.nonce);
+  };
+
   if (pool && !rootAlreadyPosted && !pendingRoot) {
     if (!ownerSigner) throw new Error('Missing TAP settlement owner signer');
     if (!governanceSigner) throw new Error('Missing independent TAP governance signer');
-    if (prepared) proposalNonce = await pool.governanceNonce();
+    if (candidate) proposalNonce = await candidateNonce();
+    else if (prepared) proposalNonce = await pool.governanceNonce();
     governanceSignature = await signRootProposal({
       nonce: proposalNonce,
       signer: governanceSigner,
@@ -2590,11 +2615,12 @@ async function rollSettlement(options, prepared, candidate) {
   if (post && pool && candidate) {
     const { confirmTapAuAlternative } = await import('./tap-prepared-debt.mjs');
     const result = await confirmTapAuAlternative({ contract: await confirmedTapContract(peerRpcUrl, fetchImpl), candidate });
-    if (result.status !== 'authorized' || result.plan.root_preparation_id !== preparationPlan.root_preparation_id) {
+    if (!(result.status === 'authorized' || (result.status === 'settled' && rootAlreadyPosted && reconciledCheckpoint)) ||
+        result.plan.root_preparation_id !== preparationPlan.root_preparation_id) {
       throw new Error('TAP conditional authorization is incomplete or superseded');
     }
     authorizedCandidate = candidate.feature.key;
-  } else if (post && pool) {
+  } else if (post && pool && !(rootAlreadyPosted && reconciledCheckpoint)) {
     if (typeof canonicalPreparationSubmitter !== 'function') {
       throw new Error(
         'TAP settlement broadcast requires canonical payout preparation submission'
@@ -2631,7 +2657,7 @@ async function rollSettlement(options, prepared, candidate) {
     preparation_ids: preparationPlan.preparation_ids,
     root_preparation_id: preparationPlan.root_preparation_id,
     external_effect_ids: preparationPlan.external_effect_ids,
-    canonical_preparation_confirmed: canonicalPreparation !== null,
+    canonical_preparation_confirmed: canonicalPreparation !== null || Boolean(!candidate && reconciledCheckpoint),
     ...(authorizedCandidate && { conditional_authorization: authorizedCandidate }),
     epoch_apply_hash: preparationPlan.intent.epoch_apply_hash,
     tap_rate_lock: preparationPlan.intent.tap_rate_lock,
@@ -2650,6 +2676,7 @@ async function rollSettlement(options, prepared, candidate) {
       // proposing, then use the actual mined proposal before executing.
       const head = await currentPoolBlock(pool);
       await checkPrice(head.timestamp, poolBasis);
+      if (candidate && await candidateNonce() !== proposalNonce) throw new Error('TAP conditional governance nonce changed');
       await options.beforeProposal?.({ nonce: String(proposalNonce), block: { number: head.number, hash: head.hash,
         timestamp: head.timestamp }, rate_key: checkpointFields?.proposal_rate_record_key ?? null });
       const sent = await writable.proposeRoot(
@@ -2908,7 +2935,7 @@ async function rollSettlement(options, prepared, candidate) {
       preparationPlan,
     });
     Object.assign(tapSettlementCheckpoint, checkpointFields);
-    const archived = prior?.tap_settlement_checkpoint;
+    const archived = reconciledCheckpoint ?? prior?.tap_settlement_checkpoint;
     if (archived?.epoch === screen.epoch) {
       // More confirmations on replay must not create a second Core submission
       // identity. Revalidate the archived proof against the observed chain.
