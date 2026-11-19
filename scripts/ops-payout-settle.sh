@@ -2767,7 +2767,8 @@ def confirmed_record(path, expected_key):
         or record.get("confirmed") is not True
         or not isinstance(record.get("signed_length"), int)
         or isinstance(record.get("signed_length"), bool)
-        or record["signed_length"] < 0
+        or record["signed_length"] < 1
+        or "value" not in record
     ):
         raise SystemExit(f"{expected_key} is not confirmed canonical state")
     return record
@@ -2846,40 +2847,17 @@ PY
   esac
 }
 
+sync_payout_queue() {
+  python3 "$SOURCE_DIR/scripts/ops/payout-work-queue.py" sync "$1"
+}
+
 resume_prior_rail_work() {
   local rail="$1"
   [[ "${MAYHEM_PAYOUT_RESUME_PRIOR:-0}" != "1" ]] || return 0
 
-  local prior_dir prior_epoch resume_result supersede_result
+  local prior_dir prior_epoch resume_result supersede_result has_prior
   local resume_list="$work_dir/$rail-prior-payout-work.list"
-  if ! python3 - "$STATE_DIR/payout" "$work_dir" "$canonical_applied_epoch" "$rail" \
-    >"$resume_list.tmp" <<'PY'
-import os, re, sys
-root, current, canonical_epoch, rail = (
-    sys.argv[1],
-    os.path.abspath(sys.argv[2]),
-    int(sys.argv[3]),
-    sys.argv[4],
-)
-pattern = re.compile(r"epoch-([1-9][0-9]*)-([0-9a-f]{64})")
-pending = []
-for name in os.listdir(root):
-    match = pattern.fullmatch(name)
-    if not match:
-        continue
-    path = os.path.abspath(os.path.join(root, name))
-    if path == current:
-        continue
-    if os.path.islink(path) or not os.path.isdir(path):
-        raise SystemExit(f"payout work entry is not a real directory: {path}")
-    epoch = int(match.group(1))
-    if epoch > canonical_epoch:
-        raise SystemExit(f"future payout work directory is unsafe: {path}")
-    if not os.path.isfile(os.path.join(path, f"{rail}.complete")):
-        pending.append((epoch, match.group(2), path))
-for _, _, path in sorted(pending):
-    sys.stdout.buffer.write(os.fsencode(path) + b"\0")
-PY
+  if ! python3 "$SOURCE_DIR/scripts/ops/payout-work-queue.py" select "$work_dir" "$rail" >"$resume_list.tmp"
   then
     rm -f "$resume_list.tmp"
     echo "abort: could not enumerate retained payout operations safely" >&2
@@ -2894,6 +2872,7 @@ PY
       supersede_result=0
       supersede_unplanned_prior_rail_work "$rail" "$prior_dir" "$prior_epoch" || supersede_result=$?
       if (( supersede_result == 0 )); then
+        sync_payout_queue "$prior_dir" || return 1
         continue
       elif (( supersede_result != 3 )); then
         return 1
@@ -2905,16 +2884,26 @@ PY
       MAYHEM_PAYOUT_RESUME_RAIL="$rail" \
       MAYHEM_PAYOUT_RESUME_WORK_DIR="$prior_dir" \
       bash "$0" "$prior_epoch" || resume_result=$?
+    sync_payout_queue "$prior_dir" || return 1
     if (( resume_result != 0 )); then
-      echo "abort: prior payout work remains failed for $rail at $prior_dir" >&2
-      return 1
-    fi
-    if [[ ! -f "$prior_dir/$rail.complete" ]]; then
-      echo "recovery: prior $rail payout work remains pending at $prior_dir; current $rail liabilities deferred"
-      return 2
+      if [[ "$rail" == tap ]]; then
+        echo "abort: prior payout work remains failed for tap at $prior_dir" >&2
+        return 1
+      fi
+      echo "alert: retained $rail payout attempt failed for epoch $prior_epoch; independently reserved outputs remain eligible" >&2
+      prior_failed=1
+    elif [[ ! -f "$prior_dir/$rail.complete" ]]; then
+      echo "recovery: prior $rail work for epoch $prior_epoch is queued for retry"
+      if [[ "$rail" == tap ]]; then return 2; fi
+      prior_pending=1
     fi
   done <"$resume_list"
   rm -f "$resume_list"
+  if [[ "$rail" == tap ]]; then
+    has_prior="$(python3 "$SOURCE_DIR/scripts/ops/payout-work-queue.py" has-prior "$work_dir" tap)" || return 1
+    if [[ "$has_prior" == yes ]]; then return 2; fi
+  fi
+  return 0
 }
 
 resume_only_rail="${MAYHEM_PAYOUT_RESUME_RAIL:-}"
@@ -2934,6 +2923,11 @@ fi
 
 failed=0
 pending=0
+prior_failed=0
+prior_pending=0
+# Register before the first provider/processor effect. The lock spans the journal,
+# the current dispatch and any child that resumes a historical operation.
+sync_payout_queue "$work_dir" || exit 1
 if [[ -z "$resume_only_rail" || "$resume_only_rail" == "fiat" ]]; then
   if [[ "$FIAT_ENABLED" == "1" ]]; then
     fiat_result=0
@@ -3016,6 +3010,8 @@ with open(target, "w") as out:
 PY
 mv "$work_dir/summary.json.tmp" "$work_dir/summary.json"
 
+sync_payout_queue "$work_dir" || exit 1
+
 if [[ -n "$resume_only_rail" ]]; then
   if (( failed != 0 )); then
     echo "epoch $applied_epoch $resume_only_rail payout reconciliation remains incomplete (see $work_dir)" >&2
@@ -3061,3 +3057,10 @@ with open(path, "w") as out:
 PY
 mv "$work_dir/complete.tmp" "$work_dir/complete"
 echo "epoch $applied_epoch payout work reconciled; evidence in $work_dir"
+if (( prior_failed )); then
+  echo "alert: independent historical payout work still needs reconciliation" >&2
+  exit 1
+fi
+if (( prior_pending )); then
+  echo "some historical payouts remain queued; their liabilities remain reserved"
+fi
