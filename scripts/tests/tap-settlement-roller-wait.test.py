@@ -19,7 +19,17 @@ flock() { python3 -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB
 node() { [[ ${1##*/} == mainnet-proof.mjs ]] || exit 90; echo proof >> calls; echo '{}'; }
 timeout() {
   case ${3##*/} in
-    verify-tap-sweep-report.mjs) echo "verify-${!#}" >> calls ;;
+    tap-finalized-proposal.mjs)
+      echo "read-finalized-header" >> calls
+      [[ ! -f refuse-header ]] || return 92
+      echo '{"number":123,"timestamp":9999}' ;;
+    verify-tap-sweep-report.mjs)
+      if [[ $8 == confirmed && $# == 9 ]]; then
+        [[ $(jq -r .number "$9") == 123 ]] || return 93
+        echo verify-confirmed-header >> calls
+      else
+        echo "verify-${!#}" >> calls
+      fi ;;
     tap-settlement-roller.mjs)
       if [[ ${!#} == --confirm ]]; then
         echo confirm >> calls
@@ -115,12 +125,14 @@ class TapPendingWaitTest(unittest.TestCase):
                   "execute_after": deadline, **changes}
         self.write("report.json", json.dumps(report))
 
-    def run_worker(self):
+    def run_worker(self, *, archived=False):
         result = subprocess.run(["bash", WRAPPER], cwd=self.dir, env=self.env, capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.spool / "working/epoch-1.receipts.json").is_file())
-        self.assertEqual(list((self.spool / "processed").iterdir()), [])
+        location = "processed" if archived else "working"
+        self.assertTrue((self.spool / location / "epoch-1.receipts.json").is_file())
+        if not archived:
+            self.assertEqual(list((self.spool / "processed").iterdir()), [])
         return (self.dir / "calls").read_text().splitlines()
 
     def test_full_delay_then_revalidate_changed_root(self):
@@ -189,6 +201,26 @@ class TapPendingWaitTest(unittest.TestCase):
         self.write("cancelled", "")
         self.write("calls", "")
         self.assertEqual(self.run_worker(), ["proof", f"dry {START}", "verify-dry", "poll 30"])
+
+    def test_finalized_checkpoint_requires_fresh_header_before_archiving(self):
+        effect = {"completed": True, "predicted_claimable_wei": "0", "remaining_claimable_wei": "0"}
+        self.write("report.json", json.dumps({"epoch": 1, "root": ROOT, "posted": True,
+            "root_confirmed": True, "execution_tx": "0x" + "d" * 64, "operator_fee": effect,
+            "burn": effect, "tap_settlement_checkpoint": {"epoch": 1}}))
+        working = self.spool / "working"
+        working.mkdir()
+        (working / "epoch-1.tap-rate.json").write_text("{}")
+        self.write("stop", "")
+        self.write("refuse-header", "")
+        calls = self.run_worker()
+        self.assertIn("read-finalized-header", calls)
+        self.assertNotIn("verify-confirmed-header", calls)
+        self.assertFalse((self.spool / "processed/latest.json").exists())
+        (self.dir / "refuse-header").unlink()
+        self.write("calls", "")
+        calls = self.run_worker(archived=True)
+        self.assertIn("verify-confirmed-header", calls)
+        self.assertTrue((self.spool / "processed/epoch-1.receipts.json").is_file())
 
 
 if __name__ == "__main__":

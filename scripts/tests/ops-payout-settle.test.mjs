@@ -1317,8 +1317,8 @@ function runWorker(ctx, extraEnv = {}) {
     env: { ...ctx.env, ...extraEnv },
     encoding: 'utf8',
   });
-  if (result.status !== 0) {
-    const payout = path.join(ctx.state, 'payout');
+  const payout = path.join(ctx.state, 'payout');
+  if (result.status !== 0 && fs.existsSync(payout)) {
     for (const entry of fs.readdirSync(payout, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const dir = path.join(payout, entry.name);

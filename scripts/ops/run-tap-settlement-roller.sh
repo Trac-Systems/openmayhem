@@ -65,8 +65,16 @@ publish_json() {
 }
 
 verify_sweep() {
+  local report="$1" phase="$2"
+  set -- "$bundle" "$report" "$peer_rpc" "$rate_lock" "$phase"
+  if [[ "$phase" == confirmed ]] && jq -e '.tap_settlement_checkpoint != null' "$report" >/dev/null; then
+    local header="$working/$name.proposal-block.json"
+    timeout "$attempt_timeout" node "$repo/contracts/scripts/tap-finalized-proposal.mjs" "$report" >"$header.tmp" || return 1
+    mv "$header.tmp" "$header" || return 1
+    set -- "$@" "$header"
+  fi
   timeout "$attempt_timeout" node "$repo/contracts/scripts/verify-tap-sweep-report.mjs" \
-    "$bundle" "$1" "$peer_rpc" "$rate_lock" "$2"
+    "$@"
 }
 
 wait_for_pending_root() {
@@ -412,5 +420,5 @@ PY
   [[ ! -f "$event_cursor" ]] || mv "$event_cursor" "$processed/"
   mv "$bundle" "$processed/"
   [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
-  rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report"
+  rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report" "$working/$name.proposal-block.json"
 done
