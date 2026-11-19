@@ -2,11 +2,11 @@
   "schema": 1,
   "release_version": "0.2.313",
   "contract_version": 31,
-  "contract_code_sha256": "7288d652c2fb42b5f7cacb92aaf53df3c1159496c47e0b96b60661662f8fa51e",
+  "contract_code_sha256": "34918f90a758653128d970fb587c7cd536fb26a8991030beb0ae9396a03c77d6",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "44606215c3988211e251d9c2850354db02868da2ae1648f7502fad698946050a"
+      "sha256": "0793b7570e40c242097f2e9f92f2da0c9003f2b522adbbd50ae38a0c02f19eb0"
     },
     {
       "path": "contract/fiat-recovery.js",
@@ -66,11 +66,11 @@
     },
     {
       "path": "contract/payout-history.js",
-      "sha256": "b893c1e35e7a7638ef07dad95fd819c84f17446618474c2367c363e214bb30ef"
+      "sha256": "bffc4727ca88caa285a2c7150043372770211648d9a796e033ec3301cd283cf4"
     },
     {
       "path": "contract/payout-reservations.js",
-      "sha256": "0e113f6be6b8c5a250ac3e3bbab689ef884fdf989c3683d9db776d415078e810"
+      "sha256": "cabef0d15db560d37fa1b1f3d6e0a04a24ff01bd10b2e1604946a4c9b6c82139"
     },
     {
       "path": "contract/protocol.js",
