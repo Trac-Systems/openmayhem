@@ -129,9 +129,8 @@ poll_again() {
 }
 
 retry_draft() {
-  if jq -e 'has("tap_liability_sweep")' "$bundle" >/dev/null; then
-    touch "$working/$name.draft-retry"
-  fi
+  # A managed receipt-only job can have a confirmed pre-journal reservation.
+  touch "$working/$name.draft-retry"
   poll_again
 }
 
@@ -153,6 +152,14 @@ while true; do
   fi
 
   name="$(basename "$bundle" .receipts.json)"
+  # The payout worker may have crashed after committing a reservation fence.
+  # Leave its evidence intact (even the dry-run output opened by redirection).
+  if [[ -f "$spool/deferred/next-sweep.json" ]] &&
+      jq -e --arg name "$name" '.reserved == true and
+        ("epoch-" + (.epoch|tostring) + "-" + .anchor == $name)' "$spool/deferred/next-sweep.json" >/dev/null; then
+    poll_again
+    continue
+  fi
   lifecycle_count=0
   for state in ready working processed failed deferred; do
     [[ -f "$spool/$state/$name.receipts.json" ]] || continue

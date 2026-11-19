@@ -135,6 +135,26 @@ class TapPendingWaitTest(unittest.TestCase):
             self.assertEqual(list((self.spool / "processed").iterdir()), [])
         return (self.dir / "calls").read_text().splitlines()
 
+    def test_committed_fence_preserves_working_evidence_after_publisher_crash(self):
+        anchor = "b" * 64
+        name = "epoch-1-" + anchor
+        working = self.spool / "working"
+        working.mkdir()
+        (self.spool / "ready/epoch-1.receipts.json").rename(working / (name + ".receipts.json"))
+        report = working / (name + ".dry-run.json")
+        report.write_bytes(b"original attempt evidence")
+        deferred = self.spool / "deferred"
+        deferred.mkdir()
+        (deferred / "next-sweep.json").write_text(json.dumps({
+            "epoch": 1, "anchor": anchor, "proof_sha256": "c" * 64, "reserved": True,
+        }))
+        self.write("stop", "")
+        completed = subprocess.run(["bash", WRAPPER], cwd=self.dir, env=self.env,
+                                   capture_output=True, text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual((self.dir / "calls").read_text().splitlines(), ["proof", "poll 30"])
+        self.assertEqual(report.read_bytes(), b"original attempt evidence")
+
     def test_full_delay_then_revalidate_changed_root(self):
         self.report(START + 3600)
         calls = self.run_worker()

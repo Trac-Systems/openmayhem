@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { ZeroHash } from 'ethers';
 import { digest as sha, durableWrite, nextRefunds, readHandoff, refundQueue, retainRefundRemainder } from './tap-draft-files.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -38,6 +39,14 @@ export function validateIntent(intent, epoch, anchor) {
     Number.isSafeInteger(intent.params?.fee_bps) && intent.params.fee_bps >= 0 &&
     /^(0|[1-9][0-9]*)$/.test(intent.params?.payout_min_au) && typeof intent.params.payout_min_au === 'string',
   'TAP sweep intent does not match the requested epoch');
+}
+
+export function sweepPointerForIntent(intent) {
+  const pointer = { schema_version: intent.schema_version, signed_length: intent.signed_length, after: intent.after };
+  // A simulation failure is isolated to one row. A reserved provider already
+  // has a Core tail that the v2 selector excludes on a normal-width page.
+  if (intent.handoff && !intent.handoff.reserved) pointer.limit = 1;
+  return pointer;
 }
 
 async function captureIntent({ epoch, anchor, dir, spool, peer, empty, bundle, fetchImpl }) {
@@ -150,7 +159,7 @@ export async function prepareSweep({ epoch, anchor, dir, spool, peer, file, empt
   if (bundle.at !== undefined) assert.equal(bundle.at, intent.at, 'TAP bundle preparation timestamp changed');
   bundle.at = intent.at;
   bundle.params = { ...bundle.params, ...intent.params };
-  bundle.tap_liability_sweep = { schema_version:intent.schema_version, signed_length:intent.signed_length, after:intent.after, ...(intent.handoff && { limit: 1 }) };
+  bundle.tap_liability_sweep = sweepPointerForIntent(intent);
   if (!fs.existsSync(stored)) durableWrite(stored, intent, false);
   durableWrite(file, bundle, true);
 }
@@ -165,12 +174,31 @@ export function validateQueuedSweep(spool, bundle) {
   assert(!handoff || handoff.ticket.epoch < bundle.epoch, 'TAP queued sweep does not follow its draft handoff');
   assert.equal(bundle.tap_liability_sweep.after, handoff ? handoff.proof.retry_after : cursor?.next_after ?? null,
     'TAP queued sweep has a different opening cursor');
-  assert.equal(bundle.tap_liability_sweep.limit, handoff ? 1 : undefined, 'TAP queued sweep has a different page size');
+  if (handoff?.ticket.reserved) assert.equal(bundle.tap_liability_sweep.schema_version, 2, 'TAP fence requires reservation-aware selection');
+  assert.equal(bundle.tap_liability_sweep.limit, handoff && !handoff.ticket.reserved ? 1 : undefined,
+    'TAP queued sweep has a different page size');
   assert.deepEqual(bundle.tap_carried_refunds, batch?.entries, 'TAP queued sweep differs from its unpaid refunds');
   if (batch || Object.hasOwn(bundle, 'tap_refund_queue_version')) {
     assert(bundle.tap_refund_queue_version === 1 && (batch || hasTapRefunds(bundle)), 'Invalid TAP refund queue version');
     assert.deepEqual(bundle.tap_refund_basis, refundBasis(spool), 'TAP queued refund predecessor changed');
   }
+  return batch?.source;
+}
+
+// A reconciled newer root permits revisiting a fenced refund. The immutable
+// per-epoch mapping must independently prove the older root never executed.
+// Check the same finalized block before authorizing a new financial plan.
+export async function verifyQueuedTapSweep(spool, bundle, pool) {
+  const source = validateQueuedSweep(spool, bundle);
+  if (!source?.reserved) return;
+  const provider = pool.runner.provider;
+  const finalized = await provider.getBlock('finalized');
+  assert(positive(finalized?.number) && /^0x[0-9a-f]{64}$/.test(finalized.hash), 'Missing finalized TAP refund basis');
+  const block = { blockTag: finalized.number };
+  const [epoch, root] = await Promise.all([pool.epoch(block), pool.merkleRootAtEpoch(source.epoch, block)]);
+  assert(typeof epoch === 'bigint' && epoch > BigInt(source.epoch) && root === ZeroHash &&
+    (await provider.getBlock(finalized.number))?.hash === finalized.hash,
+  'Fenced TAP refund epoch has not been irrevocably skipped');
 }
 
 function verifyRefundDistribution({ spool, prefix, bundle, report, intent, paid }) {
@@ -219,7 +247,7 @@ export function advanceSweep({ epoch, anchor, dir, spool, marker }) {
     assert(reconciliation.type === 'canonical_tap_settlement_reconciliation' &&
       reconciliation.processed_report_sha256 === sha(reportRaw), 'TAP payment lacks an exact reconciled report');
   }
-  const start = { schema_version:intent.schema_version, signed_length:intent.signed_length, after:intent.after, ...(intent.handoff && { limit: 1 }) };
+  const start = sweepPointerForIntent(intent);
   assert.deepEqual(bundle.tap_liability_sweep, start);
   const page = report.tap_liability_sweep;
   assert(page?.limit === start.limit && page?.schema_version === intent.schema_version && page.signed_length === intent.signed_length && page.after === intent.after &&
@@ -258,6 +286,7 @@ export function advanceSweep({ epoch, anchor, dir, spool, marker }) {
     assert.deepEqual(queue, refundQueue(previous, handoff), 'TAP refund cursor changed during preparation');
   }
   const next = retainRefundRemainder(spool, prefix, record, unpaid, batch && paid ? batch.next : queue);
+  if (paid && next.reconciled_epoch !== undefined) next.reconciled_epoch = epoch;
   if (next.tail > 0) record.refund_queue = next;
   if (previous?.epoch === epoch) {
     assert.deepEqual(previous, record, 'Conflicting TAP page already completed');

@@ -659,15 +659,16 @@ validate_rail_marker() {
 import hashlib, json, os, sys
 path, expected_rail, expected_epoch, expected_hash, expected_settlement_unix, tap_spool = sys.argv[1:]
 d = json.load(open(path))
+allowed = {"settled", "already_settled", "carry", "no_work", "disabled", "superseded"}
+if expected_rail == "tap":
+    allowed.add("fenced")
 if (
     d.get("schema_version") != 1
     or d.get("rail") != expected_rail
     or d.get("epoch") != int(expected_epoch)
     or d.get("epoch_apply_hash") != expected_hash
     or d.get("canonical_settlement_unix") != int(expected_settlement_unix)
-    or d.get("status") not in {
-        "settled", "already_settled", "carry", "no_work", "disabled", "superseded"
-    }
+    or d.get("status") not in allowed
 ):
     raise SystemExit(f"{expected_rail} completion marker is stale or malformed")
 if d["status"] == "disabled":
@@ -679,7 +680,7 @@ else:
         raise SystemExit(f"{expected_rail} completion evidence is missing")
     if hashlib.sha256(open(evidence, "rb").read()).hexdigest() != d.get("evidence_sha256"):
         raise SystemExit(f"{expected_rail} completion evidence hash changed")
-    if expected_rail == "tap" and d["status"] == "superseded":
+    if expected_rail == "tap" and d["status"] in ("superseded", "fenced"):
         prefix = os.path.join(tap_spool, "deferred", f"epoch-{expected_epoch}-{expected_hash}")
         cert = json.load(open(evidence))
         produced = json.load(open(os.path.join(os.path.dirname(path), "tap.produced")))
@@ -687,8 +688,9 @@ else:
         with open(prefix + ".receipts.json", "rb") as source:
             for block in iter(lambda: source.read(65536), b""):
                 archived.update(block)
+        expected_type = "reserved_tap_sweep" if d["status"] == "fenced" else "unprepared_tap_sweep"
         if (os.path.abspath(evidence) != os.path.abspath(prefix + ".draft.json")
-            or cert.get("type") != "unprepared_tap_sweep" or cert.get("epoch") != int(expected_epoch)
+            or cert.get("type") != expected_type or cert.get("epoch") != int(expected_epoch)
             or cert.get("epoch_apply_hash") != expected_hash or cert.get("at") != int(expected_settlement_unix)
             or cert.get("bundle_sha256") != produced.get("evidence_sha256")
             or archived.hexdigest() != cert["bundle_sha256"]):
@@ -2585,17 +2587,20 @@ PY
     validate_tap_produced "$spool_path" || return 1
     if [[ "$spool_state" == deferred || "$spool_state" == failed || ( "$spool_state" == working &&
           -f "${spool_path%.receipts.json}.draft-retry" ) ]]; then
-      if [[ "$TAP_SWEEP_ENABLED" == 1 && "$applied_epoch" -lt "$canonical_applied_epoch" &&
-            -f "$work_dir/tap-sweep-intent.json" ]]; then
+      if [[ "$TAP_SWEEP_ENABLED" == 1 && "$applied_epoch" -lt "$canonical_applied_epoch" ]]; then
         # The child holds payout.lock. The roller releases its own lock only
         # between attempts, after any pending Core or EVM invocation returns.
         if (
           flock -n 8 || exit 1
-          node "$SOURCE_DIR/contracts/scripts/tap-draft-recovery.mjs" retire "$TAP_SPOOL" \
-            "${name%.receipts.json}" "$RPC_URL" "$work_dir" "$canonical_applied_epoch" "$canonical_apply_hash"
+          recovery_args=("$TAP_SPOOL" "${name%.receipts.json}" "$RPC_URL" "$work_dir" "$canonical_applied_epoch" "$canonical_apply_hash")
+          if [[ -f "$work_dir/tap-sweep-intent.json" ]] &&
+              node "$SOURCE_DIR/contracts/scripts/tap-draft-recovery.mjs" retire "${recovery_args[@]}"; then
+            exit 0
+          fi
+          node "$SOURCE_DIR/contracts/scripts/tap-draft-recovery.mjs" fence "${recovery_args[@]}"
         ) 8>"$TAP_SPOOL/roller.lock"; then
           validate_rail_marker tap || return 1
-          echo "tap: handed unprepared sweep to the next applied epoch"
+          echo "tap: recorded the handoff to a later TAP sweep"
           return 0
         fi
       fi

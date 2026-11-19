@@ -95,6 +95,15 @@ export function digestFile(file) {
 
 export function handoffFile(spool) { return path.join(spool, 'deferred/next-sweep.json'); }
 
+// The fence ticket is committed before its working file disappears. After a
+// crash only the publisher may finish that exact move, even for a legacy job.
+export function reservedHandoffTicket(spool, epoch, anchor) {
+  const file = handoffFile(spool);
+  if (!fs.existsSync(file)) return null;
+  const ticket = JSON.parse(readDraftFile(file));
+  return ticket.reserved === true && ticket.epoch === epoch && ticket.anchor === anchor ? ticket : null;
+}
+
 export function readHandoff(spool, cursor, firstArchive) {
   if (!fs.lstatSync(handoffFile(spool), { throwIfNoEntry: false })) {
     const folder = path.dirname(handoffFile(spool));
@@ -122,7 +131,8 @@ export function readHandoff(spool, cursor, firstArchive) {
   const raw = readDraftFile(prefix + '.draft.json');
   const proof = JSON.parse(raw);
   assert(digest(raw) === ticket.proof_sha256 && proof.epoch === ticket.epoch &&
-    proof.epoch_apply_hash === ticket.anchor && proof.type === 'unprepared_tap_sweep' &&
+    proof.epoch_apply_hash === ticket.anchor && ['unprepared_tap_sweep', 'reserved_tap_sweep'].includes(proof.type) &&
+    ticket.reserved === (proof.type === 'reserved_tap_sweep' ? true : undefined) &&
     proof.bundle_sha256 === digestFile(prefix + '.receipts.json') &&
     Array.isArray(proof.refunds), 'TAP handoff differs from archived draft');
   assert.deepEqual(proof.completed_cursor, cursor, 'TAP handoff has a different completed predecessor');
@@ -149,7 +159,8 @@ export function journalTapPreparation(file, plan, draft = false) {
 export function refundQueue(cursor, handoff) {
   const q = handoff?.proof.refund_queue ?? cursor?.refund_queue ?? { head: 0, offset: 0, tail: 0 };
   assert([q.head, q.offset, q.tail].every(n => Number.isSafeInteger(n) && n >= 0) &&
-    q.head <= q.tail && (q.head < q.tail || q.offset === 0), 'Invalid TAP refund queue');
+    q.head <= q.tail && (q.head < q.tail || q.offset === 0) &&
+    (q.reconciled_epoch === undefined || (Number.isSafeInteger(q.reconciled_epoch) && q.reconciled_epoch >= 0)), 'Invalid TAP refund queue');
   return q;
 }
 
@@ -188,11 +199,14 @@ export function nextRefunds(spool, q) {
   assert(digest(raw) === ticket.proof_sha256 &&
     (ticket.remainder ? source.type === 'unpaid_tap_refunds' && source.refund_index === index &&
       source.report_sha256 === digestFile(prefix + '.settlement.json') :
-      source.type === 'unprepared_tap_sweep' && source.refund_queue.tail === index) &&
+      ['unprepared_tap_sweep', 'reserved_tap_sweep'].includes(source.type) &&
+      ticket.reserved === (source.type === 'reserved_tap_sweep' ? true : undefined) && source.refund_queue.tail === index) &&
     source.epoch === ticket.epoch && source.epoch_apply_hash === ticket.anchor &&
     source.bundle_sha256 === digestFile(prefix + '.receipts.json') &&
     Array.isArray(source.refunds) && q.offset < source.refunds.length,
   'Invalid TAP refund source');
+  const reserved = source.type === 'reserved_tap_sweep';
+  if (reserved && !(q.reconciled_epoch > source.epoch)) return null;
   const entries = source.refunds.slice(q.offset, q.offset + 32);
   const end = entries.length + q.offset;
   return { entries, source: { index, offset: q.offset, count: entries.length, ...ticket },

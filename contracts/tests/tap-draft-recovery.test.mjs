@@ -5,15 +5,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { ZeroHash } from 'ethers';
-import { advanceSweep, loadCursor, prepareSweep, validateQueuedSweep } from '../scripts/prepare-tap-sweep-bundle.mjs';
+import { ethers, ZeroHash } from 'ethers';
+import MayhemContract from '../../intercom/contract/contract.js';
+import { executeFeature, executeRateFeature, makeIdentity, makeVerifier, MemoryStorage } from '../../intercom/tests/helpers/contract.js';
+import { advanceSweep, loadCursor, prepareSweep, validateQueuedSweep, verifyQueuedTapSweep } from '../scripts/prepare-tap-sweep-bundle.mjs';
 import { digest, handoffFile, journalTapPreparation, nextRefunds } from '../scripts/tap-draft-files.mjs';
 import { proveUnpreparedTapDraft, recoverDraft } from '../scripts/tap-draft-recovery.mjs';
 import { confirmedTapContract, preflightTapSweepPreparations, verifyPriorTapClaims } from '../scripts/tap-liability-sweep.mjs';
 import { buildCanonicalTapPreparationPlan, guardianPreSignReport, projectTapRefunds, rollTapSettlement,
-  tapRateRecordToLock } from '../scripts/tap-settlement-roller.mjs';
+  resolveTapSettlementPayoutMinimum, resolveTargetedTapPayoutsFromLedger, submitCanonicalTapPreparationPlan, tapRateRecordToLock } from '../scripts/tap-settlement-roller.mjs';
 import { distribution } from '../scripts/merkle.mjs';
 import { oracleRecord } from './helpers/tap-pricing.mjs';
+import { checkTapProcessedReport, checkTapSpoolReport } from './helpers/tap-spool-report.mjs';
+import { verifyTapSweepReport } from '../scripts/verify-tap-sweep-report.mjs';
 
 const hash = n => n.toString(16).padStart(64, '0');
 const addr = n => '0x' + n.toString(16).padStart(40, '0');
@@ -26,7 +30,8 @@ const write = (file,obj) => fs.writeFileSync(file, JSON.stringify(obj));
 const liabilityKey = i => 'payout/liability/tap/' + hash(i) + '/' + hash(i);
 const emptyPending = () => [ZeroHash, 0n, 0n, 0n, 0n, 0n, 0n];
 
-function fixture(t) {
+function fixture(t, signer = null) {
+  const admin = signer?.publicKey ?? hash(91);
   const spool = fs.mkdtempSync(path.join(os.tmpdir(), 'tap-draft-test-'));
   t.after(() => fs.rmSync(spool, { recursive: true, force: true }));
   for (const d of ['working', 'processed', 'ready', 'failed']) fs.mkdirSync(path.join(spool, d));
@@ -79,7 +84,17 @@ function fixture(t) {
     seal();
     return record;
   }
-  const fetchImpl = async url => {
+  const storage = new MemoryStorage();
+  storage.values = state;
+  const reducer = signer && new MayhemContract({ peer: { wallet: makeVerifier(signer.wallet) } }, {});
+  const fetchImpl = async (url, options) => {
+    if (options?.method === 'POST') {
+      const { key, value } = JSON.parse(options.body);
+      const result = await executeFeature(reducer, storage, 'mayhem_feature', key, value, admin);
+      assert.equal(result.ok, true, result.message);
+      seal();
+      return Response.json(result);
+    }
     const q = url.searchParams;
     assert.equal(q.get('confirmed'), 'true');
     const pin = Number(q.get('signed_length') ?? length);
@@ -127,7 +142,7 @@ function fixture(t) {
       peerRpcUrl: common.peerRpcUrl, fetchImpl, post: false };
     return { ...common, dir, prefix, file, name, args, bundle, lock, options };
   }
-  return { state, seal, epoch, oracle, head, pool, freeze, spool };
+  return { ...common, state, seal, epoch, oracle, head, freeze, reducer, storage };
 }
 
 function unclaimedBasis(f) {
@@ -424,6 +439,28 @@ assert subprocess.run(node).returncode == 0`;
   assert.equal(result.status, 0, result.stderr);
 });
 
+function resumePayoutWorker(f, work, nextEpoch) {
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const worker = fs.readFileSync(path.join(repo, 'scripts/ops-payout-settle.sh'), 'utf8');
+  const extract = (start, next) => worker.slice(worker.indexOf(start + '() {'), worker.indexOf(next + '() {'));
+  const head = path.join(f.spool, 'payout', 'epoch-' + nextEpoch + '-' + hash(nextEpoch));
+  fs.mkdirSync(head, { recursive: true });
+  const queue = () => spawnSync('python3', [path.join(repo, 'scripts/ops/payout-work-queue.py'),
+    'has-prior', head, 'tap'], { encoding: 'utf8' });
+  assert.equal(queue().stdout.trim(), 'yes');
+  const result = spawnSync('bash', ['-eu', '-c',
+    extract('validate_rail_marker', 'mark_tap_produced') + extract('produce_tap_work', 'supersede_unplanned_prior_rail_work') +
+    '\nflock() { python3 -c \'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)\' "$2"; }\nproduce_tap_work'],
+    { encoding: 'utf8', timeout: 5000, env: { PATH: process.env.PATH, work_dir: work.dir,
+      SOURCE_DIR: repo, TAP_SPOOL: f.spool, TAP_SWEEP_ENABLED: '1', applied_epoch: String(work.bundle.epoch),
+      apply_hash: work.bundle.epoch_apply_hash, canonical_applied_epoch: String(nextEpoch), canonical_apply_hash: hash(nextEpoch),
+      canonical_settlement_unix: String(work.bundle.at), RPC_URL: 'file:///fixture/' } });
+  assert.equal(result.status, 0, result.stderr);
+  const sync = spawnSync('python3', [path.join(repo, 'scripts/ops/payout-work-queue.py'), 'sync', work.dir]);
+  assert.equal(sync.status, 0);
+  assert.equal(queue().stdout.trim(), 'no');
+}
+
 test('the payout worker finishes an interrupted handoff and releases only that queue entry', async t => {
   const f = fixture(t);
   f.epoch(4); f.oracle(9500);
@@ -437,25 +474,7 @@ test('the payout worker finishes an interrupted handoff and releases only that q
   });
   try { await assert.rejects(recoverDraft({ ...work, action: 'retire', successor: { epoch: 5, anchor: hash(5) } }), /marker crash/); }
   finally { fault.mock.restore(); }
-  const repo = fileURLToPath(new URL('../../', import.meta.url));
-  const worker = fs.readFileSync(path.join(repo, 'scripts/ops-payout-settle.sh'), 'utf8');
-  const extract = (start, next) => worker.slice(worker.indexOf(start + '() {'), worker.indexOf(next + '() {'));
-  const head = path.join(f.spool, 'payout', 'epoch-5-' + hash(5));
-  fs.mkdirSync(head);
-  const queue = () => spawnSync('python3', [path.join(repo, 'scripts/ops/payout-work-queue.py'),
-    'has-prior', head, 'tap'], { encoding: 'utf8' });
-  assert.equal(queue().stdout.trim(), 'yes');
-  const result = spawnSync('bash', ['-eu', '-c',
-    extract('validate_rail_marker', 'mark_tap_produced') + extract('produce_tap_work', 'supersede_unplanned_prior_rail_work') +
-    '\nflock() { python3 -c \'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)\' "$2"; }\nproduce_tap_work'],
-    { encoding: 'utf8', timeout: 5000, env: { PATH: process.env.PATH, work_dir: work.dir,
-      SOURCE_DIR: repo, TAP_SPOOL: f.spool, TAP_SWEEP_ENABLED: '1', applied_epoch: '4',
-      apply_hash: hash(4), canonical_applied_epoch: '5', canonical_apply_hash: hash(5),
-      canonical_settlement_unix: '400', RPC_URL: 'file:///fixture/' } });
-  assert.equal(result.status, 0, result.stderr);
-  const sync = spawnSync('python3', [path.join(repo, 'scripts/ops/payout-work-queue.py'), 'sync', work.dir]);
-  assert.equal(sync.status, 0);
-  assert.equal(queue().stdout.trim(), 'no');
+  resumePayoutWorker(f, work, 5);
   assert.equal(read(path.join(work.dir, 'tap.complete')).status, 'superseded');
   assert.equal(loadCursor(f.spool), null);
   assert.equal((await f.freeze(5)).bundle.tap_liability_sweep.limit, 1);
@@ -515,4 +534,295 @@ test('reservation rehearsal rejects a changed second liability before reserving 
   await assert.rejects(preflightTapSweepPreparations(plan, work.peerRpcUrl, work.fetchImpl), /watermark/);
   assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
   assert(![...f.state.keys()].some(k => k.startsWith('payout/preparation')));
+});
+
+// Install the constructor's bytecode and storage at the two addresses that the
+// production selector authenticates. All RPC calls go to an in-process Ganache.
+async function canonicalPoolFixture(t) {
+  const { default: Ganache } = await import('ganache');
+  const { compileAll } = await import('../scripts/compile.mjs');
+  const { deployPoolWithToken } = await import('../scripts/deploy-local.mjs');
+  const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1, time: new Date(10000000) } });
+  t.after(() => chain.disconnect());
+  const provider = new ethers.BrowserProvider(chain, undefined, { cacheTimeout: -1 });
+  const owner = await provider.getSigner();
+  const governance = ethers.Wallet.createRandom();
+  const art = compileAll();
+  const tokenCode = await provider.call({ data: art.MockTTAP.bytecode });
+  await provider.send('evm_setAccountCode', [scope.token_address, tokenCode]);
+  const template = await deployPoolWithToken(owner, scope.token_address, {
+    governanceSigner: governance.address, governanceDelay: 3600n, maxEpochDelta: 100n, art,
+  });
+  await provider.send('evm_setAccountCode', [scope.pool_address, await provider.getCode(template.poolAddr)]);
+  const trace = await provider.send('debug_traceTransaction', [template.pool.deploymentTransaction().hash, {}]);
+  const slots = new Set(trace.structLogs.filter(step => step.op === 'SSTORE').map(step => '0x' + step.stack.at(-1)));
+  for (const slot of slots) {
+    const word = await provider.getStorage(template.poolAddr, slot);
+    await provider.send('evm_setAccountStorageAt', [scope.pool_address, slot, word]);
+  }
+  const token = new ethers.Contract(scope.token_address, art.MockTTAP.abi, owner);
+  const pool = new ethers.Contract(scope.pool_address, art.MayhemInferencePool.abi, owner);
+  assert.equal(await pool.owner(), owner.address);
+  assert.equal(await pool.maxEpochDelta(), 100n);
+  await (await token.mint(owner.address, 1000n)).wait();
+  await (await token.approve(scope.pool_address, 1000n)).wait();
+  await (await pool.deposit(1000n)).wait();
+  const jump = async seconds => {
+    await provider.send('evm_increaseTime', [seconds]);
+    await provider.send('evm_mine', []);
+  };
+  return { pool, provider, token, jump, ownerSigner: owner, governanceSigner: governance, operatorAddress: addr(8) };
+}
+
+test('a confirmed reservation is fenced after expiry and restart while a newer provider is actually paid once', async t => {
+  const signer = await makeIdentity();
+  const f = fixture(t, signer);
+  const eth = await canonicalPoolFixture(t);
+  const { pool, provider } = eth;
+  const oracle = async price => {
+    const ts = (await provider.getBlock('latest')).timestamp;
+    const result = await executeRateFeature(f.reducer, f.storage, {
+      op: 'tap_rate_oracle', source: 'uniswap-v3-twap', ts, tap_usd_au: String(price),
+    }, signer.publicKey);
+    assert.equal(result.ok, true, result.message);
+    f.seal();
+  };
+  const later = f.state.get(liabilityKey(2));
+  f.state.delete(liabilityKey(2));
+  f.epoch(3);
+  await oracle(rateValue / 2n);
+  const inherited = { account: addr(9), amount_au: '8' };
+  const earlier = await f.freeze(3, { refunds: [inherited] });
+  const oversized = await rollTapSettlement({ ...earlier.options, ...eth, post: false });
+  assert(oversized.reasons.includes('epoch delta > cap'));
+  write(earlier.prefix + '.dry-run.json', oversized);
+  fs.writeFileSync(earlier.prefix + '.draft-retry', '');
+  f.epoch(4);
+  await recoverDraft({ ...earlier, pool, action: 'retire', successor: { epoch: 4, anchor: hash(4) } });
+  await eth.jump(1);
+  await oracle(rateValue);
+  const work = await f.freeze(4, { refunds: [{ account: addr(9), amount_au: '4' }] });
+  const adminSigner = { publicKey: signer.publicKey,
+    sign: message => Buffer.from(signer.wallet.sign(Buffer.from(message))).toString('hex') };
+  assert.deepEqual(work.bundle.tap_carried_refunds, [inherited]);
+  const run = (item, options) => {
+    const bundle = read(item.file);
+    const tapRateLock = read(item.prefix + '.tap-rate.json');
+    const latest = path.join(item.spool, 'processed/latest.json');
+    return rollTapSettlement({ ...item.options, ...eth, bundle, tapRateLock, tapUsdAu: tapRateLock.tap_usd_au,
+      prior: fs.existsSync(latest) ? read(latest) : null, post: true,
+      checkQueuedSweep: () => verifyQueuedTapSweep(f.spool, bundle, pool),
+      observeDraftPlan: plan => journalTapPreparation(item.prefix + '.draft-plan.json', plan, true),
+      canonicalPreparationSubmitter: request => submitCanonicalTapPreparationPlan({ ...request, ...item, adminSigner,
+        beforePost: () => journalTapPreparation(item.prefix + '.prepare-intent.json', request.plan) }),
+      ...options });
+  };
+  // Crash between confirmation of all reservations and the EVM invocation.
+  await assert.rejects(run(work, { beforeEthereumEffect: () => { throw Error('crash before proposal'); } }),
+    /crash before proposal/);
+  const journal = read(work.prefix + '.prepare-intent.json');
+  const rows = () => [...f.state].filter(([key]) => key.startsWith('payout/preparation') &&
+    (key.includes(journal.root_preparation_id) || journal.preparation_ids.some(id => key.includes(id)) ||
+      journal.external_effect_ids.some(id => key.includes(id)) || key.includes('/' + hash(1))));
+  const reserved = structuredClone(rows());
+  assert.equal(f.state.get('payout/preparation/tap/' + journal.root_preparation_id).consumed, false);
+  const successor = { epoch: 5, anchor: hash(5) };
+  f.state.set(liabilityKey(2), later);
+  f.epoch(5);
+  fs.writeFileSync(work.prefix + '.draft-retry', '');
+  const recover = action => recoverDraft({ ...work, pool, action, successor });
+  await assert.rejects(recover('fence'), /authentic and expired/);
+  await eth.jump(2701);
+  await oracle(rateValue * 2n);
+  await assert.rejects(run(work), /oracle is stale/);
+  await assert.rejects(recover('reprice'), /previously started/);
+  await assert.rejects(recover('retire'), /previously started/);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+  assert(fs.existsSync(work.file));
+  // A process opened the legacy confirmation file and lost its reply.
+  fs.writeFileSync(work.prefix + '.settlement.raw.json', '');
+  const rename = fs.renameSync;
+  const crash = t.mock.method(fs, 'renameSync', (from, to) => {
+    if (from === work.file) throw Error('crash after committed fence');
+    return rename(from, to);
+  });
+  try { await assert.rejects(recover('fence'), /crash after committed fence/); }
+  finally { crash.mock.restore(); }
+  assert(fs.existsSync(work.file));
+  assert.throws(() => validateQueuedSweep(f.spool, work.bundle), /ENOENT/);
+  await assert.rejects(recover('reprice'), /already fenced/);
+  resumePayoutWorker(f, work, 5);
+  const archive = path.join(work.spool, 'deferred', work.name);
+  assert.equal(read(path.join(work.dir, 'tap.complete')).status, 'fenced');
+  assert.deepEqual(read(archive + '.prepare-intent.json'), journal);
+  assert.deepEqual(read(archive + '.tap-rate.json'), work.lock);
+  assert.deepEqual(read(archive + '.draft.json').observed_liability_preparations, journal.preparation_ids);
+  assert(fs.existsSync(archive + '.settlement.raw.json'));
+  assert.deepEqual(rows(), reserved);
+  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+
+  const fresh = await f.freeze(5);
+  assert.equal(fresh.bundle.tap_carried_refunds, undefined);
+  const pending = await run(fresh);
+  assert.equal(pending.awaiting_governance_delay, true);
+  assert.deepEqual(pending.tap_liability_sweep.deferred.map(row => row.economic_op_id), journal.preparation_ids);
+  assert.deepEqual(pending.checkpoint_outputs.map(row => row.provider), [hash(2)]);
+  assert.deepEqual(pending.refunds, []);
+  assert.equal((await run(fresh)).proposal_tx, null);
+  await eth.jump(3601);
+  const executing = await run(fresh);
+  assert.equal(executing.awaiting_finality, true);
+  for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+  const final = await run(fresh, { prior: executing });
+  const cp = final.tap_settlement_checkpoint;
+  final.payout_minimum_lock = (await resolveTapSettlementPayoutMinimum({ ...fresh, at: fresh.bundle.at,
+    signedLength: fresh.bundle.tap_liability_sweep.signed_length })).evidence;
+  await verifyTapSweepReport({ ...fresh, report: final, rateLock: fresh.lock, confirmed: true,
+    proposalBlock: await provider.getBlock(cp.proposal_block_number) });
+  const bound = checkTapSpoolReport(fresh.bundle, final);
+  assert.equal(bound.finalizable, true, bound.error || bound.gateError);
+  const processed = checkTapProcessedReport(fresh.bundle, bound.bound);
+  assert.equal(processed.status, 0, processed.error);
+  assert.equal(cp.outputs[0].paid_au, '12');
+  assert.equal(cp.outputs[0].tap_wei, '3');
+  const checkpoint = () => executeFeature(f.reducer, f.storage, 'mayhem_feature',
+    key, cp, signer.publicKey);
+  const key = await f.reducer.targetedTapSettlementFeatureKey(cp);
+  assert.equal((await checkpoint()).idempotent, false);
+  assert.equal((await checkpoint()).idempotent, true);
+  f.seal();
+  assert.equal(f.state.get(liabilityKey(2)).paid_cum_au, '12');
+  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+  assert.deepEqual(rows(), reserved);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 1);
+  assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, 1);
+  // A single leaf has an empty proof. Exercise the normal token payment too.
+  await (await pool.claim(5, later.target, 3n, [])).wait();
+  assert.equal(await eth.token.balanceOf(later.target), 3n);
+  await assert.rejects(pool.claim.staticCall(5, later.target, 3n, []));
+  write(path.join(f.spool, 'processed/latest.json'), final);
+  finishPage(fresh, final, 'settled');
+  for (const key of [liabilityKey(2), 'earn/tap/' + hash(2)]) {
+    f.state.set(key, { ...f.state.get(key), total_au: '24', updated_epoch: 6 });
+  }
+  f.epoch(6);
+  await oracle(rateValue / 2n);
+  const after = await f.freeze(6);
+  assert.deepEqual(after.bundle.tap_carried_refunds, [{ account: addr(9), amount_au: '4' }, inherited]);
+  await verifyQueuedTapSweep(f.spool, after.bundle, pool);
+  await assert.rejects(verifyQueuedTapSweep(f.spool, after.bundle, {
+    runner: pool.runner, epoch: pool.epoch, merkleRootAtEpoch: async () => cp.root,
+  }), /irrevocably skipped/);
+  const refundProposal = await run(after);
+  assert.equal(refundProposal.awaiting_governance_delay, true);
+  assert.deepEqual(refundProposal.refunds, [{ account: addr(9), cumulative_wei: '12' }]);
+  await eth.jump(3601);
+  const refundExecution = await run(after);
+  for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+  const refundReport = await run(after, { prior: refundExecution });
+  const refundCheckpoint = refundReport.tap_settlement_checkpoint;
+  const settlement = await executeFeature(f.reducer, f.storage, 'mayhem_feature',
+    await f.reducer.targetedTapSettlementFeatureKey(refundCheckpoint), refundCheckpoint, signer.publicKey);
+  assert.equal(settlement.ok, true, settlement.message);
+  const tree = distribution(refundReport.entries.map(row => ({ account: row.account, amount: BigInt(row.cumulative_wei) })));
+  await (await pool.claim(6, addr(9), 12n, tree.proofFor(addr(9)))).wait();
+  assert.equal(await eth.token.balanceOf(addr(9)), 12n);
+  finishPage(after, refundReport, 'settled');
+  assert.equal(nextRefunds(f.spool, loadCursor(f.spool).refund_queue), null);
+  assert.deepEqual(rows(), reserved);
+});
+
+test('a v30 pre-journal mixed receipt job with a lost Core acknowledgement requires positive reservation and idle pool evidence', async t => {
+  const { proxyPayoutEpoch, matureFixtureLiabilities } = await import('../../intercom/tests/helpers/proxy-payout-epoch.mjs');
+  const { deriveTapReceiptBundle } = await import('../../intercom/scripts/payout-tap-receipts.mjs');
+  const source = await proxyPayoutEpoch('tap', { mixed: true });
+  await matureFixtureLiabilities(source);
+  const signer = source.f.admin;
+  const f = fixture(t, signer);
+  for (const [key, value] of source.f.storage.values) {
+    if (key !== 'payments/current') f.state.set(key, value);
+  }
+  const bundle = await deriveTapReceiptBundle(source.bundle, source.epoch, source.applyHash);
+  assert.equal(bundle.receipts.length, 2);
+  const at = f.state.get('epoch/apply-anchor/' + source.epoch).settlement_unix;
+  f.head.timestamp = at;
+  const lock = tapRateRecordToLock(f.oracle(at), bundle, signer.publicKey, scope);
+  const name = 'epoch-' + source.epoch + '-' + source.applyHash;
+  const dir = path.join(f.spool, 'payout', name);
+  fs.mkdirSync(dir, { recursive: true });
+  const prefix = path.join(f.spool, 'working', name);
+  const file = prefix + '.receipts.json';
+  write(file, bundle);
+  write(prefix + '.tap-rate.json', lock);
+  fs.writeFileSync(prefix + '.settlement.raw.json', '');
+  fs.writeFileSync(prefix + '.draft-retry', '');
+  write(path.join(dir, 'tap.produced'), { schema_version: 1, rail: 'tap', status: 'produced',
+    epoch: source.epoch, epoch_apply_hash: source.applyHash, evidence_sha256: digest(fs.readFileSync(file)) });
+  const { sessionBindings, liabilities } = await resolveTargetedTapPayoutsFromLedger({ ...f, bundle });
+  const [newEpoch, newAnchor] = [source.epoch + 1, hash(source.epoch + 1)];
+  const recover = () => recoverDraft({ ...f, dir, name, action: 'fence', successor: { epoch: newEpoch, anchor: newAnchor } });
+  await assert.rejects(recover(), /No confirmed TAP liability reservation/);
+  f.pool.maxEpochDelta = f.pool.totalDeposited = async () => 100n * 10n ** 18n;
+  const { default: ContractV30, payoutPreparationMessage } = await import('../../intercom/contract/v30.js');
+  const historical = new ContractV30({ peer: { wallet: makeVerifier(signer.wallet) } }, {});
+  const lostAck = async (input, options) => {
+    if (options?.method !== 'POST') return f.fetchImpl(input, options);
+    // Exercise the archived writer's actual wire signature and reducer on the
+    // original economic plan. The transport loses the acknowledgement.
+    const { value } = JSON.parse(options.body);
+    value.contract_version = 30;
+    value.admin_sig = Buffer.from(signer.wallet.sign(Buffer.from(payoutPreparationMessage(value)))).toString('hex');
+    const key = await historical.targetedPayoutPreparationFeatureKey(value);
+    const result = await executeFeature(historical, f.storage, 'mayhem_feature', key, value, signer.publicKey);
+    assert.equal(result.ok, true, result.message);
+    f.seal();
+    throw new Error('Core accepted before disconnect');
+  };
+  let plan;
+  await assert.rejects(rollTapSettlement({ pool: f.pool, peerRpcUrl: f.peerRpcUrl, fetchImpl: f.fetchImpl, bundle,
+    targetedSessionBindings: sessionBindings, canonicalLiabilities: liabilities,
+    tapUsdAu: lock.tap_usd_au, tapRateLock: lock, epochApplyHash: source.applyHash,
+    ledgerFeeBps: 1500, payoutMinAu: (await source.f.ledger.activeParamsAt(at, ['payout_min_au'])).payout_min_au,
+    settleThroughEpoch: source.epoch + 100, operatorAddress: addr(8),
+    ownerSigner: { getAddress: async () => addr(6) },
+    governanceSigner: { getAddress: async () => addr(7), signTypedData: async () => '0x' + '00'.repeat(65) },
+    canonicalPreparationSubmitter: request => {
+      plan = request.plan;
+      return submitCanonicalTapPreparationPlan({ ...request, peerRpcUrl: f.peerRpcUrl, fetchImpl: lostAck,
+        adminSigner: { publicKey: signer.publicKey, sign: msg => Buffer.from(signer.wallet.sign(Buffer.from(msg))).toString('hex') } });
+    } }), /Core accepted before disconnect/);
+  assert.equal(plan.preparation_ids.length, 2);
+  const first = 'payout/preparation/tap/' + plan.preparation_ids[0];
+  assert.equal(f.state.get(first).consumed, false);
+  assert.equal(f.state.get(first).contract_version, 30);
+  assert(!f.state.has('payout/preparation/tap/' + plan.preparation_ids[1]));
+  assert(!f.state.has('payout/preparation/tap/' + plan.root_preparation_id));
+  f.epoch(newEpoch);
+  f.head.timestamp += 3000;
+  const provider = f.pool.runner.provider;
+  provider.getTransactionReceipt = () => assert.fail('a receipt cannot establish absence of broadcast');
+  const block = provider.getBlock;
+  provider.getBlock = async tag => tag === 'finalized' || tag === 4
+    ? { number: 4, hash: '0x' + hash(4), timestamp: at + 1 } : block(tag);
+  await assert.rejects(recover(), /authentic and expired/);
+  provider.getBlock = block;
+  const pending = f.pool.pendingRoot;
+  f.pool.pendingRoot = async () => [plan.intent.root, BigInt(source.epoch), 2n, 0n, 0n, 0n, 999999n];
+  await assert.rejects(recover(), /pending, executed or ambiguous/);
+  f.pool.pendingRoot = pending;
+  f.pool.merkleRootAtEpoch = async () => plan.intent.root;
+  await assert.rejects(recover(), /pending, executed or ambiguous/);
+  f.pool.merkleRootAtEpoch = async () => ZeroHash;
+  const rate = f.state.get(lock.rate_record_key);
+  f.state.delete(lock.rate_record_key); f.seal();
+  await assert.rejects(recover(), /authentic and expired/);
+  f.state.set(lock.rate_record_key, rate); f.seal();
+  const before = f.storage.snapshotBytes();
+  await recover();
+  assert.equal(f.storage.snapshotBytes(), before);
+  const archived = path.join(f.spool, 'deferred', name);
+  assert.deepEqual(read(archived + '.draft.json').observed_liability_preparations, [plan.preparation_ids[0]]);
+  assert.deepEqual(read(archived + '.receipts.json'), bundle);
+  assert.deepEqual(read(archived + '.tap-rate.json'), lock);
+  assert.equal(read(path.join(dir, 'tap.complete')).status, 'fenced');
 });

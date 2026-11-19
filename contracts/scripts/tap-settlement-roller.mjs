@@ -9,7 +9,7 @@ import { ethers } from 'ethers';
 import { distribution } from './merkle.mjs';
 import { signRootProposal } from './pool-governance.mjs';
 import { safeErrorMessage } from './safe-output.mjs';
-import { durableWrite, holdTapLock, journalTapPreparation } from './tap-draft-files.mjs';
+import { durableWrite, holdTapLock, journalTapPreparation, reservedHandoffTicket } from './tap-draft-files.mjs';
 import { MAINNET_POOL, preflightTapSweepPreparations, tapContractAt, validTapSweepPointer } from './tap-liability-sweep.mjs';
 import { tapRootEventReader } from './tap-root-events.mjs';
 import {
@@ -3896,6 +3896,9 @@ async function main() {
         path.resolve(spool, 'working', name + '.receipts.json') !== path.resolve(bundlePath)) {
       throw new Error('TAP managed bundle is outside its canonical working path');
     }
+    if (reservedHandoffTicket(spool, bundle.epoch, bundle.epoch_apply_hash)) {
+      throw new Error('TAP reservation fence is awaiting archival');
+    }
     journal = path.join(working, name);
   }
   const sweepPointer = tapSweepPointer(bundle);
@@ -4001,8 +4004,8 @@ async function main() {
       if (!spool && !sweepPointer?.limit && !Object.hasOwn(bundle, 'tap_carried_refunds') &&
           !Object.hasOwn(bundle, 'tap_refund_queue_version')) return;
       if (!spool) throw new Error('Recovery sweep requires --settlement-spool');
-      const { validateQueuedSweep } = await import('./prepare-tap-sweep-bundle.mjs');
-      validateQueuedSweep(spool, bundle);
+      const { verifyQueuedTapSweep } = await import('./prepare-tap-sweep-bundle.mjs');
+      await verifyQueuedTapSweep(spool, bundle, pool);
     },
     beforeEthereumEffect: journal ? plan => journalTapPreparation(journal + '.prepare-intent.json', plan) : undefined,
     observeDraftPlan: journal ? plan => journalTapPreparation(journal + '.draft-plan.json', plan, true) : undefined,
