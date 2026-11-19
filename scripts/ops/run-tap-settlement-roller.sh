@@ -44,11 +44,16 @@ command -v timeout >/dev/null 2>&1 || {
 }
 
 mkdir -p "$ready" "$working" "$processed" "$failed"
+# Keep one daemon. The original roller.lock fences individual attempts as well
+# as legacy daemons that still hold it for their entire lifetime.
+exec 7>"$spool/roller-service.lock"
 exec 8>"$spool/roller.lock"
-flock -n 8 || {
+flock -n 7 || {
   echo "Another TAP settlement roller already owns $spool" >&2
   exit 0
 }
+
+flock -x 8
 
 node "$repo/scripts/mainnet-proof.mjs" \
   --peer-rpc "$peer_rpc" --timeout-seconds 0 --json >"$spool/mainnet-proof.json.tmp"
@@ -61,7 +66,23 @@ mv "$spool/mainnet-proof.json.tmp" "$spool/mainnet-proof.json"
 # The bundle moves to processed last. A restart sees either the old complete
 # report or the new one, including the prior passed to the next dry-run.
 publish_json() {
-  install -m 600 "$1" "$2.tmp" && mv "$2.tmp" "$2"
+  install -m 600 "$1" "$2.tmp" && durable_move "$2.tmp" "$2"
+}
+
+durable_move() {
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+source, destination = sys.argv[1:]
+with open(source, "rb") as item:
+    os.fsync(item.fileno())
+os.replace(source, destination)
+for directory in {os.path.dirname(source), os.path.dirname(destination)}:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
 }
 
 verify_sweep() {
@@ -81,7 +102,7 @@ wait_for_pending_root() {
   # The timer is the wrapper's only background job. A PID-only stop must
   # interrupt wait immediately, and the timer must never retain the spool lock.
   trap 'kill %+ 2>/dev/null || :; exit 0' TERM INT HUP
-  python3 - "$1" "$interval" "$$" 8>&- <<'PY' &
+  python3 - "$1" "$interval" "$$" 7>&- 8>&- <<'PY' &
 import os, sys, time
 execute_after, interval, roller_pid = map(int, sys.argv[1:])
 now = time.time()
@@ -101,6 +122,23 @@ PY
   trap - TERM INT HUP
 }
 
+poll_again() {
+  flock -u 8
+  sleep "$interval"
+  flock -x 8
+}
+
+retry_draft() {
+  if jq -e 'has("tap_liability_sweep")' "$bundle" >/dev/null; then
+    touch "$working/$name.draft-retry"
+    if [[ -f "$rate_lock" && ! -e "$working/$name.prepare-intent.json" ]]; then
+      timeout "$attempt_timeout" node "$repo/contracts/scripts/tap-draft-recovery.mjs" \
+        reprice "$spool" "$name" "$peer_rpc" || :
+    fi
+  fi
+  poll_again
+}
+
 while true; do
   bundle="$(find "$working" -maxdepth 1 -type f -name 'epoch-*.receipts.json' -print | sort -V | head -n 1)"
   if [[ -z "$bundle" ]]; then
@@ -114,19 +152,19 @@ while true; do
     fi
   fi
   if [[ -z "$bundle" ]]; then
-    sleep "$interval"
+    poll_again
     continue
   fi
 
   name="$(basename "$bundle" .receipts.json)"
   lifecycle_count=0
-  for state in ready working processed failed; do
+  for state in ready working processed failed deferred; do
     [[ -f "$spool/$state/$name.receipts.json" ]] || continue
     lifecycle_count=$((lifecycle_count + 1))
   done
   if (( lifecycle_count != 1 )); then
     echo "TAP spool item $name exists in $lifecycle_count lifecycle states; refusing duplicate work" >&2
-    sleep "$interval"
+    poll_again
     continue
   fi
   ready_buyer="$ready/$name.buyers.json"
@@ -134,7 +172,7 @@ while true; do
   if [[ -f "$ready_buyer" ]]; then
     [[ ! -f "$working_buyer" ]] || {
       echo "TAP buyer-account companion for $name exists in two lifecycle states" >&2
-      sleep "$interval"
+      poll_again
       continue
     }
     mv "$ready_buyer" "$working_buyer"
@@ -143,11 +181,16 @@ while true; do
   rate_lock="$working/$name.tap-rate.json"
   event_cursor="$rate_lock.events.json"
   dry_report="$working/$name.dry-run.json"
-  raw_report="$working/$name.settlement.raw.json"
+  # Legacy .settlement.raw.json remains evidence of a possible submission.
+  raw_report="$working/$name.confirmation.json"
   bound_report="$working/$name.settlement.bound.json"
   final_report="$working/$name.settlement.json"
   fee_bps="$(jq -er '.params.fee_bps' "$bundle")" || {
     echo "$bundle is missing params.fee_bps" >&2
+    if jq -e 'has("tap_liability_sweep")' "$bundle" >/dev/null; then
+      retry_draft
+      continue
+    fi
     mv "$bundle" "$failed/"
     [[ ! -f "$buyer_accounts" ]] || mv "$buyer_accounts" "$failed/"
     continue
@@ -156,6 +199,7 @@ while true; do
   args=(
     /usr/bin/node "$repo/contracts/scripts/tap-settlement-roller.mjs"
     --bundle "$bundle"
+    --settlement-spool "$spool"
     --tap-rate-lock "$rate_lock"
     --ledger-fee-bps "$fee_bps"
     --peer-rpc "$peer_rpc"
@@ -169,12 +213,12 @@ while true; do
 
   if ! timeout "$attempt_timeout" "${args[@]}" >"$dry_report"; then
     echo "TAP settlement dry-run failed for $name" >&2
-    sleep "$interval"
+    retry_draft
     continue
   fi
   if ! verify_sweep "$dry_report" dry; then
     echo "TAP dry-run sweep evidence failed for $name" >&2
-    sleep "$interval"
+    retry_draft
     continue
   fi
   if jq -e '
@@ -191,7 +235,7 @@ while true; do
   ' "$dry_report" >/dev/null; then
     if ! python3 "$repo/scripts/ops/check-tap-carry-basis.py" "$dry_report" "$processed" "$bundle"; then
       echo "TAP carry has no matching finalized distribution for $name" >&2
-      sleep "$interval"
+      retry_draft
       continue
     fi
     if ! python3 - "$bundle" "$dry_report" "$bound_report" <<'PY'
@@ -272,14 +316,15 @@ with open(target, "w") as out:
 PY
     then
       echo "TAP carry report binding failed for $name" >&2
-      sleep "$interval"
+      retry_draft
       continue
     fi
     publish_json "$bound_report" "$processed/$name.settlement.json"
     # latest.json always refers to the last finalized Ethereum distribution.
     publish_json "$rate_lock" "$processed/$name.tap-rate.json"
-    mv "$bundle" "$processed/"
-    [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
+    [[ ! -f "$buyer_accounts" ]] || publish_json "$buyer_accounts" "$processed/$name.buyers.json"
+    durable_move "$bundle" "$processed/$name.receipts.json"
+    rm -f "$buyer_accounts" "$working/$name.draft-plan.json" "$working/$name.prepare-intent.json" "$working/$name.draft-retry"
     rm -f "$rate_lock" "$event_cursor" "$dry_report" "$raw_report" "$bound_report" "$final_report"
     continue
   fi
@@ -289,17 +334,17 @@ PY
     (.root_already_posted == true or .propose_root_dry_run.ok == true)
   ' "$dry_report" >/dev/null; then
     echo "TAP settlement dry-run did not pass for $name" >&2
-    sleep "$interval"
+    retry_draft
     continue
   fi
   if ! timeout "$attempt_timeout" "${args[@]}" --confirm >"$raw_report"; then
     echo "TAP settlement broadcast failed for $name" >&2
-    sleep "$interval"
+    retry_draft
     continue
   fi
   if ! verify_sweep "$raw_report" confirmed; then
     echo "TAP settlement sweep evidence failed for $name" >&2
-    sleep "$interval"
+    poll_again
     continue
   fi
   # Only the freshly bound pending report emits a scheduling hint. Restart
@@ -379,7 +424,7 @@ with open(target, "w") as out:
 PY
   )"; then
     echo "TAP settlement report binding failed for $name" >&2
-    sleep "$interval"
+    poll_again
     continue
   fi
   mv "$bound_report" "$final_report"
@@ -410,7 +455,7 @@ PY
     else
       echo "TAP settlement report did not confirm root, fee, burn, and checkpoint completion for $name" >&2
     fi
-    sleep "$interval"
+    poll_again
     continue
   fi
 
@@ -418,7 +463,8 @@ PY
   publish_json "$final_report" "$processed/latest.json"
   publish_json "$rate_lock" "$processed/$name.tap-rate.json"
   [[ ! -f "$event_cursor" ]] || mv "$event_cursor" "$processed/"
-  mv "$bundle" "$processed/"
-  [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
+  [[ ! -f "$buyer_accounts" ]] || publish_json "$buyer_accounts" "$processed/$name.buyers.json"
+  durable_move "$bundle" "$processed/$name.receipts.json"
+  rm -f "$buyer_accounts" "$working/$name.draft-plan.json" "$working/$name.prepare-intent.json" "$working/$name.draft-retry"
   rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report" "$working/$name.proposal-block.json"
 done

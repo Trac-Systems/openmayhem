@@ -1103,7 +1103,7 @@ test('held earnings after a finalized root advance without replacing claims or p
       chain_id: first.tapRateLock.chain_id, pool_address: poolAddress, token_address: token,
       root: paid.root, cumulative_spent_wei: paid.cumulative_spent_wei } };
   const pool = { epoch: async () => 1, cumulativeSpent: async () => BigInt(paid.cumulative_spent_wei),
-    merkleRoot: async () => paid.root, pendingRoot: async () => ({ executeAfter: 0n }),
+    merkleRoot: async () => paid.root, pendingRoot: async () => [ethers.ZeroHash, 0n, 0n, 0n, 0n, 0n, 0n],
     totalDeposited: async () => 1000n, maxEpochDelta: async () => 1000n,
     getAddress: async () => poolAddress };
   const next = inputs(2, '100');
@@ -1125,7 +1125,7 @@ test('held earnings after a finalized root advance without replacing claims or p
     { pool: { ...pool, totalDeposited: async () => 1n } },
     { pool: { ...pool, pendingRoot: async () => ({
       merkleRoot: paid.root, newEpoch: 2, newCumulativeSpent: 100n, previousEpoch: 1,
-      previousCumulativeSpent: 100n, nonce: 1n, executeAfter: 123n }) } },
+      previousCumulativeSpent: BigInt(paid.cumulative_spent_wei), nonce: 1n, executeAfter: 123n }) } },
   ]) {
     const refused = await rollTapSettlement({ ...options, ...changes });
     assert.equal(refused.blocked, true);
@@ -1247,7 +1247,7 @@ test('TAP sweep pays unchanged held storage in a later receiptless epoch and rep
     getAddress: async () => sweepPool, merkleRoot: async () => posted ? report.root : ethers.ZeroHash,
     epoch: async () => posted ? 4 : 0, cumulativeSpent: async () => posted ? 67n : 0n,
     totalDeposited: async () => 1000n, maxEpochDelta: async () => 1000n,
-    pendingRoot: async () => posted ? {} : { merkleRoot: report.root, newEpoch: 4, newCumulativeSpent: 67n,
+    pendingRoot: async () => posted ? [ethers.ZeroHash, 0n, 0n, 0n, 0n, 0n, 0n] : { merkleRoot: report.root, newEpoch: 4, newCumulativeSpent: 67n,
       previousEpoch: 0, previousCumulativeSpent: 0n, nonce: 1n, executeAfter: 14600 },
     operatorWithdrawn: async () => 10n, totalBurned: async () => 7n,
     runner: { provider: { getTransactionReceipt: chainEvidence.getTransactionReceipt,
@@ -1384,6 +1384,35 @@ test('TAP sweep bounds output revisions while verifying every off-page receipt a
   args.bundle.receipts[0].lane = 'proxy';
   bind();
   await assert.rejects(rollTapSettlement(args), /proxy accepted-spend/);
+});
+
+test('a v2 receipt still authenticates its allocation when its TAP binding is unavailable', async () => {
+  const identity = makeReceiptIdentity();
+  const row = { ...sweepRow, provider: identity.publicKeyHex, target: '0x' + '36'.repeat(20) };
+  const receipts = [receipt({ session: 'unbound', provider: identity, epoch: 4, au: '100' })];
+  const { args, bind, state } = sweepFixture(4, { receipts, rows: [row, sweepRow] });
+  args.bundle.tap_liability_sweep.schema_version = 2;
+  bind();
+  const [allocation] = Object.values(targetedBindingsFor(args.bundle, { [row.provider]: row.target },
+    { [row.provider]: row.revision }));
+  state.set('payout/allocation/4/' + allocation.session_id, { ...allocation, rail: 'tap', type: 'provider_payout_session_allocation',
+    feature_key: 'epoch/targeted/4/' + '12'.repeat(32) });
+  const bindingKey = 'payout/binding/tap/' + row.provider + '/' + row.revision;
+  state.delete(bindingKey);
+  const resolve = () => resolveTargetedTapPayoutsFromLedger(args);
+  const resolved = await resolve();
+  assert.deepEqual(resolved.accounts, {});
+  const report = await rollTapSettlement({ ...args, targetedSessionBindings: resolved.sessionBindings,
+    canonicalLiabilities: resolved.liabilities });
+  assert.deepEqual(report.checkpoint_outputs.map(o => [o.provider, o.net_au_paid]), [[sweepRow.provider, '101']]);
+  assert.deepEqual(report.tap_liability_sweep.deferred, [{ provider: row.provider, payout_revision: row.revision,
+    reason: 'unverified_binding' }]);
+  state.set(bindingKey, { verified: false, provider: sweepRow.provider });
+  await assert.rejects(resolve(), /conflicts/);
+  args.bundle.tap_liability_sweep.schema_version = 1;
+  bind();
+  await assert.rejects(resolveTargetedTapPayoutsFromLedger({ ...args, fetchImpl: async url =>
+    Response.json({ value: state.get(url.searchParams.get('key')) ?? null }) }), /verified targeted TAP binding/);
 });
 
 test('TAP sweep rejects caller projections, malformed pointers and stale policy or snapshot evidence', async () => {

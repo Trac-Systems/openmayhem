@@ -9,6 +9,8 @@ import { ethers } from 'ethers';
 import { distribution } from './merkle.mjs';
 import { signRootProposal } from './pool-governance.mjs';
 import { safeErrorMessage } from './safe-output.mjs';
+import { holdTapLock, journalTapPreparation } from './tap-draft-files.mjs';
+import { MAINNET_POOL, preflightTapSweepPreparations, tapContractAt, validTapSweepPointer } from './tap-liability-sweep.mjs';
 import { tapRootEventReader } from './tap-root-events.mjs';
 import {
   TAP_GOVERNANCE_SIGNER_ENV,
@@ -45,6 +47,7 @@ export const POOL_SETTLEMENT_ABI = [
   'function governanceDelay() view returns (uint64)',
   'function governanceSigner() view returns (address)',
   'function pendingRoot() view returns (bytes32 merkleRoot, uint256 newEpoch, uint256 newCumulativeSpent, uint256 previousEpoch, uint256 previousCumulativeSpent, uint256 nonce, uint64 executeAfter)',
+  'function pendingMaxEpochDelta() view returns (uint256 newMaxEpochDelta, uint256 nonce, uint64 executeAfter)',
   'function epoch() view returns (uint256)',
   'function cumulativeSpent() view returns (uint256)',
   'function totalDeposited() view returns (uint256)',
@@ -972,10 +975,7 @@ function sortedTapLiabilities(map) {
 function tapSweepPointer(bundle) {
   if (!hasOwn(bundle ?? {}, 'tap_liability_sweep')) return null;
   const pointer = bundle.tap_liability_sweep;
-  if (!isObject(pointer) || Object.keys(pointer).length !== 3 ||
-      !['schema_version', 'signed_length', 'after'].every(key => hasOwn(pointer, key)) ||
-      ![1, 2].includes(pointer.schema_version) || !Number.isSafeInteger(pointer.signed_length) || pointer.signed_length < 1 ||
-      !(pointer.after === null || (typeof pointer.after === 'string' && TAP_LIABILITY_CURSOR.test(pointer.after)))) {
+  if (!validTapSweepPointer(pointer)) {
     throw new Error('invalid TAP liability sweep pointer');
   }
   return pointer;
@@ -993,7 +993,7 @@ async function verifiedTapSweep({ pointer, bundle, epochApplyHash, tapRateLock, 
   const at = tapPreparationAt(bundle);
   const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
   const page = await resolveTapLiabilitySweep({ peerRpcUrl, epoch: bundle.epoch, epochApplyHash, at,
-    signedLength: pointer.signed_length, after: pointer.after, schemaVersion: pointer.schema_version, fetchImpl });
+    signedLength: pointer.signed_length, after: pointer.after, schemaVersion: pointer.schema_version, limit: pointer.limit, fetchImpl });
   if (page?.signed_length !== pointer.signed_length || page.after !== pointer.after ||
       !(page.next_after === null || (typeof page.next_after === 'string' && TAP_LIABILITY_CURSOR.test(page.next_after) &&
         (pointer.after === null || page.next_after > pointer.after)))) {
@@ -1051,19 +1051,24 @@ function buyerRefundSource(inputBundle) {
     ?? [];
 }
 
-function buyerRefundAccount(entry, buyerAccounts) {
+function buyerRefundDestination(entry, buyerAccounts) {
   const direct = entry.account
     ?? entry.buyer_tap_address
     ?? entry.tap_address
     ?? entry.eth_address;
-  if (direct) return normalizeAddress(direct, 'buyer refund account');
+  if (direct) return { account: normalizeAddress(direct, 'buyer refund account') };
   const buyerId = entry.buyer ?? entry.user ?? entry.user_pubkey ?? entry.user_public_key;
   if (typeof buyerId !== 'string' || buyerId.length === 0) {
     throw new Error('buyer refund requires account or buyer/user id');
   }
   const mapped = buyerAccounts?.[buyerId] ?? buyerAccounts?.[buyerId.toLowerCase()];
-  if (!mapped) throw new Error(`Missing TAP refund address for buyer ${buyerId}`);
-  return normalizeAddress(mapped, `buyer refund account for ${buyerId}`);
+  return mapped ? { account: normalizeAddress(mapped, 'buyer refund account') } : { buyer: buyerId };
+}
+
+function buyerRefundAccount(entry, buyerAccounts) {
+  const destination = buyerRefundDestination(entry, buyerAccounts);
+  if (!destination.account) throw new Error(`Missing TAP refund address for buyer ${destination.buyer}`);
+  return destination.account;
 }
 
 function buyerRefundWei(entry, rate) {
@@ -1076,6 +1081,58 @@ function buyerRefundWei(entry, rate) {
     ?? entry.refund_au;
   if (au !== undefined) return auToTapWei(au, rate);
   throw new Error('buyer refund requires cumulative_wei/amount_wei/refund_wei or cumulative_au/amount_au/refund_au');
+}
+
+// Preserve denomination and each conversion boundary. Adding AU first would
+// change the sum of the per-refund integer divisions at the proposal price.
+export function transferableTapRefunds(bundle, buyerAccounts = {}) {
+  const source = buyerRefundSource(bundle);
+  if (!Array.isArray(source) && !isObject(source)) throw new Error('Invalid TAP draft refunds');
+  const normalize = (destination, entry) => {
+    const wei = entry.cumulative_wei ?? entry.amount_wei ?? entry.refund_wei;
+    const au = entry.cumulative_au ?? entry.amount_au ?? entry.refund_au;
+    if (wei === undefined && au === undefined) throw new Error('Missing TAP draft refund amount');
+    if (wei !== undefined) return { ...destination, amount_wei: String(parseBigIntString(wei, 'buyer refund wei')) };
+    return { ...destination, amount_au: String(safeAu(au, 'buyer refund AU', { allowZero: true })) };
+  };
+  const original = Array.isArray(source)
+    ? source.map(entry => normalize(buyerRefundDestination(entry, buyerAccounts), entry))
+    : Object.entries(source).map(([key, entry]) => normalize({ account: normalizeAddress(key, 'refund address') },
+      isObject(entry) ? entry : { amount_wei: entry }));
+  return original;
+}
+
+export function hasTapRefunds(bundle) {
+  const source = buyerRefundSource(bundle);
+  if (!Array.isArray(source) && !isObject(source)) throw new Error('Invalid TAP refunds');
+  return Object.keys(source).length > 0;
+}
+
+// A positive AU debt below one wei, or a buyer without a destination, has
+// received nothing. Keep its denomination and identity for the next root.
+export function projectTapRefunds(bundle, buyers, rate, hasProviderOutput) {
+  const own = transferableTapRefunds(bundle, buyers);
+  const carried = transferableTapRefunds({ refunds: bundle.tap_carried_refunds ?? [] }, buyers);
+  const credits = [], unpaid = [];
+  let reservedWei = 0n;
+  for (const entry of [...own, ...carried]) {
+    if (BigInt(entry.amount_au ?? entry.amount_wei) === 0n) continue;
+    const wei = buyerRefundWei(entry, rate);
+    if (hasProviderOutput && entry.account && entry.account !== ethers.ZeroAddress &&
+        entry.account !== MAINNET_POOL && wei > 0n) {
+      credits.push({ account: entry.account, amount_wei: String(wei) });
+    } else {
+      unpaid.push(entry);
+      reservedWei += wei;
+    }
+  }
+  return { credits, unpaid, reservedWei };
+}
+
+export function cumulativeTapRefunds(credits, prior) {
+  const amounts = priorRefundMap(prior);
+  for (const row of credits) addWei(amounts, row.account, BigInt(row.amount_wei));
+  return sortedDistributionEntries(amounts).map(({ account, amount }) => ({ account, cumulative_wei: String(amount) }));
 }
 
 function applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate) {
@@ -1338,7 +1395,17 @@ function buildTapSettlementFromEntries({
     });
   }
 
-  if (!resumingSweep) applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate);
+  let reservedRefundWei = 0n;
+  if (inputBundle.tap_refund_queue_version !== undefined || inputBundle.tap_carried_refunds !== undefined) {
+    if (!sweep || inputBundle.tap_refund_queue_version !== 1) throw new Error('TAP refund queue requires a frozen sweep');
+    if (!resumingSweep) {
+      const refunds = projectTapRefunds(inputBundle, buyerAccounts, rate, checkpointOutputs.length > 0);
+      applyBuyerRefunds(perBuyerRefund, { refunds: refunds.credits }, {}, rate);
+      if (checkpointOutputs.length) reservedRefundWei = refunds.reservedWei;
+    }
+  } else if (!resumingSweep) {
+    applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate);
+  }
 
   const providers = sortedDistributionEntries(perProvider);
   const providerClaimedWei = providers.reduce((sum, entry) => sum + entry.amount, 0n);
@@ -1426,6 +1493,7 @@ function buildTapSettlementFromEntries({
     canonical_deferred_liabilities: deferredLiabilities,
     checkpoint_outputs: checkpointOutputs,
     provider_claimed_wei: providerClaimedWei.toString(),
+    ...(reservedRefundWei > 0n && { pending_refund_wei: String(reservedRefundWei) }),
     buyer_refund_wei: buyerRefundWei.toString(),
     total_claimed_wei: totalClaimedWei.toString(),
     provider_cap_wei: providerCapWei.toString(),
@@ -1670,7 +1738,8 @@ export async function guardianPreSignReport({
   const providerOwedWei = providerEntries.reduce((sum, entry) => sum + entry.amount, 0n);
   if (providerOwedWei > providerCapWei) reasons.push('provider owed > 75% spent cap');
   if (providerOwedWei < providerCapWei) reasons.push('provider owed < 75% spent cap');
-  if (totalOwedWei + operatorCapWei + burnCapWei > depositedWei) {
+  const unpaidRefundWei = safeAu(settlement.pending_refund_wei ?? '0', 'pending buyer refund wei', { allowZero: true });
+  if (totalOwedWei + operatorCapWei + burnCapWei + unpaidRefundWei > depositedWei) {
     reasons.push('owed + operator cap + burn cap > deposited');
   }
 
@@ -1694,15 +1763,24 @@ export async function guardianPreSignReport({
 }
 
 function pendingRootRecord(value) {
-  const executeAfter = BigInt(value?.executeAfter ?? value?.[6] ?? 0);
-  if (executeAfter === 0n) return null;
+  const root = value?.merkleRoot ?? value?.[0];
+  const fields = ['newEpoch', 'newCumulativeSpent', 'previousEpoch', 'previousCumulativeSpent', 'nonce', 'executeAfter']
+    .map((key, i) => value?.[key] ?? value?.[i + 1]);
+  const uint = x => (typeof x === 'bigint' && x >= 0n) || (Number.isSafeInteger(x) && x >= 0) ||
+    (typeof x === 'string' && /^(0|[1-9][0-9]{0,77})$/.test(x));
+  if (typeof root !== 'string' || !/^0x[0-9a-f]{64}$/i.test(root) || !fields.every(uint)) {
+    throw new Error('Invalid TAP pending root record');
+  }
+  const [epoch, spent, previousEpoch, previousSpent, nonce, executeAfter] = fields.map(BigInt);
+  if (executeAfter === 0n) {
+    if (root.toLowerCase() !== ethers.ZeroHash || fields.some(x => BigInt(x) !== 0n)) throw new Error('Ambiguous empty TAP pending root');
+    return null;
+  }
+  if (root.toLowerCase() === ethers.ZeroHash || epoch <= previousEpoch || spent < previousSpent ||
+      ![epoch, previousEpoch, executeAfter].every(n => Number.isSafeInteger(Number(n)))) throw new Error('Invalid TAP pending root');
   return {
-    merkle_root: String(value?.merkleRoot ?? value?.[0]).toLowerCase(),
-    epoch: Number(value?.newEpoch ?? value?.[1]),
-    cumulative_spent_wei: BigInt(value?.newCumulativeSpent ?? value?.[2]).toString(),
-    previous_epoch: Number(value?.previousEpoch ?? value?.[3]),
-    previous_cumulative_spent_wei: BigInt(value?.previousCumulativeSpent ?? value?.[4]).toString(),
-    nonce: BigInt(value?.nonce ?? value?.[5]).toString(),
+    merkle_root: root.toLowerCase(), epoch: Number(epoch), cumulative_spent_wei: String(spent),
+    previous_epoch: Number(previousEpoch), previous_cumulative_spent_wei: String(previousSpent), nonce: String(nonce),
     execute_after: Number(executeAfter),
   };
 }
@@ -2157,6 +2235,9 @@ export async function rollTapSettlement(options = {}) {
       poolRootOrNull(pool),
       pool.pendingRoot().then(pendingRootRecord),
     ]);
+    if (pendingRoot && (pendingRoot.previous_epoch !== chainEpoch || pendingRoot.previous_cumulative_spent_wei !== String(chainSpentWei))) {
+      throw new Error('TAP pending root has a conflicting pool predecessor');
+    }
     rootAlreadyPosted = (
       chainEpoch > 0
       && chainSpentWei === expectedSpentWei
@@ -2172,6 +2253,7 @@ export async function rollTapSettlement(options = {}) {
     throw new Error('Prior TAP settlement differs from the confirmed pool basis');
   }
   if (sweep && !rootAlreadyPosted) {
+    if (!pendingRoot) await options.checkQueuedSweep?.();
     const baseMatches = prior?.root
       ? matchesConfirmedPriorRoot(prior, tapRateLock, chainRoot, chainEpoch, chainSpentWei)
       : !pool || (chainEpoch === 0 && chainRoot === ethers.ZeroHash && chainSpentWei === 0n);
@@ -2260,6 +2342,7 @@ export async function rollTapSettlement(options = {}) {
   const checkPrice = (financialAt, basis) => verifyTapFinancialPolicy({
     intent: preparationPlan.intent, financialAt, peerRpcUrl, fetchImpl, poolBasis: basis,
   });
+  options.observeDraftPlan?.(preparationPlan);
   const checkPendingPrice = async (pending, head) => {
     const proposal = await lookupProposedRoot({ pool, epoch: screen.epoch, root: expectedRoot,
       cumulativeSpentWei: expectedSpentWei, tapRateLock, rootEventReader, nonce: BigInt(pending.nonce),
@@ -2415,6 +2498,17 @@ export async function rollTapSettlement(options = {}) {
   }
 
   let canonicalPreparation = null;
+  if (sweep && pool && !pendingRoot && !rootAlreadyPosted) {
+    const intent = preparationPlan.intent;
+    await preflightTapSweepPreparations(preparationPlan, peerRpcUrl, fetchImpl, prior, async (record, output, admin) => {
+      const { contractVersion } = await preparationDependencies();
+      const expected = { ...output, op: 'prepare_targeted_payout', contract_version: contractVersion, rail: 'tap',
+        epoch: intent.epoch, epoch_apply_hash: intent.epoch_apply_hash, prepared_at: intent.at,
+        payload_hash: record.payload_hash, admin };
+      if (!exactUnconsumedPreparation(record, expected)) throw new Error('Conflicting TAP preparation signature');
+    });
+    if (post) await checkPrice((await currentPoolBlock(pool)).timestamp, poolBasis);
+  }
   if (post && pool) {
     if (typeof canonicalPreparationSubmitter !== 'function') {
       throw new Error(
@@ -2463,6 +2557,7 @@ export async function rollTapSettlement(options = {}) {
   if (post && pool) {
     if (!ownerSigner) throw new Error('Missing TAP settlement owner signer for broadcast');
     if (!writable) throw new Error('Missing writable TAP pool');
+    options.beforeEthereumEffect?.(preparationPlan);
     if (!rootAlreadyPosted && !pendingRoot) {
       // Confirmation of preparations can take time. Recheck immediately before
       // proposing, then use the actual mined proposal before executing.
@@ -2865,12 +2960,20 @@ export async function resolveTargetedTapPayoutsFromLedger({
   fetchImpl,
 } = {}) {
   const bundleEpoch = bundle?.epoch ?? bundle?.receipt_epoch ?? bundle?.settlement_epoch;
+  const selector = tapSweepPointer(bundle);
+  let snapshot;
+  const read = key => snapshot ? snapshot.get(key) : readContractStateValue(peerRpcUrl, key, { confirmed: true, fetchImpl });
   const sessionBindings = {};
   const accounts = {};
   const liabilities = new Map();
   const aggregatePaidByProvider = new Map();
   const entries = await verifiedSettlementReceipts(bundle, normalizedReceipts(bundle));
-  for (const { entry, body, envelope, proxy = false } of entries) {
+  for (const [index, { entry, body, envelope, proxy = false }] of entries.entries()) {
+    // Each bounded batch uses the same signed checkout. Large valid receipt
+    // epochs need multiple batches even when the monetary page contains one row.
+    if (selector?.schema_version === 2 && index % 32 === 0) {
+      snapshot = tapContractAt(peerRpcUrl, selector.signed_length, fetchImpl);
+    }
     if (!proxy) verifyReceiptEnvelope(envelope);
     const epoch = parsePositiveInt(
       entryEpoch(entry, body, bundleEpoch),
@@ -2881,11 +2984,7 @@ export async function resolveTargetedTapPayoutsFromLedger({
       user: body.user,
       sessionId: body.session_id,
     });
-    const allocation = await readContractStateValue(
-      peerRpcUrl,
-      `payout/allocation/${epoch}/${body.session_id}`,
-      { confirmed: true, fetchImpl }
-    );
+    const allocation = await read(`payout/allocation/${epoch}/${body.session_id}`);
     if (!allocation ||
         allocation.type !== 'provider_payout_session_allocation' ||
         allocation.epoch !== epoch ||
@@ -2900,41 +2999,33 @@ export async function resolveTargetedTapPayoutsFromLedger({
     }
     const allocationAu = safeAu(allocation.au, 'targeted TAP allocation au').toString();
     const revision = allocation.payout_revision.toLowerCase();
-    const binding = await readContractStateValue(
-      peerRpcUrl,
-      `payout/binding/tap/${body.provider}/${revision}`,
-      { confirmed: true, fetchImpl }
-    );
-    if (!binding ||
-        binding.verified !== true ||
-        binding.provider !== body.provider ||
-        binding.rail !== 'tap' ||
-        binding.revision !== revision ||
-        binding.activation_epoch > epoch ||
-        !Number.isSafeInteger(binding.chain_id) ||
-        binding.chain_id < 1) {
+    const binding = await read(`payout/binding/tap/${body.provider}/${revision}`);
+    const liability = await read(`payout/liability/tap/${body.provider}/${revision}`);
+    // For a v2 receipt the signed allocation and liability establish what was
+    // earned. Only the separate signed page can authorize a transfer target.
+    const unbound = snapshot && (binding === null || binding.verified === false);
+    if (!unbound && (!binding || binding.verified !== true || binding.provider !== body.provider ||
+        binding.rail !== 'tap' || binding.revision !== revision || binding.activation_epoch > epoch ||
+        !Number.isSafeInteger(binding.chain_id) || binding.chain_id < 1)) {
       throw new Error(`verified targeted TAP binding is missing for session ${body.session_id}`);
     }
-    const liability = await readContractStateValue(
-      peerRpcUrl,
-      `payout/liability/tap/${body.provider}/${revision}`,
-      { confirmed: true, fetchImpl }
-    );
-    if (!liability ||
-        liability.provider !== body.provider ||
-        liability.rail !== 'tap' ||
-        liability.revision !== revision ||
-        liability.target !== binding.target ||
-        liability.chain_id !== binding.chain_id) {
+    if (!liability || liability.provider !== body.provider || liability.rail !== 'tap' ||
+        liability.revision !== revision || (unbound ? liability.chain_id !== 1 :
+          liability.target !== binding.target || liability.chain_id !== binding.chain_id)) {
       throw new Error(`targeted TAP liability is missing for session ${body.session_id}`);
+    }
+    if (unbound && binding !== null && (binding.type !== 'provider_payout_binding' ||
+        binding.provider !== body.provider || binding.rail !== 'tap' || binding.revision !== revision ||
+        binding.target !== liability.target || binding.chain_id !== 1 || binding.currency !== null)) {
+      throw new Error('Unverified TAP binding conflicts with the signed receipt liability');
+    }
+    if (snapshot) {
+      const error = snapshot.guardianValidatePayoutLiabilityRecord(liability, body.provider, 'tap', revision);
+      if (error instanceof Error) throw error;
     }
     let aggregatePaidCumAu = aggregatePaidByProvider.get(body.provider);
     if (aggregatePaidCumAu === undefined) {
-      const earning = await readContractStateValue(
-        peerRpcUrl,
-        `earn/tap/${body.provider}`,
-        { confirmed: true, fetchImpl }
-      );
+      const earning = await read(`earn/tap/${body.provider}`);
       if (!earning ||
           earning.provider !== body.provider ||
           earning.rail !== 'tap') {
@@ -2996,12 +3087,13 @@ export async function resolveTargetedTapPayoutsFromLedger({
       provider: body.provider,
       payout_revision: revision,
       account: normalizeAddress(
-        binding.target,
+        liability.target,
         `targeted TAP account for ${body.provider}`
       ),
-      chain_id: binding.chain_id,
-      context_revision: binding.context_revision,
-      payment_config_version: binding.payment_config_version,
+      chain_id: liability.chain_id,
+      context_revision: binding?.context_revision,
+      payment_config_version: binding?.payment_config_version,
+      ...(unbound && { verified: false }),
       au: allocationAu,
     };
     if (sessionBindings[key] &&
@@ -3010,7 +3102,7 @@ export async function resolveTargetedTapPayoutsFromLedger({
     }
     sessionBindings[key] = resolved;
     const providerRevision = `${body.provider}/${revision}`;
-    accounts[providerRevision] = resolved.account;
+    if (!unbound) accounts[providerRevision] = resolved.account;
   }
   return {
     accounts,
@@ -3396,7 +3488,7 @@ async function submitPreparationFeature({
   fetchImpl = globalThis.fetch,
   timeoutMs = PREPARATION_CONFIRM_TIMEOUT_MS,
   intervalMs = PREPARATION_CONFIRM_INTERVAL_MS,
-  requireExisting,
+  requireExisting, beforePost,
 } = {}) {
   const recordKey = `payout/preparation/tap/${unsigned.economic_op_id}`;
   const readPreparation = async () => {
@@ -3421,13 +3513,17 @@ async function submitPreparationFeature({
   if (requireExisting) throw new Error('Existing TAP root lacks its preceding canonical preparation');
   const message = 'mayhem-targeted-payout-preparation-v1' + stableJson(payoutPreparationEvidence(unsigned));
   const signature = String(await adminSigner.sign(message)).toLowerCase();
-  if (!isHexBytes(signature, 64)) throw new Error('canonical TAP preparation signer returned an invalid signature');
+  if (!isHexBytes(signature, 64) || !crypto.verify(null, Buffer.from(message),
+    ed25519PublicKeyFromRawHex(unsigned.admin), Buffer.from(signature, 'hex'))) {
+    throw new Error('canonical TAP preparation signer returned an invalid signature');
+  }
   const value = { ...unsigned, admin_sig: signature };
   const featureDigest = await opaqueBlake3Hash(
     'mayhem-targeted-payout-preparation-feature-v1',
     value
   );
   const url = new URL('contract/feature', ensureRpcBase(peerRpcUrl));
+  beforePost?.();
   const response = await fetchImpl(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -3476,7 +3572,7 @@ export async function submitCanonicalTapPreparationPlan({
   peerRpcUrl,
   fetchImpl,
   timeoutMs,
-  intervalMs,
+  intervalMs, beforePost,
 } = {}) {
   if (!isObject(plan) || !Array.isArray(plan.preparations)) {
     throw new Error('canonical TAP preparation plan is missing');
@@ -3530,7 +3626,7 @@ export async function submitCanonicalTapPreparationPlan({
       peerRpcUrl,
       unsigned,
       adminSigner,
-      requireExisting,
+      requireExisting, beforePost,
       fetchImpl,
       timeoutMs,
       intervalMs,
@@ -3579,7 +3675,7 @@ export function settlementBundleSha256(bundle) {
   return crypto.createHash('sha256').update(stableJson(bundle)).digest('hex');
 }
 
-function canonicalTapPaymentScope(payments, admin) {
+export function canonicalTapPaymentScope(payments, admin) {
   if (!isObject(payments) || payments.denom !== 'au_usd') {
     throw new Error('confirmed payments/current is missing or invalid');
   }
@@ -3606,7 +3702,7 @@ function canonicalTapPaymentScope(payments, admin) {
   };
 }
 
-function tapRateRecordToLock(rate, bundle, admin, paymentScope) {
+export function tapRateRecordToLock(rate, bundle, admin, paymentScope) {
   const epoch = parsePositiveInt(bundle?.epoch, 'settlement bundle epoch');
   if (!isObject(rate) || rate.denom !== 'tap_usd_au') {
     throw new Error('confirmed tap/rate/latest is missing or invalid');
@@ -3641,7 +3737,7 @@ function tapRateRecordToLock(rate, bundle, admin, paymentScope) {
   };
 }
 
-function validateTapRateLock(lock, bundle, paymentScope) {
+export function validateTapRateLock(lock, bundle, paymentScope) {
   if (!isObject(lock)) throw new Error('TAP settlement rate lock must be an object');
   const expectedKeys = [
     'bundle_sha256',
@@ -3757,6 +3853,7 @@ function buildReplayCommand({
   peerRpcUrl,
   buyerAccountsPath,
   tapRateLockPath,
+  settlementSpool,
   ledgerFeeBps,
   priorPath,
   poolAddress,
@@ -3771,6 +3868,7 @@ function buildReplayCommand({
   if (buyerAccountsPath) args.push('--buyer-accounts', buyerAccountsPath);
   if (tapRateLockPath) args.push('--tap-rate-lock', tapRateLockPath);
   if (ledgerFeeBps !== undefined && ledgerFeeBps !== null) args.push('--ledger-fee-bps', String(ledgerFeeBps));
+  if (settlementSpool) args.push('--settlement-spool', settlementSpool);
   if (priorPath) args.push('--prior', priorPath);
   if (poolAddress) args.push('--pool', poolAddress);
   if (operatorAddress) args.push('--operator-address', operatorAddress);
@@ -3793,7 +3891,21 @@ async function main() {
   }
   const bundlePath = args.bundle || args['receipts-file'];
   if (!bundlePath) throw new Error('Missing --bundle/--receipts-file.');
+  const working = path.dirname(path.resolve(bundlePath));
+  const inferredSpool = path.basename(working) === 'working' && fs.existsSync(path.join(working, '../roller.lock'))
+    ? path.dirname(working) : undefined;
+  const spool = args['settlement-spool'] || inferredSpool;
+  if (spool) holdTapLock(path.join(spool, 'roller.lock'), 8);
   const bundle = readJson(path.resolve(bundlePath), 'receipt bundle');
+  let journal;
+  if (spool) {
+    const name = 'epoch-' + bundle.epoch + '-' + bundle.epoch_apply_hash;
+    if (!/^epoch-[1-9][0-9]*-[0-9a-f]{64}$/.test(name) ||
+        path.resolve(spool, 'working', name + '.receipts.json') !== path.resolve(bundlePath)) {
+      throw new Error('TAP managed bundle is outside its canonical working path');
+    }
+    journal = path.join(working, name);
+  }
   const sweepPointer = tapSweepPointer(bundle);
   if (args['provider-accounts'] !== undefined) {
     throw new Error('--provider-accounts is not supported.');
@@ -3880,6 +3992,15 @@ async function main() {
   }) : undefined;
 
   const report = await rollTapSettlement({
+    checkQueuedSweep: async () => {
+      if (!spool && !sweepPointer?.limit && !Object.hasOwn(bundle, 'tap_carried_refunds') &&
+          !Object.hasOwn(bundle, 'tap_refund_queue_version')) return;
+      if (!spool) throw new Error('Recovery sweep requires --settlement-spool');
+      const { validateQueuedSweep } = await import('./prepare-tap-sweep-bundle.mjs');
+      validateQueuedSweep(spool, bundle);
+    },
+    beforeEthereumEffect: journal ? plan => journalTapPreparation(journal + '.prepare-intent.json', plan) : undefined,
+    observeDraftPlan: journal ? plan => journalTapPreparation(journal + '.draft-plan.json', plan, true) : undefined,
     bundle,
     peerRpcUrl,
     targetedSessionBindings: targetedPayouts.sessionBindings,
@@ -3902,9 +4023,8 @@ async function main() {
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
     canonicalPreparationSubmitter: confirm
       ? ({ plan, requireExisting }) => submitCanonicalTapPreparationPlan({
-        plan, requireExisting,
-        adminSigner: preparationAdminSigner,
-        peerRpcUrl,
+        plan, requireExisting, adminSigner: preparationAdminSigner, peerRpcUrl,
+        beforePost: journal ? () => journalTapPreparation(journal + '.prepare-intent.json', plan) : undefined,
       })
       : null,
     post: confirm,
@@ -3920,6 +4040,7 @@ async function main() {
     tapRateLockPath,
     ledgerFeeBps,
     priorPath,
+    settlementSpool: spool,
     poolAddress,
     operatorAddress,
     epoch: report.epoch,
@@ -3933,6 +4054,7 @@ async function main() {
       buyerAccountsPath,
       tapRateLockPath,
       ledgerFeeBps,
+      settlementSpool: spool,
       priorPath,
       poolAddress,
       operatorAddress,

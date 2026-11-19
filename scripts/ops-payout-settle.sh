@@ -655,9 +655,9 @@ PY
 validate_rail_marker() {
   local rail="$1"
   python3 - "$work_dir/$rail.complete" "$rail" "$applied_epoch" "$apply_hash" \
-    "$canonical_settlement_unix" <<'PY'
+    "$canonical_settlement_unix" "$TAP_SPOOL" <<'PY'
 import hashlib, json, os, sys
-path, expected_rail, expected_epoch, expected_hash, expected_settlement_unix = sys.argv[1:]
+path, expected_rail, expected_epoch, expected_hash, expected_settlement_unix, tap_spool = sys.argv[1:]
 d = json.load(open(path))
 if (
     d.get("schema_version") != 1
@@ -679,6 +679,16 @@ else:
         raise SystemExit(f"{expected_rail} completion evidence is missing")
     if hashlib.sha256(open(evidence, "rb").read()).hexdigest() != d.get("evidence_sha256"):
         raise SystemExit(f"{expected_rail} completion evidence hash changed")
+    if expected_rail == "tap" and d["status"] == "superseded":
+        prefix = os.path.join(tap_spool, "deferred", f"epoch-{expected_epoch}-{expected_hash}")
+        cert = json.load(open(evidence))
+        produced = json.load(open(os.path.join(os.path.dirname(path), "tap.produced")))
+        if (os.path.abspath(evidence) != os.path.abspath(prefix + ".draft.json")
+            or cert.get("type") != "unprepared_tap_sweep" or cert.get("epoch") != int(expected_epoch)
+            or cert.get("epoch_apply_hash") != expected_hash or cert.get("at") != int(expected_settlement_unix)
+            or cert.get("bundle_sha256") != produced.get("evidence_sha256")
+            or hashlib.sha256(open(prefix + ".receipts.json", "rb").read()).hexdigest() != cert["bundle_sha256"]):
+            raise SystemExit("TAP supersession lacks its original unpaid draft")
 PY
 }
 
@@ -2517,7 +2527,7 @@ else:
 produce_tap_work() {
   [[ -f "$work_dir/tap.complete" ]] && {
     validate_rail_marker tap || return 1
-    echo "tap: settlement already reconciled for epoch $applied_epoch"
+    echo "tap: verified the recorded work outcome for epoch $applied_epoch"
     return 0
   }
 
@@ -2531,7 +2541,7 @@ produce_tap_work() {
     spool_path=""
     spool_count=0
     local state candidate
-    for state in ready working processed failed; do
+    for state in ready working processed failed deferred; do
       candidate="$TAP_SPOOL/$state/$name"
       [[ -f "$candidate" ]] || continue
       spool_count=$((spool_count + 1))
@@ -2569,6 +2579,24 @@ PY
       return 1
     fi
     validate_tap_produced "$spool_path" || return 1
+    if [[ "$spool_state" == deferred || "$spool_state" == failed || ( "$spool_state" == working &&
+          -f "${spool_path%.receipts.json}.draft-retry" ) ]]; then
+      if [[ "$TAP_SWEEP_ENABLED" == 1 && "$applied_epoch" -lt "$canonical_applied_epoch" &&
+            -f "$work_dir/tap-sweep-intent.json" ]]; then
+        # The child holds payout.lock. The roller releases its own lock only
+        # between attempts, after any pending Core or EVM invocation returns.
+        if (
+          flock -n 8 || exit 1
+          node "$SOURCE_DIR/contracts/scripts/tap-draft-recovery.mjs" retire "$TAP_SPOOL" \
+            "${name%.receipts.json}" "$RPC_URL" "$work_dir" "$canonical_applied_epoch" "$canonical_apply_hash"
+        ) 8>"$TAP_SPOOL/roller.lock"; then
+          validate_rail_marker tap || return 1
+          echo "tap: handed unprepared sweep to the next applied epoch"
+          return 0
+        fi
+      fi
+      [[ "$spool_state" != deferred ]] || return 2
+    fi
     case "$spool_state" in
       ready|working)
         echo "tap: settlement worker owns $spool_path in $spool_state state"
@@ -2591,8 +2619,8 @@ PY
 
   local sweep=0 empty_mode=receipts
   tap_spool_state || return 1
-  if [[ -f "$work_dir/tap-sweep-intent.json" ]] || \
-    [[ "$TAP_SWEEP_ENABLED" == 1 && "$applied_epoch" == "$canonical_applied_epoch" && "$spool_count" == 0 ]]; then
+  if [[ -f "$work_dir/tap-sweep-intent.json" ]] ||
+    [[ "$TAP_SWEEP_ENABLED" == 1 && "$spool_count" == 0 ]]; then
     sweep=1
   fi
   temp_bundle="$work_dir/tap-receipts.json.tmp"
@@ -2649,6 +2677,11 @@ PY
     node "$SOURCE_DIR/contracts/scripts/prepare-tap-sweep-bundle.mjs" prepare \
       "$applied_epoch" "$apply_hash" "$work_dir" "$TAP_SPOOL" "$RPC_URL" "$temp_bundle" "$empty_mode" || return 1
   elif [[ "$receipt_count" == 0 ]]; then
+    if ! jq -e '[.buyer_refunds, .buyerRefunds, .refunds] | all(. == null or . == [] or . == {})' \
+      "$temp_bundle" >/dev/null; then
+      echo "tap: historical refund instructions require an authenticated sweep checkout" >&2
+      return 1
+    fi
     rm -f "$temp_bundle"
     mark_rail tap no_work "$bundle" || return 1
     echo "tap: finalized bundle has no TAP receipts"

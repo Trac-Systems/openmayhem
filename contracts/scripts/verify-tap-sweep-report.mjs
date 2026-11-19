@@ -1,6 +1,7 @@
 // Read-only spool gate. The page selector comes from the frozen bundle, never
 // from the report whose completeness is being checked.
 import fs from 'node:fs';
+import { validTapSweepPointer } from './tap-liability-sweep.mjs';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { stableValue } from '../../intercom/scripts/recompute-epoch-roots.mjs';
@@ -188,10 +189,7 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
     return;
   }
   const selector = bundle.tap_liability_sweep;
-  requireEvidence(selector && isDeepStrictEqual(Object.keys(selector).sort(), ['after', 'schema_version', 'signed_length']) &&
-    [1, 2].includes(selector.schema_version) && Number.isSafeInteger(selector.signed_length) && selector.signed_length > 0 &&
-    (selector.after === null || (typeof selector.after === 'string' && cursorPattern.test(selector.after))),
-  'invalid frozen page selector');
+  requireEvidence(validTapSweepPointer(selector), 'invalid frozen page selector');
   requireEvidence(bundle.rail === 'tap' && Number.isSafeInteger(bundle.epoch) && bundle.epoch > 0 &&
     typeof bundle.epoch_apply_hash === 'string' && /^[0-9a-f]{64}$/.test(bundle.epoch_apply_hash) &&
     report.epoch === bundle.epoch && report.epoch_apply_hash === bundle.epoch_apply_hash &&
@@ -207,7 +205,7 @@ export async function verifyTapSweepReport({ bundle, report, peerRpcUrl, rateLoc
   const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
   const signal = AbortSignal.timeout(60_000);
   const page = await resolveTapLiabilitySweep({ peerRpcUrl, epoch: bundle.epoch, epochApplyHash: bundle.epoch_apply_hash,
-    at, signedLength: selector.signed_length, after: selector.after, schemaVersion: selector.schema_version,
+    at, signedLength: selector.signed_length, after: selector.after, schemaVersion: selector.schema_version, limit: selector.limit,
     fetchImpl: (url, options) => fetchImpl(url, { ...options, signal }) });
   requireEvidence(page.signed_length === selector.signed_length && page.after === selector.after &&
     (page.next_after === null || (typeof page.next_after === 'string' && cursorPattern.test(page.next_after))) &&

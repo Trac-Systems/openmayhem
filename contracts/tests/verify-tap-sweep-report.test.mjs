@@ -215,7 +215,7 @@ test('spool binding and completion each read the pinned page; interrupted reads 
     };`);
   const reads = path.join(root, 'reads');
   const env = { PATH: process.env.PATH, NODE_OPTIONS: `--import=${preload}`, READS: reads,
-    repo, SOURCE_DIR: repo, TAP_SPOOL: root, working, processed, name, applied_epoch: '8', apply_hash: hash,
+    repo, SOURCE_DIR: repo, TAP_SPOOL: root, spool: root, working, processed, name, applied_epoch: '8', apply_hash: hash,
     peer_rpc: ctx.peerRpcUrl, RPC_URL: ctx.peerRpcUrl, attempt_timeout: '3', interval: '0',
     bundle: path.join(working, receiptName), rate_lock: path.join(working, `${name}.tap-rate.json`),
     dry_report: path.join(working, 'dry'), bound_report: path.join(working, 'bound'),
@@ -223,7 +223,8 @@ test('spool binding and completion each read the pinned page; interrupted reads 
     event_cursor: path.join(working, 'events'), buyer_accounts: path.join(working, 'buyers') };
   const run = (source, pin) => spawnSync('bash', ['-eu', '-c', source], {
     env: { ...env, RESPONSE_PIN: String(pin) }, encoding: 'utf8' });
-  const bind = `timeout() { shift; "$@"; }
+  const bind = `flock() { :; } # One isolated attempt, no competing producer.
+timeout() { shift; "$@"; }
 ${helpers}
 for attempt in once; do
 ${binding}
@@ -276,7 +277,7 @@ test('finalized zero-receipt roller report passes both existing payment gates on
   const chainEvidence = rootReceiptFixture();
   const pool = {
     epoch: async () => 8, cumulativeSpent: async () => BigInt(draft.cumulative_spent_wei),
-    merkleRoot: async () => draft.root, pendingRoot: async () => ({}),
+    merkleRoot: async () => draft.root, pendingRoot: async () => ['0x' + '0'.repeat(64), 0n, 0n, 0n, 0n, 0n, 0n],
     getAddress: async () => ctx.rateLock.pool_address, totalDeposited: async () => 1000n,
     maxEpochDelta: async () => 1000n, operatorWithdrawn: async () => 2n, totalBurned: async () => 2n,
     operatorClaimable: async () => 0n, burnClaimable: async () => 0n,

@@ -1,10 +1,11 @@
+import { isDeepStrictEqual } from 'node:util';
 import MayhemContract from '../../intercom/contract/contract.js';
 
 const PREFIX = 'payout/liability/tap/';
 const KEY = /^payout\/liability\/tap\/([0-9a-f]{64})\/([0-9a-f]{64})$/;
 const HEX32 = /^[0-9a-f]{64}$/;
-const MAINNET_TOKEN = '0x5e7f6e008c6d9d7ad4c7eb75bd4ce62864cc7454';
-const MAINNET_POOL = '0xcfea9a256f1f96269d848cabf1ecb00fd2dd6a28';
+export const MAINNET_TOKEN = '0x5e7f6e008c6d9d7ad4c7eb75bd4ce62864cc7454';
+export const MAINNET_POOL = '0xcfea9a256f1f96269d848cabf1ecb00fd2dd6a28';
 const BATCH_SIZE = 32;
 // Probe gates can fan out over distinct bucket epochs and auditors even on a one-row page.
 const MAX_REQUESTS = 512;
@@ -136,6 +137,7 @@ export async function confirmedTapContract(peerRpcUrl, fetchImpl = fetch) {
     'Invalid TAP confirmed Core checkout');
   const contract = tapContractAt(peerRpcUrl, head.signed_length, fetchImpl);
   requireState(await contract.get('admin') === head.value, 'Inconsistent TAP confirmed Core admin');
+  contract.signedLength = head.signed_length;
   return contract;
 }
 
@@ -198,8 +200,8 @@ async function openProviderPreparation(contract, provider, paid) {
   return tail.economic_op_id;
 }
 
-function verifyBinding(binding, row, payments) {
-  requireState(binding?.type === 'provider_payout_binding' && binding.verified === true &&
+function verifyBinding(binding, row, payments, verified = true) {
+  requireState(binding?.type === 'provider_payout_binding' && binding.verified === verified &&
     binding.provider === row.provider && binding.rail === 'tap' && binding.revision === row.revision &&
     binding.target === row.target && /^0x[0-9a-f]{40}$/.test(binding.target) && binding.currency === null &&
     binding.chain_id === 1 && row.chain_id === 1 && binding.network === 'mainnet' &&
@@ -239,6 +241,38 @@ async function providerBudget(contract, provider, epoch, params) {
   return { gates, payable, paid: earning.paid_cum_au, scannedPaid: 0n, selected: 0n };
 }
 
+// Old v1/v2 selectors always use the original page width. A replacement for
+// a failed draft can freeze a single-row page to isolate an oversized output.
+export function validTapSweepPointer(p) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return false;
+  const single = Object.hasOwn(p, 'limit');
+  return Object.keys(p).length === (single ? 4 : 3) &&
+    ['schema_version', 'signed_length', 'after'].every(k => Object.hasOwn(p, k)) &&
+    [1, 2].includes(p.schema_version) && uint(p.signed_length) && p.signed_length > 0 &&
+    (!single || (p.schema_version === 2 && p.limit === 1)) &&
+    (p.after === null || (typeof p.after === 'string' && KEY.test(p.after)));
+}
+
+// Every TAP root preparation follows a nonempty list of provider preparations.
+// Their immutable watermark locks cover all outputs the frozen selector could
+// ever have reserved, even when binding validation prevents rebuilding a root.
+export async function tapDraftWatermarks({ peerRpcUrl, bundle, fetchImpl }) {
+  const p = bundle.tap_liability_sweep;
+  requireState(validTapSweepPointer(p), 'Invalid TAP draft selector');
+  const snapshot = snapshotReader(peerRpcUrl, p.signed_length, fetchImpl);
+  const contract = Object.assign(Object.create(MayhemContract.prototype), { get: snapshot.get });
+  await verifyAnchor(contract, bundle.epoch, bundle.epoch_apply_hash, bundle.at);
+  await mainnetPayments(contract);
+  const params = await sweepParams(contract, bundle.at);
+  const page = await snapshot.page(p.after, Math.min(p.limit ?? BATCH_SIZE, params.max_tap_settlement_outputs));
+  const rows = page.values.map(({ key, value }) => {
+    const [, provider, revision] = KEY.exec(key);
+    checked(contract.guardianValidatePayoutLiabilityRecord(value, provider, 'tap', revision));
+    return { provider, revision, before: value.paid_cum_au, target: value.target, chainId: value.chain_id };
+  });
+  return { rows, next: page.next_cursor };
+}
+
 /**
  * Read one confirmed TAP liability page at signedLength. Resume at the same pin
  * with next_after, the last scanned full key. A null next_after ends the scan.
@@ -246,7 +280,7 @@ async function providerBudget(contract, provider, epoch, params) {
  * total_au minus held_au minus paid_cum_au. All AU fields are decimal strings.
  */
 export async function resolveTapLiabilitySweep({
-  peerRpcUrl, epoch, epochApplyHash, at, signedLength, after = null, schemaVersion = 1, fetchImpl = fetch,
+  peerRpcUrl, epoch, epochApplyHash, at, signedLength, after = null, schemaVersion = 1, limit, fetchImpl = fetch,
 }) {
   requireState(uint(signedLength) && signedLength > 0 && uint(epoch) && epoch > 0 &&
     hex32(epochApplyHash) && uint(at), 'Invalid pinned TAP sweep inputs');
@@ -259,7 +293,8 @@ export async function resolveTapLiabilitySweep({
   const payments = await mainnetPayments(contract);
   const params = await sweepParams(contract, at);
   const maxOutputs = params.max_tap_settlement_outputs;
-  const page = await snapshot.page(after, Math.min(BATCH_SIZE, maxOutputs));
+  requireState(limit === undefined || (schemaVersion === 2 && limit === 1), 'Invalid TAP recovery page limit');
+  const page = await snapshot.page(after, Math.min(limit ?? BATCH_SIZE, maxOutputs));
   const minimum = BigInt(params.payout_min_au);
   const providers = new Map();
   const liabilities = [];
@@ -269,7 +304,7 @@ export async function resolveTapLiabilitySweep({
     checked(contract.guardianValidatePayoutLiabilityRecord(row, provider, 'tap', revision));
     const binding = await contract.get(contract.providerPayoutBindingFeatureKey('tap', provider, revision));
     const unavailable = schemaVersion === 2 && (binding === null || binding.verified === false);
-    if (!unavailable) verifyBinding(binding, row, payments);
+    if (!unavailable || binding !== null) verifyBinding(binding, row, payments, !unavailable);
     if (!providers.has(provider)) {
       const budget = await providerBudget(contract, provider, epoch, params);
       if (schemaVersion === 2) budget.preparation = await openProviderPreparation(contract, provider, budget.paid);
@@ -301,4 +336,53 @@ export async function resolveTapLiabilitySweep({
     fee_bps: params.fee_bps, max_outputs: maxOutputs, liabilities,
     ...(schemaVersion === 2 ? { deferred } : {}),
   };
+}
+
+// Rehearse the complete ordered plan at a fresh confirmed Core checkout before
+// reserving its first provider. A frozen page can outlive its original budget.
+export async function preflightTapSweepPreparations(plan, peerRpcUrl, fetchImpl, prior, verifyExisting) {
+  const current = await confirmedTapContract(peerRpcUrl, fetchImpl);
+  if (prior?.root) {
+    const record = await current.get('settle/targeted/tap/' + prior.epoch);
+    requireState(record?.type === 'targeted_tap_settlement' && record.epoch === prior.epoch &&
+      record.epoch_apply_hash === prior.epoch_apply_hash && record.root_confirmed === true &&
+      record.root === prior.root && record.cumulative_spent_wei === prior.cumulative_spent_wei &&
+      isDeepStrictEqual(record.entries, prior.entries) && isDeepStrictEqual(record.provider_entries, prior.providers) &&
+      isDeepStrictEqual(record.refunds, prior.refunds), 'TAP prior claim distribution differs from confirmed Core');
+  }
+  const staged = new Map();
+  const view = Object.assign(Object.create(current), {
+    get: key => staged.has(key) ? staged.get(key) : current.get(key),
+  });
+  const { epoch, at, epoch_apply_hash: anchor, outputs } = plan.intent;
+  checked(await view.targetedPayoutSettlementUpdates(
+    outputs.map(row => ({ ...row, role: 'provider', au: row.paid_au })), 'tap', epoch, at,
+    plan.preparation_ids
+  ));
+  for (const p of plan.preparations) {
+    const key = view.payoutPreparationRecordKey('tap', p.economic_op_id);
+    if (await view.get(key) !== null) {
+      const record = checked(await view.validatePayoutPreparationRecord({ rail: 'tap', epoch, epochApplyHash: anchor,
+        economicOpId: p.economic_op_id, kind: p.kind, outputIndex: p.output_index,
+        payload: p.payload, liability: p.liability, externalEffectIds: p.external_effect_ids }));
+      if (verifyExisting) await verifyExisting(record, p, await current.get('admin'));
+      continue;
+    }
+    if (p.liability) {
+      const lock = view.payoutPreparationLiabilityLockKey('tap', p.liability);
+      requireState(await view.get(lock) === null, 'TAP liability already reserved');
+      const state = checked(await view.validatePayoutPreparationLiability({
+        rail: 'tap', epoch, prepared_at: at, liability: p.liability,
+      }));
+      staged.set(lock, { economic_op_id: p.economic_op_id });
+      staged.set(state.tail_key, { economic_op_id: p.economic_op_id,
+        paid_cum_au_before: p.liability.aggregate_paid_cum_au_before,
+        paid_cum_au_after: state.paid_cum_au_after, consumed: false });
+    }
+    for (const id of p.external_effect_ids) {
+      requireState(await view.get(view.payoutPreparationEffectLockKey('tap', id)) === null,
+        'TAP root effect already reserved');
+    }
+  }
+  checked(await view.validatePayoutPreparationConsumption(plan.preparations.map(p => ({ ...p, rail: 'tap' }))));
 }
