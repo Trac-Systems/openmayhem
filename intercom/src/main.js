@@ -1746,6 +1746,7 @@ if (env.MAYHEM_WRITER_CHECKPOINTS === '1') {
       checkpointWorker = new WriterCheckpointWorker({ journal,
         transport: new WriterCheckpointTransport({ peer, msb, feature: mayhemFeature, releaseIdentity }),
         monotonicNow: () => Number(hrtime.bigint() / 1000000n),
+        slotLimitFile: env.MAYHEM_WRITER_CHECKPOINT_SLOT_LIMIT_FILE ?? null,
         reserveAu: env.MAYHEM_WRITER_CHECKPOINT_RESERVE_AU ?? '5000000000000000000',
       });
       peer.writerCheckpointStatus = () => checkpointWorker.status();

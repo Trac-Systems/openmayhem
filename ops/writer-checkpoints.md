@@ -119,3 +119,13 @@ recovered, keep the current fleet serving while arranging the version transition
 After activation, verify the fee on the signed MSB view and the applied slot on
 an independent subnet peer. Verify the next slot links to the recovered payment
 and measure sustained advancement before declaring the checkpoint stream healthy.
+
+For a bounded production canary the operator may set
+`MAYHEM_WRITER_CHECKPOINT_SLOT_LIMIT_FILE` to an absolute path inside an
+operator-owned directory. Atomically replace this small file with the decimal
+number of the last slot that may run. The worker verifies and completes that
+slot, then leaves later work in the journal. Missing or invalid content holds
+checkpoint processing. An already running step may finish. Advance the limit
+after verifying the signed slot, or atomically write `continuous` to resume
+the normal cadence without restarting the peer. Without this environment
+variable the worker follows its ordinary schedule and does no control-file I/O.

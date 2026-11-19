@@ -31,7 +31,9 @@ const transport = {
     return checkpoint;
   },
 };
-const worker = new WriterCheckpointWorker({ journal, transport, now: () => now,
+const slotLimitFile = path.join(directory, 'slot-limit');
+fs.writeFileSync(slotLimitFile, '100');
+const worker = new WriterCheckpointWorker({ journal, transport, slotLimitFile, now: () => now,
   monotonicNow: () => Number(hrtime.bigint() / 1000000n) + now, reserveAu: '0', log: () => {} });
 try {
   await worker.initialize();
@@ -41,6 +43,13 @@ try {
   for (let slot = 0; slot < 2; slot++) {
     if (slot) now += 30000;
     worker.schedule();
+    if (slot === 1) {
+      await worker.step();
+      assert(worker.status().status === 'held_at_operator_slot');
+      assert(paid.size === 1);
+      fs.writeFileSync(slotLimitFile + '.new', 'continuous');
+      fs.renameSync(slotLimitFile + '.new', slotLimitFile);
+    }
     await worker.step();
     await worker.step();
   }

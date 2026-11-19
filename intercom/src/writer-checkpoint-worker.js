@@ -68,13 +68,31 @@ export class CheckpointJournal {
   }
 }
 
+export function readCheckpointLimit(file) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size < 1 || stat.size > 32) throw new Error('Invalid checkpoint limit file.');
+    const bytes = b4a.alloc(stat.size);
+    if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length) throw new Error('Incomplete checkpoint limit.');
+    const text = b4a.toString(bytes, 'utf8').trim();
+    if (text === 'continuous') return Infinity;
+    const n = Number(text);
+    if (!/^[1-9][0-9]*$/.test(text) || !Number.isSafeInteger(n)) throw new Error('Invalid checkpoint slot limit.');
+    return n;
+  } finally { fs.closeSync(fd); }
+}
+
 // The scheduler records a compact contiguous range of due slot identities even
 // while the independent submit/reconcile step is awaiting the network.
 export class WriterCheckpointWorker {
   constructor({ journal, transport, now = () => Date.now(), reserveAu = '5000000000000000000',
-    monotonicNow = () => globalThis.performance.now(), catchupSpacingMs = 5000, log = console.log }) {
+    monotonicNow = () => globalThis.performance.now(), catchupSpacingMs = 5000, slotLimitFile = null, log = console.log }) {
     this.journal = journal;
     this.transport = transport;
+    if (slotLimitFile !== null && !path.isAbsolute(slotLimitFile)) throw new Error('Checkpoint limit file requires an absolute path.');
+    this.slotLimitFile = slotLimitFile;
+    this.limitStatus = null;
     this.now = now;
     this.monotonicNow = monotonicNow;
     this.reserveAu = BigInt(reserveAu);
@@ -128,6 +146,14 @@ export class WriterCheckpointWorker {
   async processSlot() {
     const state = this.journal.state;
     if (!state || state.next_slot > state.due_through) return;
+    if (this.slotLimitFile !== null) {
+      try {
+        this.limitStatus = state.next_slot > readCheckpointLimit(this.slotLimitFile) ? 'held_at_operator_slot' : null;
+      } catch {
+        this.limitStatus = 'operator_slot_limit_unavailable';
+      }
+      if (this.limitStatus) return;
+    }
     let active = state.active ?? { slot: state.next_slot, phase: 'DUE', prepared: null, proof: null };
     if (!state.active) this.update({ active, status: 'working', error: null });
     if (!active.prepared) {
@@ -232,7 +258,7 @@ export class WriterCheckpointWorker {
 
   status() {
     const state = this.journal.state;
-    return state ? { enabled: true, status: this.stopped ? 'stopped' : state.status,
+    return state ? { enabled: true, status: this.stopped ? 'stopped' : (this.limitStatus ?? state.status),
       scheduled_through: state.due_through, next_slot: state.next_slot,
       backlog_slots: Math.max(0, state.due_through - state.next_slot + 1),
       active_phase: state.active?.phase ?? null, active_tx: state.active?.prepared?.surrogate?.tx ?? null,

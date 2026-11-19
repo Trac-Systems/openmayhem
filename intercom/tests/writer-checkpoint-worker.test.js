@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { CheckpointJournal, WriterCheckpointWorker } from '../src/writer-checkpoint-worker.js';
 
-async function harness(t) {
+async function harness(t, slotLimitFile = null) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-paid-checkpoints-'));
   let clock = 3000000;
   let monotonic = 0;
@@ -46,7 +46,7 @@ async function harness(t) {
   let worker;
   const start = async () => {
     worker = new WriterCheckpointWorker({ journal: new CheckpointJournal(directory), transport,
-      now: () => clock, monotonicNow: () => monotonic, reserveAu: '0', log: () => {} });
+      now: () => clock, monotonicNow: () => monotonic, slotLimitFile, reserveAu: '0', log: () => {} });
     await worker.initialize();
     worker.schedule();
     return worker;
@@ -237,4 +237,46 @@ test('journal failure before broadcast stops spending and retains the prepared a
   await ctx.worker.step();
   assert.equal(ctx.preparations, 1);
   assert.equal(ctx.paid.size, 1);
+});
+
+
+test('an operator file bounds the original slot, survives restart and releases the same worker', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkpoint-control-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'limit');
+  const set = limit => {
+    fs.writeFileSync(file + '.new', limit);
+    fs.renameSync(file + '.new', file);
+  };
+  const ctx = await harness(t, file);
+  const first = ctx.worker.status().next_slot;
+  ctx.advance(180000);
+  for (const invalid of [null, '', '0', '-1', 'any', '9'.repeat(40)]) {
+    if (invalid !== null) set(invalid);
+    await ctx.worker.step();
+    assert.equal(ctx.worker.status().status, 'operator_slot_limit_unavailable');
+    assert.equal(ctx.preparations, 0);
+  }
+  set(String(first));
+  await ctx.worker.step();
+  await ctx.worker.step();
+  await ctx.worker.stop();
+  await ctx.start();
+  await ctx.worker.step();
+  assert.equal(ctx.worker.status().status, 'held_at_operator_slot');
+  assert.equal(ctx.worker.status().next_slot, first + 1);
+  assert.equal(ctx.broadcasts, 1);
+  set(String(first + 1));
+  ctx.advance(10000);
+  await ctx.worker.step();
+  await ctx.worker.step();
+  await ctx.worker.step();
+  assert.equal(ctx.worker.status().next_slot, first + 2);
+  assert.equal(ctx.broadcasts, 2);
+  set('continuous');
+  ctx.advance(10000);
+  await ctx.worker.step();
+  await ctx.worker.step();
+  assert.equal(ctx.worker.status().next_slot, first + 3);
+  assert.equal(ctx.applied.size, 3);
 });
