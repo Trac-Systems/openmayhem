@@ -5585,12 +5585,7 @@ class MayhemContract extends Contract {
         (provider.status !== 'active' && provider.status !== 'banned')) {
       return new Error('Targeted payout preparation provider status is not payable.');
     }
-    const params = await this.activeParamsAt(value.prepared_at, [
-      'holdback_epochs',
-      'challenge_epochs',
-      'canary_probe_holdback_bps',
-      'canary_probe_release_min_passes',
-    ]);
+    const params = await this.targetedPayoutHoldbackParamsAt(value.rail, value.prepared_at);
     if (params instanceof Error) return params;
     const probeGate = await this.probeGateForEarning(
       liability.provider,
@@ -5704,7 +5699,8 @@ class MayhemContract extends Contract {
       }
     }
     if (normalized.rail === 'tap') {
-      const params = await this.activeParamsAt(normalized.prepared_at, ['fee_bps']);
+      const params = await this.targetedTapParamsAt(normalized.prepared_at, ['fee_bps']);
+      if (params instanceof Error) return params;
       const split = this.targetedTapPayoutSplit(params.fee_bps);
       if (split instanceof Error) return split;
       if (normalized.payload.fee_bps !== split.fee_bps ||
@@ -12919,6 +12915,7 @@ class MayhemContract extends Contract {
         'proposal_tx',
         'proposal_block_number',
         'proposal_block_hash',
+        'proposal_block_timestamp',
         'execution_tx',
         'execution_status',
         'execution_block_number',
@@ -12961,7 +12958,7 @@ class MayhemContract extends Contract {
         value.payment_config_ver < 1 ||
         !this.isHexBytes(value.epoch_apply_hash, 32) ||
         !Array.isArray(value.preparation_ids) ||
-        value.preparation_ids.length < 1 ||
+        value.preparation_ids.length !== value.outputs?.length ||
         !this.isHexBytes(value.root_preparation_id, 32) ||
         !Array.isArray(value.external_effect_ids) ||
         value.external_effect_ids.length !== 2 ||
@@ -12974,6 +12971,8 @@ class MayhemContract extends Contract {
         value.proposal_block_number < 0 ||
         !this.isEthHexBytes(value.proposal_block_hash, 32) ||
         value.proposal_block_hash !== value.proposal_block_hash.toLowerCase() ||
+        !Number.isSafeInteger(value.proposal_block_timestamp) ||
+        value.proposal_block_timestamp < value.at ||
         !this.isEthHexBytes(value.execution_tx, 32) ||
         value.execution_tx !== value.execution_tx.toLowerCase() ||
         value.execution_status !== 1 ||
@@ -13041,6 +13040,9 @@ class MayhemContract extends Contract {
         providerPaidAu instanceof Error ||
         providerTapWei instanceof Error) {
       return new Error('Invalid targeted TAP settlement totals.');
+    }
+    if (providerCumulativeClaimedWei !== cumulativeSpentWei * BigInt(value.provider_share_bps) / 10_000n) {
+      return new Error('Targeted TAP cumulative provider entitlement does not match its exact cap.');
     }
     const entries = [];
     const seenAccounts = new Set();
@@ -14233,13 +14235,19 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds) {
-    const params = await this.activeParamsAt(at, [
+  async targetedPayoutHoldbackParamsAt(rail, at) {
+    const policyKeys = [
       'holdback_epochs',
       'challenge_epochs',
       'canary_probe_holdback_bps',
       'canary_probe_release_min_passes',
-    ]);
+    ];
+    return rail === 'tap' ? this.targetedTapParamsAt(at, policyKeys) : this.activeParamsAt(at, policyKeys);
+  }
+
+  async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds) {
+    const params = await this.targetedPayoutHoldbackParamsAt(rail, at);
+    if (params instanceof Error) return params;
     const liabilityUpdates = [];
     const paidByProvider = new Map();
     for (const [outputIndex, output] of outputs.entries()) {
@@ -14435,10 +14443,37 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     const normalized = this.normalizeTargetedTapSettlementValue(value);
     if (normalized instanceof Error) return normalized;
-    const settlementParams = await this.activeParamsAt(
+    const record = {
+      type: 'targeted_tap_settlement',
+      ...value,
+      tap_rate_lock: normalized.rate_lock,
+      entries: normalized.entries,
+      outputs: normalized.outputs,
+      settled_by: this.address,
+      settled_by_role: 'admin',
+    };
+    const recordKey = `settle/targeted/tap/${value.epoch}`;
+    const existing = await this.get(recordKey);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'targetedTapSettlement',
+          epoch: value.epoch,
+          rail: 'tap',
+          root: value.root,
+          execution_tx: value.execution_tx,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted TAP settlement already exists for epoch.');
+    }
+
+    const settlementParams = await this.targetedTapParamsAt(
       value.at,
       ['max_tap_settlement_outputs', 'fee_bps']
     );
+    if (settlementParams instanceof Error) return settlementParams;
     const payoutSplit = this.targetedTapPayoutSplit(settlementParams.fee_bps);
     if (payoutSplit instanceof Error) return payoutSplit;
     if (normalized.fee_bps !== payoutSplit.fee_bps ||
@@ -14463,38 +14498,9 @@ class MayhemContract extends Contract {
     }
     const rate = await this.guardianRequireHistoricalTapRateLock(
       normalized.rate_lock,
-      value.at
+      value.proposal_block_timestamp
     );
     if (rate instanceof Error) return rate;
-
-    const record = {
-      type: 'targeted_tap_settlement',
-      ...value,
-      tap_rate_lock: normalized.rate_lock,
-      entries: normalized.entries,
-      outputs: normalized.outputs,
-      fee_bps: payoutSplit.fee_bps,
-      tap_burn_bps: payoutSplit.tap_burn_bps,
-      provider_share_bps: payoutSplit.provider_share_bps,
-      settled_by: this.address,
-      settled_by_role: 'admin',
-    };
-    const recordKey = `settle/targeted/tap/${value.epoch}`;
-    const existing = await this.get(recordKey);
-    if (existing) {
-      if (stableJson(existing) === stableJson(record)) {
-        return {
-          ok: true,
-          op: 'targetedTapSettlement',
-          epoch: value.epoch,
-          rail: 'tap',
-          root: value.root,
-          execution_tx: value.execution_tx,
-          idempotent: true,
-        };
-      }
-      return new Error('Targeted TAP settlement already exists for epoch.');
-    }
 
     const applyAnchor = await this.requireEpochApplyAnchor(
       value.epoch,
@@ -14508,6 +14514,9 @@ class MayhemContract extends Contract {
       'tap'
     );
     if (preparations instanceof Error) return preparations;
+    if (preparations.some(record => record.prepared_at !== value.at)) {
+      return new Error('Targeted TAP liability snapshot does not match its signed preparations.');
+    }
 
     const scope = `${value.chain_id}/${value.pool_address}`;
     const rootSeenKey = `rail/seen/tap-settlement-root/${scope}/${value.root}`;
@@ -14565,12 +14574,11 @@ class MayhemContract extends Contract {
     if (nextSpentWei <= priorSpentWei) {
       return new Error('Targeted TAP cumulative gross spend must advance.');
     }
-    const grossSpendDeltaWei = nextSpentWei - priorSpentWei;
-    const expectedProviderDeltaWei =
-      (grossSpendDeltaWei * BigInt(payoutSplit.provider_share_bps)) / 10_000n;
-    if (BigInt(normalized.provider_tap_wei) !== expectedProviderDeltaWei ||
-        nextProviderClaimedWei !==
-          priorProviderClaimedWei + BigInt(normalized.provider_tap_wei)) {
+    const priorCap = priorSpentWei * BigInt(payoutSplit.provider_share_bps) / 10_000n;
+    // The executed pool floors each cumulative cap. Their difference can be
+    // one wei larger than flooring the epoch's gross delta.
+    if (priorProviderClaimedWei !== priorCap ||
+        nextProviderClaimedWei - priorProviderClaimedWei !== BigInt(normalized.provider_tap_wei)) {
       return new Error(
         'Targeted TAP provider entitlement does not match the historical fee/burn split.'
       );
@@ -24911,6 +24919,56 @@ class MayhemContract extends Contract {
     return rate;
   }
 
+  // The hot parameter record retains only current and pending. After a second
+  // policy change, an older proposal may require the immutable update history.
+  async targetedTapParamEntriesAt(at, keys) {
+    const entries = {};
+    const missing = new Set();
+    let version = 0;
+    for (const key of keys) {
+      const record = await this.paramRecord(key);
+      const validEntry = entry => Number.isSafeInteger(entry?.effective_at) && entry.effective_at >= 0 &&
+        Number.isSafeInteger(entry.ver) && entry.ver >= 0;
+      if (record.key !== key || !validEntry(record.current) ||
+          (record.pending != null && (!validEntry(record.pending) ||
+            record.pending.ver <= record.current.ver || record.pending.effective_at < record.current.effective_at))) {
+        return new Error('Invalid historical TAP parameter schedule.');
+      }
+      const entry = this.paramActiveEntry(record, at);
+      if (entry.effective_at <= at) entries[key] = entry;
+      else {
+        missing.add(key);
+        version = Math.max(version, record.current.ver);
+      }
+    }
+    while (missing.size && version > 0) {
+      const update = await this.get(`params/update/${version}`);
+      if (update?.ver !== version || update.set_by_role !== 'admin' ||
+          !Number.isSafeInteger(update.effective_at) || update.effective_at < 0 ||
+          !update.values || typeof update.values !== 'object' || Array.isArray(update.values)) {
+        return new Error('Missing historical TAP parameter update.');
+      }
+      if (update.effective_at <= at) {
+        for (const key of missing) {
+          if (hasOwn(update.values, key)) {
+            entries[key] = { value: update.values[key], ver: version, effective_at: update.effective_at };
+            missing.delete(key);
+          }
+        }
+      }
+      version--;
+    }
+    for (const key of missing) entries[key] = { value: PARAM_DEFINITIONS[key].default, ver: 0, effective_at: 0 };
+    return entries;
+  }
+
+  async targetedTapParamsAt(at, keys) {
+    const entries = await this.targetedTapParamEntriesAt(at, keys);
+    if (entries instanceof Error) return entries;
+    const params = Object.fromEntries(keys.map(key => [key, entries[key].value]));
+    return this.validateParamValues(params) ?? params;
+  }
+
   async guardianRequireHistoricalTapRateLock(lock, at) {
     const oracleValue = {
       op: 'tap_rate_oracle',
@@ -24945,7 +25003,10 @@ class MayhemContract extends Contract {
     if (rate.ts > at) {
       return new Error('Guardian TAP settlement rate invariant failed: oracle timestamp is in the future.');
     }
-    const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
+    const params = await this.targetedTapParamsAt(at, ['rate_staleness_seconds', 'fee_bps']);
+    if (params instanceof Error) return params;
+    const split = this.targetedTapPayoutSplit(params.fee_bps);
+    if (split instanceof Error) return split;
     if (at - rate.ts > params.rate_staleness_seconds) {
       return new Error('Guardian TAP settlement rate invariant failed: oracle is stale.');
     }

@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Autobase from 'autobase';
+import Corestore from 'corestore';
+import Hyperbee from 'hyperbee';
+import Wallet from 'trac-peer/src/wallet.js';
+import { FeatureOperation, FeatureCheck } from 'trac-peer/src/operations/feature/index.js';
 import MayhemContract from '../contract/contract.js';
+import ContractV30 from '../contract/v30.js';
 import {
   MemoryStorage,
   execute,
@@ -36,13 +45,17 @@ async function setupTargetedTapSettlement({
   heldAu = '0',
   paidCumAu = '0',
   feeBps = 1_500,
+  rateAt = rate.ts,
+  snapshotAt = 90_000,
+  proposalAt = 90_000,
+  Implementation = MayhemContract,
 } = {}) {
   const providerShareBps = 10_000 - feeBps - 1_000;
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const outsider = await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
-  const contract = new MayhemContract(
+  const contract = new Implementation(
     { peer: { wallet: makeVerifier(provider.wallet) } },
     {}
   );
@@ -109,7 +122,7 @@ async function setupTargetedTapSettlement({
   const rateResult = await executeRateFeature(
     contract,
     storage,
-    rate,
+    { ...rate, ts: rateAt },
     admin.publicKey
   );
   assert.equal(rateResult.ok, true, rateResult.message);
@@ -157,7 +170,7 @@ async function setupTargetedTapSettlement({
     updated_epoch: 1,
     pending_epoch: null,
     last_apply_hash: applyHash,
-    last_settlement_unix: 90_000,
+    last_settlement_unix: snapshotAt,
     updated_at: 'epoch/targeted/1/apply',
   });
 
@@ -170,10 +183,7 @@ async function setupTargetedTapSettlement({
     paidCumAu,
     providerShareBps
   );
-  const cumulativeGrossSpendWei = (
-    priorGrossSpendWei +
-    grossSpendForProviderClaims(tapWei, providerShareBps)
-  );
+  const cumulativeGrossSpendWei = grossSpendForProviderClaims(cumulativeClaimWei, providerShareBps);
   const providerEntries = [{
     account: providerTarget,
     cumulative_wei: cumulativeClaimWei,
@@ -221,7 +231,7 @@ async function setupTargetedTapSettlement({
   const value = {
     op: 'settle_targeted_tap',
     epoch: 1,
-    at: 90_000,
+    at: snapshotAt,
     rail: 'tap',
     chain_id: chainId,
     token_address: tokenAddress,
@@ -235,7 +245,7 @@ async function setupTargetedTapSettlement({
       denom: 'tap_usd_au',
       tap_usd_au: rate.tap_usd_au,
       source: rate.source,
-      rate_ts: rate.ts,
+      rate_ts: rateAt,
       rate_record_key: rateRecord.updated_at,
       posted_by: admin.publicKey,
       posted_by_role: 'admin',
@@ -248,6 +258,7 @@ async function setupTargetedTapSettlement({
     root_confirmed: true,
     proposal_tx: `0x${'7'.repeat(64)}`,
     proposal_block_number: 88,
+    proposal_block_timestamp: proposalAt,
     proposal_block_hash: `0x${'8'.repeat(64)}`,
     execution_tx: `0x${'9'.repeat(64)}`,
     execution_status: 1,
@@ -692,4 +703,184 @@ test('targeted TAP settlement fails closed when the ledger fee diverges from the
     /fixed on-chain operator split/i
   );
   assert.equal(ctx.storage.snapshotBytes(), before);
+});
+
+test('v31 settles the difference of exact cumulative caps with the later proposal clock', async () => {
+  // Cumulative gross goes from 2 to 3. Both provider caps are exact (1 and 2).
+  // The 1-wei payout is larger than floor(1 * 7500 / 10000).
+  const day = Date.UTC(2030, 0, 2) / 1000;
+  const snapshotAt = day + 7 * 3600 + 59 * 60;
+  const rateAt = day + 8 * 3600 + 55 * 60;
+  const proposalAt = day + 8 * 3600 + 57 * 60;
+  const ctx = await setupTargetedTapSettlement({
+    totalAu: '2', paidCumAu: '1', snapshotAt, rateAt, proposalAt,
+  });
+  assert.equal(ctx.value.cumulative_spent_wei, '3');
+  const result = await applyTargetedTap(ctx);
+  assert.equal(result.ok, true, result.message);
+  const stored = (await ctx.storage.get('settle/targeted/tap/1')).value;
+  assert.equal(stored.at, snapshotAt);
+  assert.equal(stored.proposal_block_timestamp, proposalAt);
+  assert.equal(stored.provider_tap_wei, '1');
+  assert.equal((await applyTargetedTap(ctx)).idempotent, true);
+  const legacy = structuredClone(ctx.value);
+  delete legacy.proposal_block_timestamp;
+  const old = new ContractV30({}, {});
+  assert.ok(!(old.normalizeTargetedTapSettlementValue(legacy) instanceof Error));
+  assert.ok(old.normalizeTargetedTapSettlementValue(ctx.value) instanceof Error);
+  assert.ok(ctx.contract.normalizeTargetedTapSettlementValue(legacy) instanceof Error);
+});
+
+test('TAP refuses either inexact cumulative cap, including a matching delta between inexact caps', async () => {
+  for (const [priorGross, nextGross] of [['1','3'], ['2','2'], ['4','6']]) {
+    const ctx = await setupTargetedTapSettlement({ totalAu: '2', paidCumAu: '1' });
+    const stateKey = `settle/targeted/tap/state/${chainId}/${poolAddress}`;
+    const state = (await ctx.storage.get(stateKey)).value;
+    await ctx.storage.put(stateKey, { ...state, cumulative_spent_wei: priorGross });
+    ctx.value.cumulative_spent_wei = nextGross;
+    const result = await applyTargetedTap(ctx);
+    assert.match(result.message, /provider entitlement/);
+    assert.equal(await ctx.storage.get('settle/targeted/tap/1'), null);
+    assert.equal((await ctx.storage.get(stateKey)).value.last_epoch, 0);
+  }
+});
+
+test('TAP applies proposal-time fee and freshness policy, including rotated history', async () => {
+  const schedule = (key, value, next, change) => ({ key,
+    current: { ver: 1, effective_at: 0, value },
+    pending: { ver: 2, effective_at: change, value: next } });
+  for (const [seconds, allowed] of [[120,true],[121,false]]) {
+    const ctx = await setupTargetedTapSettlement({ snapshotAt: rate.ts - 10, proposalAt: rate.ts + seconds });
+    await ctx.storage.put('params/rate_staleness_seconds',
+      schedule('rate_staleness_seconds', 2700, 120, rate.ts + 1));
+    const result = await applyTargetedTap(ctx);
+    if (allowed) assert.equal(result.ok, true, result.message);
+    else assert.match(result.message, /stale/);
+  }
+  const future = await setupTargetedTapSettlement({ snapshotAt: rate.ts - 100, proposalAt: rate.ts - 1 });
+  assert.match((await applyTargetedTap(future)).message, /in the future/);
+  const fee = await setupTargetedTapSettlement({ proposalAt: rate.ts + 120 });
+  await fee.storage.put('params/fee_bps', schedule('fee_bps', 1500, 1000, rate.ts + 100));
+  assert.match((await applyTargetedTap(fee)).message, /fixed on-chain operator split/);
+  const old = await setupTargetedTapSettlement({ proposalAt: rate.ts + 200 });
+  await old.storage.put('params/rate_staleness_seconds', { key: 'rate_staleness_seconds',
+    current: { ver: 3, effective_at: rate.ts + 1000, value: 2700 }, pending: null });
+  const verify = async () => (await applyTargetedTap(old)).message;
+  assert.match(await verify(), /Missing historical TAP parameter/);
+  for (const [ver, value, effective_at] of [[2,120,rate.ts],[3,2700,rate.ts+1000]]) {
+    await old.storage.put('params/update/'+ver, {
+      ver, effective_at, values: { rate_staleness_seconds: value }, set_by_role: 'admin',
+    });
+  }
+  assert.match(await verify(), /stale/);
+});
+
+test('TAP binds the liability clock to the original signed preparations', async () => {
+  const ctx = await setupTargetedTapSettlement({ proposalAt: rate.ts + 5 });
+  await prepareTargetedPayout(ctx.contract, ctx.storage, ctx.value, ctx.admin);
+  const before = ctx.storage.snapshotBytes();
+  ctx.value.at++;
+  assert.match((await applyTargetedTap(ctx)).message, /snapshot does not match/);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+});
+
+test('native signed v30 TAP history replays to the original tree including its historical rounding', async t => {
+  const ctx = await setupTargetedTapSettlement({
+    totalAu: '2', paidCumAu: '1', Implementation: ContractV30,
+  });
+  // V30 accepted floor(delta gross * 3/4): gross 2 -> 4, claim 1 -> 2.
+  // This is a historical operation that v31 must never reinterpret.
+  delete ctx.value.proposal_block_timestamp;
+  ctx.value.cumulative_spent_wei = '4';
+  assert.equal(await prepareTargetedPayout(ctx.contract, ctx.storage, ctx.value, ctx.admin,
+    { contractVersion: 30 }), ctx.value);
+  const key = 'mayhem_' + await ctx.contract.targetedTapSettlementFeatureKey(ctx.value);
+  const nonce = 'synthetic-tap-history';
+  const signature = Buffer.from(ctx.admin.wallet.sign(Buffer.from(JSON.stringify(ctx.value) + nonce))).toString('hex');
+  const op = { type: 'feature', key, value: { dispatch: { type: 'mayhem_feature', contract_version: 30,
+    key, address: ctx.admin.publicKey, value: ctx.value, nonce, hash: signature } } };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tap-v30-history-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const seed = async batch => { for (const [key, value] of ctx.storage.values) await batch.put(key, value); };
+  const wallet = new Wallet();
+  await wallet.ready;
+  const handler = (contract, canonicalView) => new FeatureOperation(new FeatureCheck(), {
+    wallet, protocolInstance: { featMaxBytes: () => 1e6 }, contractInstance: contract, canonicalView,
+  });
+  const viewOptions = { extension: false, keyEncoding: 'utf-8', valueEncoding: 'json' };
+  const store = new Corestore(path.join(dir, 'writer'));
+  let historyLength;
+  const base = new Autobase(store, null, { valueEncoding: 'json', ackInterval: 0,
+    open: storage => new Hyperbee(storage.get('view'), viewOptions),
+    async apply(nodes, view) {
+      const batch = view.batch();
+      try {
+        for (const node of nodes) {
+          if (node.value === 'seed') await seed(batch);
+          else if (node.value?.type === 'feature') {
+            historyLength = node.length;
+            await handler(ctx.contract, view).handle(node.value, batch, base, node);
+          }
+        }
+        await batch.flush();
+      } finally { await batch.close(); }
+    } });
+  const replayStore = new Corestore(path.join(dir, 'replay'));
+  const replay = new Hyperbee(replayStore.get({ name: 'view' }), viewOptions);
+  try {
+    await base.ready();
+    await base.append('seed');
+    await base.append(op);
+    await base.update();
+    assert.equal((await base.view.get('fr/' + signature)).value.ok, true);
+    const node = { value: op, from: base.local, length: historyLength, indexed: true, optimistic: false };
+    await replay.ready();
+    const prefix = replay.batch();
+    try {
+      await seed(prefix);
+      await prefix.flush();
+    } finally { await prefix.close(); }
+    const batch = replay.batch();
+    const current = new MayhemContract(ctx.contract.protocol, {});
+    try {
+      await handler(current, base.view).handle(op, batch, base, node);
+      await batch.flush();
+    } finally { await batch.close(); }
+    assert.equal(current._mayhemReplayStatus.completed, 1);
+    assert.deepEqual(await replay.core.treeHash(), await base.view.core.treeHash());
+    const restored = (await replay.get('settle/targeted/tap/1')).value;
+    assert.equal(restored.provider_cumulative_claimed_wei, '2');
+    assert.equal(Object.hasOwn(restored, 'proposal_block_timestamp'), false);
+    const fresh = { ...ctx.value, proposal_block_timestamp: ctx.value.at };
+    assert.match(current.normalizeTargetedTapSettlementValue(fresh).message, /exact cap/);
+  } finally {
+    await replay.close();
+    await replayStore.close();
+    await base.close();
+    await store.close();
+  }
+});
+
+test('v31 consumes the already signed v30 preparations with the recovered proposal evidence exactly once', async () => {
+  const ctx = await setupTargetedTapSettlement({ totalAu: '2', paidCumAu: '1',
+    snapshotAt: rate.ts - 3360, proposalAt: rate.ts + 120, Implementation: ContractV30 });
+  const archive = structuredClone(ctx.value);
+  delete archive.proposal_block_timestamp;
+  assert.equal(await prepareTargetedPayout(ctx.contract, ctx.storage, archive, ctx.admin, { contractVersion: 30 }), archive);
+  const archivedBytes = JSON.stringify(archive);
+  const oldResult = await executeFeature(ctx.contract, ctx.storage, 'mayhem_feature',
+    await ctx.contract.targetedTapSettlementFeatureKey(archive), archive, ctx.admin.publicKey);
+  assert.match(oldResult.message, /oracle timestamp is in the future/);
+  const current = new MayhemContract(ctx.contract.protocol, {});
+  const submission = { ...structuredClone(archive), proposal_block_timestamp: ctx.value.proposal_block_timestamp };
+  const key = await current.targetedTapSettlementFeatureKey(submission);
+  const submit = () => executeFeature(current, ctx.storage, 'mayhem_feature', key, submission, ctx.admin.publicKey);
+  assert.equal((await submit()).idempotent, false);
+  const state = ctx.storage.snapshotBytes();
+  assert.equal((await submit()).idempotent, true);
+  assert.equal(ctx.storage.snapshotBytes(), state);
+  const preparation = (await ctx.storage.get(current.payoutPreparationRecordKey('tap', archive.root_preparation_id))).value;
+  assert.equal(preparation.contract_version, 30);
+  assert.equal(preparation.consumed_by, 'settle/targeted/tap/1');
+  assert.equal(JSON.stringify(archive), archivedBytes);
 });

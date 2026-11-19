@@ -84,7 +84,7 @@ export async function prepareTargetedPayout(
   storage,
   value,
   admin,
-  { submit = true, preparationValue = null } = {}
+  { submit = true, preparationValue = null, contractVersion = CONTRACT_VERSION } = {}
 ) {
   const rail = value.rail;
   const preparationSource = preparationValue ?? value;
@@ -205,7 +205,7 @@ export async function prepareTargetedPayout(
     );
     const unsigned = {
       op: 'prepare_targeted_payout',
-      contract_version: CONTRACT_VERSION,
+      contract_version: contractVersion,
       economic_op_id: preparation.economic_op_id,
       rail,
       epoch: preparationSource.epoch,
