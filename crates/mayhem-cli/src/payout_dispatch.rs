@@ -403,10 +403,23 @@ pub(super) async fn explicit_payout(
     }
     let feature_result =
         submitted.then(|| json!({"plan":record,"outputs":receipts,"close":settlement_state}));
+    let no_work = already_settled.is_none()
+        && if rail == "tnk" {
+            outputs.is_empty()
+        } else {
+            plan["outcome"] == "no_work"
+        };
+    let carry_forward = already_settled.is_none()
+        && if rail == "tnk" {
+            outputs.is_empty()
+        } else {
+            plan["outcome"] == "carry"
+        };
     Ok(ExplicitPayout::Report(json!({
-        "ok":true, "submitted":submitted, "epoch":epoch, "settlement":plan,
+        "ok":true, "submitted":submitted, "sim":false, "epoch":epoch, "settlement":plan,
+        "skipped_providers":[],
         "freeze_only":freeze_only, "close_only":close_only,
-        "no_work":plan["outcome"] == "no_work", "carry_forward":plan["outcome"] == "carry", "selected_output_id":output_id,
+        "no_work":no_work, "carry_forward":carry_forward, "selected_output_id":output_id,
         "already_settled":already_settled,"settlement_state":settlement_state,"feature":record,"feature_result":feature_result,
         "pending":settlement_state.is_none(), "pending_outputs":pending,"output_settlements":receipts,
     })))

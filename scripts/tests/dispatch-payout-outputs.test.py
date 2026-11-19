@@ -34,7 +34,7 @@ class ProcessorFixture:
         record = {"type": "targeted_payout_epoch_plan", "rail": rail, "epoch": epoch,
                   "plan_root": p["plan_root"], "value": p}
         report = {"ok": True, "sim": False, "settlement": p, "skipped_providers": [], "epoch": epoch,
-                  "submitted": not self.closed, "already_settled": {"epoch": epoch} if self.closed else None,
+                  "submitted": False, "already_settled": {"epoch": epoch} if self.closed else None,
                   "feature": record, "pending": not self.closed, "selected_output_id": None,
                   "output_settlements": [], "pending_outputs": []}
         if flags == ["--freeze-only", "--submit"]:

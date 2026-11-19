@@ -54,7 +54,8 @@ def checked_plan(report, rail, epoch, anchor):
     require(len(set(ids)) == len(ids), "duplicate payout output")
     if report.get("already_settled") is None:
         feature = report.get("feature")
-        require(report.get("submitted") is True and isinstance(feature, dict) and
+        # A readback of a frozen plan or an existing receipt performs no submission.
+        require(isinstance(report.get("submitted"), bool) and isinstance(feature, dict) and
                 feature.get("type") == "targeted_payout_epoch_plan" and feature.get("epoch") == epoch and
                 feature.get("rail") == rail and feature.get("plan_root") == plan["plan_root"] and
                 feature.get("value") == plan, "the frozen plan has no confirmed record")
