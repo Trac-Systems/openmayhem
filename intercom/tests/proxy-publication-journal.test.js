@@ -218,12 +218,12 @@ test('journal rejects wrong identity, another live writer, mutation and invalid 
   assert.equal(fs.readFileSync(path.join(f.directory, 'pending.json'), 'utf8'), '{broken');
 });
 
-test('contract 31 reopens a drained contract 30 publication journal for the identical writer', async t => {
+for (const version of [31, 32]) test(`contract ${version} reopens only the preceding drained journal for the identical writer`, async t => {
   const f = await fixture(t);
   const directory = path.join(f.root, 'upgrade-journal');
   const disk = path.join(directory, 'pending.json');
-  const current = { ...f.transport.identity(), contract_version: 31 };
-  const prior = { ...current, contract_version: 30 };
+  const current = { ...f.transport.identity(), contract_version: version };
+  const prior = { ...current, contract_version: version - 1 };
   const open = identity => ProxyPublicationJournal.open({ directory, identity });
   const initial = await open(prior);
   const envelope = await f.create();
@@ -243,7 +243,7 @@ test('contract 31 reopens a drained contract 30 publication journal for the iden
     { ...current, subnet_bootstrap: 'ab'.repeat(32) },
     { ...current, writer_fork: current.writer_fork + 1 },
     { ...current, admin: 'cd'.repeat(32) },
-    { ...current, contract_version: 32 },
+    { ...current, contract_version: version + 1 },
   ]) {
     await assert.rejects(open(changed), /identity/);
     assert.deepEqual(fs.readFileSync(disk), empty);

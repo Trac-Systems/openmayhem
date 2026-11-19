@@ -425,7 +425,7 @@ fn restart_after_abrupt_process_exit_resumes_the_durable_page() {
 }
 
 #[test]
-fn fiat31_catalog_upgrade() {
+fn consecutive_catalog_upgrades_preserve_each_prior_projection() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.redb");
     let next = Identity {
@@ -494,10 +494,25 @@ fn fiat31_catalog_upgrade() {
     assert!(get(&catalog, 1).is_none() && get(&catalog, 2).is_none());
     drop(catalog);
 
+    let current = Identity {
+        contract_version: 32,
+        ..identity()
+    };
+    let catalog = Catalog::open(&path, current.clone()).unwrap();
+    assert!(catalog.read().unwrap().status().invalidated);
+    assert!(get(&catalog, 3).is_none());
+    let mut fresh = page(13, vec![row(5)], None, None);
+    fresh.context.contract_version = 32;
+    apply(&catalog, &fresh);
+    drop(catalog);
+    let catalog = Catalog::open(&path, current).unwrap();
+    assert_eq!(get(&catalog, 5), Some(row(5).value));
+    drop(catalog);
     use redb::{Database, ReadableDatabase, TableDefinition};
     let db = Database::open(&path).unwrap();
     let read = db.begin_read().unwrap();
     for (table, key, expected) in [
+        ("v31_proxy_catalog_current_v1", row(3).key, row(3).value),
         ("v30_proxy_catalog_current_v1", row(1).key, row(1).value),
         ("v30_proxy_catalog_staged_v1", row(2).key, row(2).value),
     ] {

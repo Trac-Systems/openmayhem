@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "release_version": "0.2.314",
-  "contract_version": 31,
-  "contract_code_sha256": "6f62e14c2e07ea1657eeac6a8839923073b6f64c5bba0385b89ac62f9e069b41",
+  "release_version": "0.2.315",
+  "contract_version": 32,
+  "contract_code_sha256": "3b630146f7011f6306ea52878d0481554223ef172cc077d0c7d5391be301fba5",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "b5f1dacc565137e5e53e3e3f7171b698fbeff382e56efe718b68d7aa30e7fa63"
+      "sha256": "0f59be2a83c92cdb42cdc6fc028d47a1befb38e38aaee11f4a8c54fb887eacef"
     },
     {
       "path": "contract/fiat-recovery.js",
@@ -125,12 +125,20 @@
       "sha256": "60e9cdaac8dc5f7262f1bdde045d2dd9a29899fd4a0090fe02dbd2016339a939"
     },
     {
+      "path": "contract/tap-prepared-debt-v32.js",
+      "sha256": "2d22661996e773800c0d3a8f11190fef683a36429932fd75d8809c90c0f6735f"
+    },
+    {
       "path": "contract/tap-prepared-debt.js",
       "sha256": "dc23d9f0ee28810007818509abcfa7ec71c1c2c77888ae25a1e8b23071bc4ca0"
     },
     {
       "path": "contract/v30.js",
       "sha256": "bd499c64b5d9ce0d8faf9712c7c1b867439b30eeb244393b1096a283877885a3"
+    },
+    {
+      "path": "contract/v31.js",
+      "sha256": "b5f1dacc565137e5e53e3e3f7171b698fbeff382e56efe718b68d7aa30e7fa63"
     },
     {
       "path": "features/mayhem/index.js",
@@ -162,7 +170,7 @@
     },
     {
       "path": "features/mayhem/proxy-publication-journal.js",
-      "sha256": "243b3103061744b0018c982ae98c8c8454e8a36b50dfaa8da999c9bb078ad6c7"
+      "sha256": "38178c8e430c89798999dacca365b9dbb1aa3521db460733a6e67052fb87fac7"
     },
     {
       "path": "features/mayhem/proxy-publication-transport.js",

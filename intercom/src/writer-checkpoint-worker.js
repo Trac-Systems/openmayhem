@@ -143,10 +143,11 @@ export class WriterCheckpointWorker {
       // The exact signed MSB transaction is durable BEFORE the first broadcast.
       this.update({ active, funding, status: 'working', error: null });
     }
-    const inspection = await this.transport.inspect(active.prepared, active.expected_fee_au);
+    const inspection = await this.transport.inspect(active.prepared, active.expected_fee_au, active);
     if (inspection.confirmed) {
       active = { ...active, phase: 'MSB_CONFIRMED', proof: inspection.proof };
-      this.update({ active, status: 'reconciling', error: null });
+      this.update({ active, status: inspection.previous_version ? 'previous_checkpoint_paid_pending_application' : 'reconciling',
+        error: null });
       const checkpoint = await this.transport.reconcileSubnet(active.prepared, inspection.proof);
       if (!checkpoint) return;
       const completed = { ...active, phase: 'COMPLETE', checkpoint, completed_at: this.now() };
@@ -164,8 +165,15 @@ export class WriterCheckpointWorker {
           evidence.previous_txv === active.prepared.surrogate.txv) {
         // Preserve every retired attempt and its authoritative non-execution
         // evidence. The new preparation still belongs to this same logical slot.
-        const snapshot = await this.transport.prepareSnapshot(active.slot, Math.floor(this.now() / 1000));
+        const historical = inspection.previous_version || inspection.committed_recovery;
+        const snapshot = historical ? inspection.canonical_snapshot :
+          await this.transport.prepareSnapshot(active.slot, Math.floor(this.now() / 1000));
         const replacement = await this.transport.preparePayment(snapshot);
+        if (historical && (replacement.surrogate.txv !== evidence.txv ||
+            replacement.dispatch.value.slot !== active.slot || replacement.dispatch.value.snapshot_hash !== active.snapshot_hash ||
+            replacement.dispatch.value.contract_version !== this.transport.releaseIdentity.contractVersion)) {
+          throw new Error('Replacement checkpoint changed signed validator context, revision or snapshot.');
+        }
         active = { ...active, phase: 'PREPARED', prepared: replacement, proof: null,
           broadcast_attempts: 0, last_broadcast_at: null, prepared_at: this.now(),
           retired_attempts: [...(active.retired_attempts ?? []), {
@@ -179,7 +187,13 @@ export class WriterCheckpointWorker {
       this.update({ status: 'awaiting_context_reconciliation', error: null });
       return;
     }
-    const funding = await this.transport.funding();
+    if (inspection.previous_version) {
+      if (this.journal.state.status !== 'awaiting_previous_checkpoint_context') {
+        this.update({ status: 'awaiting_previous_checkpoint_context', error: null });
+      }
+      return;
+    }
+    const funding = await this.transport.funding({ local: inspection.committed_recovery === true });
     if (BigInt(funding.fee_au) !== BigInt(active.expected_fee_au)) {
       throw new Error('MSB fee changed after payment preparation.');
     }

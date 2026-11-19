@@ -1744,7 +1744,7 @@ if (env.MAYHEM_WRITER_CHECKPOINTS === '1') {
     try {
       journal = new CheckpointJournal(directory);
       checkpointWorker = new WriterCheckpointWorker({ journal,
-        transport: new WriterCheckpointTransport({ peer, feature: mayhemFeature, releaseIdentity }),
+        transport: new WriterCheckpointTransport({ peer, msb, feature: mayhemFeature, releaseIdentity }),
         monotonicNow: () => Number(hrtime.bigint() / 1000000n),
         reserveAu: env.MAYHEM_WRITER_CHECKPOINT_RESERVE_AU ?? '5000000000000000000',
       });

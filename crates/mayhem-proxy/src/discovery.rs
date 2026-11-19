@@ -61,10 +61,10 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// The one supported on-disk projection transition. Wire identities stay exact.
-    pub(crate) fn v30_predecessor(&self) -> Option<Self> {
-        (self.contract_version == 31).then(|| Self {
-            contract_version: 30,
+    /// Only adjacent, supported on-disk projection transitions are accepted. Wire identities stay exact.
+    pub(crate) fn storage_predecessor(&self) -> Option<Self> {
+        matches!(self.contract_version, 31 | 32).then(|| Self {
+            contract_version: self.contract_version - 1,
             ..self.clone()
         })
     }

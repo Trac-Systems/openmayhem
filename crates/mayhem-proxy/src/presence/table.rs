@@ -50,7 +50,7 @@ impl Table {
                 .transpose()?;
             if let Some(value) = &stored {
                 require(
-                    *value == network || network.v30_predecessor().as_ref() == Some(value),
+                    *value == network || network.storage_predecessor().as_ref() == Some(value),
                     "presence store belongs to another network",
                 )?;
                 // Opening a missing HIGH for write would silently reset every fence.

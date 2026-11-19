@@ -17,3 +17,6 @@ of new, modified, optimistic or unbound historical operations. A fresh mainnet
 reader also catches up through authenticated fast-forward and is compared with
 the live writer. This does not claim that every historical operation can be
 re-executed from genesis with a single source revision for each version.
+
+The retained contract-31 reducer is the exact published v0.2.314 contract file,
+installed beside its same-directory dependencies as `contract/v31.js`.

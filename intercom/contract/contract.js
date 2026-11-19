@@ -1,6 +1,7 @@
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
+import { sha256 } from 'ethereum-cryptography/sha256';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
@@ -19,7 +20,8 @@ import ContractV27 from './history/v27.js';
 import ContractV28 from './history/v28.js';
 import ContractV29 from './history/v29.js';
 import ContractV30 from './v30.js';
-import { applyTapDebt, isTapRateKey, verifyPreparedTapPrice } from './tap-prepared-debt.js';
+import ContractV31 from './v31.js';
+import { applyTapDebt, isTapRateKey, verifyPreparedTapPrice } from './tap-prepared-debt-v32.js';
 import { indexPayoutHistory, historyKey } from './payout-history.js';
 import { bookedBalance, unbookedBalance, allocationCursor, revisionScope, providerScope,
   planClaimWrites, openClaim, consumeClaimWrites, receiptMatchesOutput } from './payout-reservations.js';
@@ -30,7 +32,7 @@ import { prepareProxyPublication, proxyPublicationFeatureKey } from './proxy-pub
 import { normalizeProxySpendSessionRecord, validateProxyCanonicalReceiptHead } from './proxy-reservations.js';
 import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
 
-export const CONTRACT_VERSION = 31;
+export const CONTRACT_VERSION = 32;
 // Only authenticated canonical replay can select these exact prior reducers.
 const HISTORICAL_CONTRACTS = new Map([
   [17, ContractV17],
@@ -47,11 +49,12 @@ const HISTORICAL_CONTRACTS = new Map([
   [28, ContractV28],
   [29, ContractV29],
   [30, ContractV30],
+  [31, ContractV31],
 ]);
-// Recovery is limited to receipt evidence already signed by v23-v30
+// Recovery is limited to receipt evidence already signed by v23-v31
 // participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28, 29, 30]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28, 29, 30, 31]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -850,6 +853,52 @@ const stableValue = (value) => {
 };
 const stableJson = (value) => JSON.stringify(stableValue(value));
 
+// SHA-256 of the UTF-8 compact JSON array [domain, version, slot, admin,
+// predecessor transaction, prepared snapshot hash, original MSB transaction].
+// Only the audited commitment enters the release. The TX hash already binds
+// the MSB/subnet bootstraps, nonce, writer, validator context and dispatch hash.
+const C30_CHECKPOINT_COMMITMENT = '4af7b7b685d8b4fd551835c9614ca93892d8b5855ac41bb2db0ee86e56cdc78b';
+export async function matchesCommittedC30Checkpoint(op, storage, commitment) {
+  const dispatch = op?.value?.dispatch;
+  const value = dispatch?.value;
+  const hex32 = input => typeof input === 'string' && input.length === 64 && /^[a-f0-9]+$/.test(input);
+  if (op?.type !== 'tx' || dispatch?.type !== 'stateCheckpoint' || Object.keys(dispatch).length !== 2 ||
+      value?.op !== 'state_checkpoint' || value.contract_version !== 30 || Object.keys(value).length !== 4 ||
+      !Number.isSafeInteger(value.slot) || value.slot < 2 || !hex32(value.snapshot_hash) ||
+      !hex32(op.key) || !hex32(op.value.ipk)) return false;
+  const read = async key => (await storage.get(key))?.value ?? null;
+  const snapshot = await read(`checkpoint/prepared/${value.slot}`);
+  if (snapshot?.type !== 'state_checkpoint_snapshot' || snapshot.schema_version !== 1 ||
+      snapshot.state?.contract_version !== 30 || snapshot.slot !== value.slot ||
+      snapshot.prepared_by !== op.value.ipk || snapshot.snapshot_hash !== value.snapshot_hash ||
+      !hex32(snapshot.previous_tx)) return false;
+  const preimage = ['openmayhem:paid-checkpoint-recovery:v1', value.contract_version, value.slot,
+    op.value.ipk, snapshot.previous_tx, value.snapshot_hash, op.key];
+  if (b4a.toString(sha256(b4a.from(JSON.stringify(preimage), 'utf8')), 'hex') !== commitment) return false;
+  if (await read('admin') !== op.value.ipk) return false;
+  const { snapshot_hash: snapshotHash, ...body } = snapshot;
+  const digest = async (domain, data) => b4a.toString(await blake3(b4a.from(stableJson({ domain, value: data }))), 'hex');
+  if (await digest('mayhem-checkpoint-state-v1', snapshot.state) !== snapshot.state_hash ||
+      await digest('mayhem-checkpoint-snapshot-v1', body) !== snapshotHash) return false;
+  const existing = await read(`checkpoint/slot/${value.slot}`);
+  const predecessor = await read(existing === null ? 'checkpoint/current' : `checkpoint/slot/${value.slot - 1}`);
+  if (predecessor?.type !== 'paid_state_checkpoint' || predecessor.schema_version !== 1 ||
+      predecessor.slot !== value.slot - 1 || predecessor.tx !== snapshot.previous_tx) return false;
+  const index = await read(`tx/${op.key}`);
+  if (existing === null) {
+    const preparing = await read('checkpoint/preparing');
+    return index === null && preparing?.slot === value.slot && preparing.snapshot_hash === snapshotHash;
+  }
+  if (existing.type !== 'paid_state_checkpoint' || existing.schema_version !== 1 ||
+      existing.slot !== value.slot || existing.tx !== op.key || existing.paid_by !== op.value.ipk ||
+      ['snapshot_hash', 'state_hash', 'previous_tx', 'no_change', 'scheduled_at', 'observed_at']
+        .some(key => existing[key] !== snapshot[key]) || !Number.isSafeInteger(index) || index < 0) return false;
+  const indexed = await read(`txi/${index}`);
+  return indexed?.err === null && indexed.tx === op.key && indexed.ipk === op.value.ipk &&
+    hex32(indexed.wp) && (op.value.wp === undefined || indexed.wp === op.value.wp) &&
+    JSON.stringify(indexed.val) === JSON.stringify(dispatch);
+}
+
 const verifyEd25519Hex = (signature, message, publicKey) => {
   const signatureHex = String(signature ?? '').toLowerCase();
   const publicKeyHex = String(publicKey ?? '').toLowerCase();
@@ -945,7 +994,7 @@ class MayhemContract extends Contract {
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
         (HISTORICAL_CONTRACTS.has(versioned.version) && canonicalReplay) ||
-        ([24, 25, 26, 27, 28, 29].includes(versioned.version) &&
+        ([24, 25, 26, 27, 28, 29, 30].includes(versioned.version) &&
           await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
@@ -978,6 +1027,9 @@ class MayhemContract extends Contract {
   async isPreparedCheckpointReplay(op, storage) {
     const dispatch = op?.value?.dispatch;
     const value = dispatch?.value;
+    if (CONTRACT_VERSION === 32 && value?.contract_version === 30) {
+      return matchesCommittedC30Checkpoint(op, storage, C30_CHECKPOINT_COMMITMENT);
+    }
     if (op?.type !== 'tx' || dispatch?.type !== 'stateCheckpoint' ||
         value?.op !== 'state_checkpoint' || value.contract_version !== 24 ||
         !Number.isSafeInteger(value.slot) || value.slot < 1 ||
@@ -3401,7 +3453,7 @@ class MayhemContract extends Contract {
       'record usage receipt envelope'
     );
     if (receiptShapeError) return receiptShapeError;
-    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28, 29, 30].includes(value.contract_version)
+    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28, 29, 30, 31].includes(value.contract_version)
       ? SESSION_RECEIPT_SCHEMA_VERSION
       : 11;
     const receipt = await this.normalizeReceiptEnvelope(value.receipt, {

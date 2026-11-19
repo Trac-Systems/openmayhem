@@ -102,3 +102,20 @@ funding exhaustion and the spending lock.
 Run thirty minutes of live idle/active observation, verify every paid MSB hash and
 canonical checkpoint, and continue the twenty-four-hour cadence observation.
 Track settlement advancement independently from paid checkpoint confirmations.
+
+### Contract cutovers with outstanding checkpoint payments
+
+Inspect the writer's durable journal and its signed subnet and MSB records before
+changing the peer contract. Record the last paid slot, the next due slot, and the
+phase of any signed preparation. Quiesce new checkpoint creation and verify the
+observed journal still matches that evidence before the fleet freeze.
+
+An uncertain broadcast can still settle after an explorer lookup returns no
+record. Preserve the original bytes and spending lock. Rehearse recovery of the
+exact pending transaction under the incoming contract, including a lost
+acknowledgement and the next ordinary slot. If an older payment cannot yet be
+recovered, keep the current fleet serving while arranging the version transition.
+
+After activation, verify the fee on the signed MSB view and the applied slot on
+an independent subnet peer. Verify the next slot links to the recovered payment
+and measure sustained advancement before declaring the checkpoint stream healthy.

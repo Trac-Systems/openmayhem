@@ -16,6 +16,7 @@ import { canonicalReplayContext, consumeCanonicalReplayContext, canonicalReplayV
 import {adminWriterDiagnostics,appliedViewProof} from '../src/rpc.js';
 import MayhemContract from '../contract/contract.js';
 import Contract30 from '../contract/v30.js';
+import Contract31 from '../contract/v31.js';
 import Contract17 from '../contract/history/v17.js';
 import Contract18 from '../contract/history/v18.js';
 import Contract19 from '../contract/history/v19.js';
@@ -24,7 +25,7 @@ import Contract21 from '../contract/history/v21.js';
 import Contract22 from '../contract/history/v22.js';
 import Contract23 from '../contract/history/v23.js';import Contract24 from '../contract/history/v24.js';import Contract25 from '../contract/history/v25.js';import Contract26 from '../contract/history/v26.js';import Contract27 from '../contract/history/v27.js';import Contract28 from '../contract/history/v28.js';import Contract29 from '../contract/history/v29.js';
 import { MemoryStorage } from './helpers/contract.js';
-const historicalContracts=new Map([[17,Contract17],[18,Contract18],[19,Contract19],[20,Contract20],[21,Contract21],[22,Contract22],[23,Contract23],[24,Contract24],[25,Contract25],[26,Contract26],[27,Contract27],[28,Contract28],[29,Contract29],[30,Contract30]]);
+const historicalContracts=new Map([[17,Contract17],[18,Contract18],[19,Contract19],[20,Contract20],[21,Contract21],[22,Contract22],[23,Contract23],[24,Contract24],[25,Contract25],[26,Contract26],[27,Contract27],[28,Contract28],[29,Contract29],[30,Contract30],[31,Contract31]]);
 const versions=[...historicalContracts.keys()];
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const protocol={featMaxBytes:()=>1e6};
@@ -58,23 +59,23 @@ async function fixture(version,kind='feature'){
  async function replay(){const replayStore=new Corestore(path.join(dir,'replay'));const view=new Hyperbee(replayStore.get({name:'view'}),{extension:false,keyEncoding:'utf-8',valueEncoding:'json'});await view.ready();await view.put('admin',wallet.publicKey);const batch=view.batch();const current=new MayhemContract(proto,{});await applyHandler(current,base.view).handle(op,batch,base,node);await batch.flush();await batch.close();assert.equal((await view.core.treeHash()).toString('hex'),expectedHash,'Full authenticated tree must match historical writer');const once=view.core.length;const duplicate=view.batch();await applyHandler(current,base.view).handle(op,duplicate,base,node);await duplicate.flush();await duplicate.close();assert.equal(view.core.length,once);const state=await collect(view);await view.close();await replayStore.close();return state;}
  return {wallet,op,node,proto,replay,get view(){return base.view;},expected,before:()=>new MemoryStorage({admin:wallet.publicKey}),async close(){await base.close();await store.close();fs.rmSync(dir,{recursive:true,force:true});}};
 }
-for(const version of versions)for(const kind of ['feature','tx'])test(`persisted signed v${version} ${kind} history preserves full tree under31 exactly once`,async()=>{
+for(const version of versions)for(const kind of ['feature','tx'])test(`persisted signed v${version} ${kind} history preserves full tree under32 exactly once`,async()=>{
  const f=await fixture(version,kind);try{const replayed=await f.replay();assert.equal(replayed.snapshotBytes(),f.expected.snapshotBytes());if(kind==='tx')assert.equal((await replayed.get('params/price_min_bps')).value.pending.value,version>=25?2500:1,'Historical pricing bound must not be reinterpreted');}finally{await f.close();}
 });
 for (const version of [17,22,24,30]) test(`fresh, unbound, mutated and wrong-version v${version} Feature calls remain rejected`,async()=>{
  const f=await fixture(version);try{const c=new MayhemContract({},{});
- await assert.rejects(c.execute(f.op,f.before()),new RegExp('expected CONTRACT_VERSION 31, got '+version));
- await assert.rejects(c.execute(f.op,f.before(),{replay:true}),new RegExp('expected CONTRACT_VERSION 31, got '+version));
+ await assert.rejects(c.execute(f.op,f.before()),new RegExp('expected CONTRACT_VERSION 32, got '+version));
+ await assert.rejects(c.execute(f.op,f.before(),{replay:true}),new RegExp('expected CONTRACT_VERSION 32, got '+version));
  const fresh=structuredClone(f.op);fresh.value.dispatch.nonce='fresh';fresh.value.dispatch.hash=f.wallet.sign(JSON.stringify(fresh.value.dispatch.value)+'fresh');
- const unsignedNode={...f.node,value:fresh};await assert.rejects(handler(f.wallet,c,f.view).handle(fresh,f.before(),{},unsignedNode),new RegExp('expected CONTRACT_VERSION 31, got '+version));
- const bad=structuredClone(f.op);bad.value.dispatch.contract_version=23;await assert.rejects(handler(f.wallet,c,f.view).handle(bad,f.before(),{},{...f.node,value:bad}),/expected CONTRACT_VERSION 31, got 23/);
+ const unsignedNode={...f.node,value:fresh};await assert.rejects(handler(f.wallet,c,f.view).handle(fresh,f.before(),{},unsignedNode),new RegExp('expected CONTRACT_VERSION 32, got '+version));
+ const bad=structuredClone(f.op);bad.value.dispatch.contract_version=23;await assert.rejects(handler(f.wallet,c,f.view).handle(bad,f.before(),{},{...f.node,value:bad}),/expected CONTRACT_VERSION 32, got 23/);
  const storage=f.before(),token=await canonicalReplayContext(f.op,storage,f.node,f.view);assert(token);assert.equal(consumeCanonicalReplayContext(token,f.op,f.before()),false);assert.equal(consumeCanonicalReplayContext(token,f.op,storage),false,'failed use consumes capability');
  const token2=await canonicalReplayContext(f.op,storage,f.node,f.view);f.op.value.dispatch.key+='tampered';assert.equal(consumeCanonicalReplayContext(token2,f.op,storage),false);
  }finally{await f.close();}
 });
 
 for (const version of [17,22,24,30]) test(`ordinary v${version} TX requires exact canonical index and original signed bytes`,async()=>{
- const f=await fixture(version,'tx');try{const c=new MayhemContract(f.proto,{}),storage=f.before();await assert.rejects(c.execute(f.op,storage),new RegExp('expected CONTRACT_VERSION 31, got '+version));
+ const f=await fixture(version,'tx');try{const c=new MayhemContract(f.proto,{}),storage=f.before();await assert.rejects(c.execute(f.op,storage),new RegExp('expected CONTRACT_VERSION 32, got '+version));
  const noIndex={core:f.view.core,checkout:length=>{const view=f.view.checkout(length);return {close:()=>view.close(),get:async key=>key.startsWith('tx/')?null:view.get(key)};}};
  assert.equal(await canonicalReplayContext(f.op,storage,f.node,noIndex),null);
  const badRecord={core:f.view.core,checkout:length=>{const view=f.view.checkout(length);return {close:()=>view.close(),get:async key=>{const row=await view.get(key);return key.startsWith('txi/')?{...row,value:{...row.value,ipk:'00'.repeat(32)}}:row;}};}};
@@ -110,32 +111,58 @@ for (const version of versions) test(`persisted remote v${version} Feature reads
   state.base=base;base.on('error',e=>{state.error=e;});await base.ready();opened.add(state);return state;
  }
  async function close(state){await state.base.close();await state.store.close();opened.delete(state);}
- function connect(left,right){const a=left.store.replicate(true),b=right.store.replicate(false);a.pipe(b).pipe(a);const close=()=>{a.destroy();b.destroy();};streams.push(close);return close;}
- async function until(check){for(let i=0;i<250;i++){if(await check())return;await delay(10);}assert.fail('Remote replay did not reach its expected terminal state');}
+ function connect(left,right){const a=left.base.replicate(true),b=right.base.replicate(false);a.pipe(b).pipe(a);const close=()=>{a.destroy();b.destroy();};streams.push(close);return close;}
+ async function until(check,label){
+  for(let i=0;i<250;i++){if(await check())return;await delay(10);}
+  assert.fail(`Remote replay did not reach ${label}`);
+ }
  try{
   const writer=await open('writer',null,old);await writer.base.append({type:'seed'});await writer.base.update();
+  const seedLength=writer.base.view.core.length;
+  const seedHash=await writer.base.view.core.treeHash(seedLength);
+  assert(seedLength>0);
+  await until(()=>writer.base.view.core.signedLength===seedLength,'signed writer seed');
   // Both followers persist the earlier prefix, then go offline before the old
   // writer accepts the Feature. Reopening them invokes real remote Autobase
   // apply nodes; no synthetic node.from=base.local or borrowed writer view.
   for(const name of ['broken','fixed']){
    const follower=await open(name,writer.base.key,old);const disconnect=connect(writer,follower);
-   await until(async()=>!!await follower.base.view.get('admin'));disconnect();await close(follower);
+   // The admin row can be visible in a speculative batch. Wait for the
+   // signed prefix and complete its update before closing the live replica.
+   await until(async()=>{
+    await follower.base.update();
+    return follower.base.view.core.signedLength===seedLength &&
+     (await follower.base.view.get('admin',{wait:false}))?.value===wallet.publicKey;
+   },`signed seed on ${name}`);
+   assert.deepEqual(await follower.base.view.core.treeHash(seedLength),seedHash);
+   await close(follower);disconnect();
   }
   const value={op:'rate_oracle',tnk_usd_au:'50000000000000000',source:'gate-spot',ts:3600},key='mayhem_'+await old.rateFeatureKey(value),nonce='remote-'+version;
   const op={type:'feature',key,value:{dispatch:{type:'mayhem_feature',contract_version:version,key,address:wallet.publicKey,value,nonce,hash:wallet.sign(JSON.stringify(value)+nonce)}}};
   await writer.base.append(op);await writer.base.update();
+  await until(()=>writer.base.view.core.signedLength===writer.base.view.core.length,'signed writer Feature');
   const expected=(await writer.base.view.core.treeHash()).toString('hex');
-  const broken=await open('broken',writer.base.key,new MayhemContract(protocol,{}),true);const disconnectBroken=connect(writer,broken);
-  await until(()=>broken.error);assert.match(broken.error.message,new RegExp('expected CONTRACT_VERSION 31, got '+version));
+  async function reopenFollower(name,contract,broken=false){
+   const follower=await open(name,writer.base.key,contract,broken);
+   await follower.base.update();
+   assert.equal(follower.base.view.core.signedLength,seedLength,`persisted seed length on ${name}`);
+   assert.deepEqual(await follower.base.view.core.treeHash(seedLength),seedHash);
+   return follower;
+  }
+  const broken=await reopenFollower('broken',new MayhemContract(protocol,{}),true);const disconnectBroken=connect(writer,broken);
+  await until(()=>broken.error,'broken follower rejection');assert.match(broken.error.message,new RegExp('expected CONTRACT_VERSION 32, got '+version));
   assert(broken.observations.some(x=>x.remote&&x.inputSignedLength>=x.nodeLength&&x.publicLength===x.applyLength));
   disconnectBroken();await close(broken);
-  const current=new MayhemContract(protocol,{}),fixed=await open('fixed',writer.base.key,current);connect(writer,fixed);
-  await until(async()=>fixed.error||!!await fixed.base.view.get('fr/'+op.value.dispatch.hash));assert.equal(fixed.error,null);
+  const current=new MayhemContract(protocol,{}),fixed=await reopenFollower('fixed',current);connect(writer,fixed);
+  await until(async()=>fixed.error||!!await fixed.base.view.get('fr/'+op.value.dispatch.hash),'fixed follower replay');assert.equal(fixed.error,null);
   assert(fixed.observations.some(x=>x.remote&&x.inputSignedLength>=x.nodeLength&&x.canonicalLength>x.publicLength&&x.publicLength===x.applyLength));
   assert.equal((await fixed.base.view.core.treeHash()).toString('hex'),expected,'Real follower must reproduce the complete historical signed tree');
   assert.equal((await collect(fixed.base.view)).snapshotBytes(),(await collect(writer.base.view)).snapshotBytes());
   assert.equal(current._mayhemReplayStatus.completed,1);
-  await writer.base.append(op);await writer.base.update();await delay(50);await fixed.base.update();
+  await writer.base.append(op);await writer.base.update();
+  const duplicateLength=writer.base.local.length;
+  await until(()=>fixed.error||fixed.observations.some(x=>x.remote&&x.nodeLength===duplicateLength),'remote duplicate input');
+  assert.equal(fixed.error,null);await fixed.base.update();
   assert.equal(current._mayhemReplayStatus.completed,1,'Repeated signed input must not apply twice');
   assert.equal((await fixed.base.view.core.treeHash()).toString('hex'),expected);
  }finally{for(const close of streams)close();for(const state of opened)await close(state);fs.rmSync(dir,{recursive:true,force:true});}
@@ -151,4 +178,11 @@ test('retained v17–22 sources are exact originals and bound into release ident
   const bytes=fs.readFileSync(new URL('../'+relative,import.meta.url));
   assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'),sha256);
  }
+});
+
+
+test('the retained C31 reducer is byte-identical to the released implementation', () => {
+  const previous = fs.readFileSync(new URL('../contract/v31.js', import.meta.url));
+  assert.equal(crypto.createHash('sha256').update(previous).digest('hex'),
+    'b5f1dacc565137e5e53e3e3f7171b698fbeff382e56efe718b68d7aa30e7fa63');
 });

@@ -66,7 +66,7 @@ impl Store {
             if let Some(prior) = &prior {
                 if identity_changed {
                     let previous = network
-                        .v30_predecessor()
+                        .storage_predecessor()
                         .ok_or_else(|| crate::invalid("conformance store identity differs"))?;
                     require(
                         prior.value() == serde_json::to_vec(&(previous, &config.tester))?,

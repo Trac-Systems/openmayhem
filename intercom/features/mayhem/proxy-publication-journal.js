@@ -108,12 +108,12 @@ export class ProxyPublicationJournal {
         if (state.schema_version !== 1 || !Array.isArray(state.entries) ||
             state.entries.length > this.maxEntries) fail('identity/schema mismatch');
         if (stable(state.identity) !== stable(this.identity)) {
-          // Contract 31 changes FIAT recovery. An empty v30 queue has no
+          // A drained journal from the immediately preceding release has no
           // outstanding nonce or receipt to replay. Keep every writer and
           // network identity field bound while upgrading its local file.
-          if (state.entries.length !== 0 || this.identity.contract_version !== 31 ||
+          if (state.entries.length !== 0 || ![31, 32].includes(this.identity.contract_version) ||
               !hex(this.identity.writer_key) || !hex(this.identity.admin) ||
-              stable(state.identity) !== stable({ ...this.identity, contract_version: 30 })) {
+              stable(state.identity) !== stable({ ...this.identity, contract_version: this.identity.contract_version - 1 })) {
             fail('identity/schema mismatch');
           }
           upgradeDrainedJournal = true;

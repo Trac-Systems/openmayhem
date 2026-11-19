@@ -158,12 +158,13 @@ fn decode_state(bytes: &[u8], identity: &Identity) -> Result<State> {
 
 // redb 3.1.3 renames a table root in the directory. Deleting a populated table
 // would visit every page. Keep the old roots (including the checkpoint and any
-// partial traversal) for inspection without exposing them through v31 reads.
-fn archive_v30<V: redb::Value + 'static>(
+// partial traversal) for inspection without exposing them through the upgraded catalog.
+fn archive_prior<V: redb::Value + 'static>(
     tx: &redb::WriteTransaction,
     table: TableDefinition<&str, V>,
+    prior_version: u32,
 ) -> Result<()> {
-    let archived = format!("v30_{}", table.name());
+    let archived = format!("v{prior_version}_{}", table.name());
     let source = db(tx.open_table(table))?;
     db(tx.rename_table(source, TableDefinition::<&str, V>::new(&archived)))
 }
@@ -249,7 +250,7 @@ impl Catalog {
             value
                 .map(|v| match decode_state(v.value(), &identity) {
                     Err(Error::Identity) => {
-                        let prior = identity.v30_predecessor().ok_or(Error::Identity)?;
+                        let prior = identity.storage_predecessor().ok_or(Error::Identity)?;
                         decode_state(v.value(), &prior)
                     }
                     result => result,
@@ -295,16 +296,16 @@ impl Catalog {
                 "invalid staged catalog index",
             )?;
             if state.identity != identity {
-                archive_v30(&tx, META)?;
-                archive_v30(&tx, CURRENT)?;
+                archive_prior(&tx, META, state.identity.contract_version)?;
+                archive_prior(&tx, CURRENT, state.identity.contract_version)?;
                 if has_index {
-                    archive_v30(&tx, INDEX)?;
+                    archive_prior(&tx, INDEX, state.identity.contract_version)?;
                 }
                 if has_staged {
-                    archive_v30(&tx, STAGED)?;
+                    archive_prior(&tx, STAGED, state.identity.contract_version)?;
                 }
                 if has_staged_index {
-                    archive_v30(&tx, STAGED_INDEX)?;
+                    archive_prior(&tx, STAGED_INDEX, state.identity.contract_version)?;
                 }
                 state.advance()?;
                 initial_generation = Some(state.generation);
