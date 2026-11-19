@@ -64,9 +64,15 @@ test('TAP polling cost over sixty caught-up ticks and subsequent finality advanc
   await f.tick();
   assert.equal(f.from, '12');
   assert.equal(f.pages.at(-1).coverage.finalized_number, '11');
+  // SITE's next lease after processing a block is due in one second. Its
+  // first empty page starts the server's idle interval as well as our own.
   const afterTip = f.calls.length;
   await f.tick();
-  assert.equal(f.calls.length, afterTip);
+  assert.equal(f.pages.at(-1).coverage, undefined);
+  assert.equal(f.pages.at(-1).next_cursor, '12');
+  assert.deepEqual(f.calls.slice(afterTip), ['eth_chainId', 'eth_getBlockByNumber']);
+  await f.tick();
+  assert.equal(f.calls.length, afterTip + 2);
 });
 
 test('TAP polling cost for empty and dense blocks during bounded catch-up', async () => {

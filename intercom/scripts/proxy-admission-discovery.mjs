@@ -14,8 +14,9 @@ const ethAddress = value => typeof value === 'string' && /^0x[0-9a-f]{40}$/.test
 const TAP_FINALITY_POLL_MS = 30000;
 
 function tapCaughtUp(work, page) {
-  if (!page.coverage) return page.next_cursor === work.from_cursor && page.next_offset === work.from_offset;
-  return page.coverage.finalized_number === work.from_cursor && BigInt(page.next_cursor) > BigInt(work.from_cursor);
+  // SITE schedules its idle interval only after an acknowledged no-progress
+  // page. Let it receive that page promptly after the last finalized block.
+  return !page.coverage && page.next_cursor === work.from_cursor && page.next_offset === work.from_offset;
 }
 export function validateDiscoveryWork(w, stream) {
   shape(w,['schema_version','purpose','phase','stream_id','stream','from_cursor','from_offset','max_positions','lease_token','lease_expires_at_ms',
