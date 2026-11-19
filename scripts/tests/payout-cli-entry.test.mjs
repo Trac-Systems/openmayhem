@@ -26,6 +26,7 @@ test('payout workers execute their CLI through a symlinked release directory', t
     ['contracts/scripts/tap-deposit-watcher.mjs', /Missing --rpc/],
     ['contracts/scripts/tap-claim-proof.mjs', /Missing --settlement/],
     ['contracts/scripts/tap-calldata-builder.mjs', /Use mode/],
+    ['intercom/scripts/fiat-preparation-recovery.mjs', /Usage: inspect SNAPSHOT/],
   ]) {
     const result = run(script);
     assert.equal(result.status, 1, script);
@@ -42,4 +43,14 @@ test('payout workers execute their CLI through a symlinked release directory', t
   const written = JSON.parse(fs.readFileSync(output, 'utf8'));
   assert.equal(written.epoch_apply_hash, applyHash);
   assert.deepEqual(written.receipts, []);
+});
+
+test('a recovery inspection imported from stdin leaves the CLI idle', () => {
+  const result = spawnSync(process.execPath, ['--input-type=module', '-'], {
+    cwd: source, env: { PATH: process.env.PATH }, encoding: 'utf8', timeout: 10000,
+    input: "import { inspectOverlap } from './intercom/scripts/fiat-preparation-recovery.mjs';\n" +
+      "if (typeof inspectOverlap !== 'function') throw Error('missing inspection helper');\n",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '');
 });

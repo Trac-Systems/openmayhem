@@ -142,7 +142,8 @@ async function main([command, snapshotFile, reviewFile, outputFile, keypair, evi
   fs.writeFileSync(outputFile, JSON.stringify(feature) + '\n', { flag: 'wx', mode: 0o600 });
   console.log('Signed recovery feature prepared locally.');
 }
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main ?? (process.argv[1] && fs.existsSync(process.argv[1]) &&
+    fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url))) {
   main(process.argv.slice(2)).catch(e => {
     // Parser and filesystem errors can include private input bytes or paths.
     const message = e.message;
