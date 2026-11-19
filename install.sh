@@ -1111,6 +1111,7 @@ reset_runtime_asset_dir() {
     "$SHARE_DIR/catalog" \
     "$SHARE_DIR/intercom" \
     "$SHARE_DIR/contracts" \
+    "$SHARE_DIR/scripts/validate-tap-settlement-checkpoint.mjs" \
     "$SHARE_DIR/crates/mayhem-cli/src"
   mkdir -p "$SHARE_DIR"
 }
@@ -1145,6 +1146,8 @@ copy_source_assets() {
   cp -R "$SOURCE_DIR/catalog" "$SHARE_DIR/catalog"
   copy_runtime_tree "$SOURCE_DIR/intercom" "$SHARE_DIR/intercom"
   copy_runtime_tree "$SOURCE_DIR/contracts" "$SHARE_DIR/contracts"
+  mkdir -p "$SHARE_DIR/scripts"
+  cp "$SOURCE_DIR/scripts/validate-tap-settlement-checkpoint.mjs" "$SHARE_DIR/scripts/"
   mkdir -p "$SHARE_DIR/crates/mayhem-cli/src"
   cp "$SOURCE_DIR/crates/mayhem-cli/src/"*.mjs "$SHARE_DIR/crates/mayhem-cli/src/"
   log "installed Mayhem runtime assets into $SHARE_DIR"

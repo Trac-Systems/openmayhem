@@ -1554,6 +1554,7 @@ function Reset-RuntimeAssetDir {
         (Join-Path $ShareDir "catalog"),
         (Join-Path $ShareDir "intercom"),
         (Join-Path $ShareDir "contracts"),
+        (Join-RelativePath $ShareDir "scripts/validate-tap-settlement-checkpoint.mjs"),
         (Join-Path (Join-Path (Join-Path $ShareDir "crates") "mayhem-cli") "src")
     )
     foreach ($path in $paths) {
@@ -1591,6 +1592,8 @@ function Copy-SourceAssets {
     Copy-FilteredDirectory -Source (Join-Path $SourceDir "catalog") -Destination (Join-Path $ShareDir "catalog")
     Copy-FilteredDirectory -Source (Join-Path $SourceDir "intercom") -Destination (Join-Path $ShareDir "intercom")
     Copy-FilteredDirectory -Source (Join-Path $SourceDir "contracts") -Destination (Join-Path $ShareDir "contracts")
+    $scripts = New-Item -ItemType Directory -Path (Join-Path $ShareDir "scripts") -Force
+    Copy-Item -LiteralPath (Join-RelativePath $SourceDir "scripts/validate-tap-settlement-checkpoint.mjs") -Destination $scripts.FullName -Force
     $helperDir = Join-Path (Join-Path (Join-Path $ShareDir "crates") "mayhem-cli") "src"
     New-Item -ItemType Directory -Path $helperDir -Force | Out-Null
     foreach ($helper in Get-ChildItem -Path (Join-Path (Join-Path (Join-Path $SourceDir "crates") "mayhem-cli") "src") -Filter "*.mjs") {
