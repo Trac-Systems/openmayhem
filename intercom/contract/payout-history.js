@@ -114,11 +114,6 @@ async function inventoryOutput(contract, writes, plan, output, planKey) {
   // Its absence/success adjudication must still be executable after inventory.
   const reviewedPair = rail === 'fiat' && provider && old?.epoch === 508 && old.index === 0 &&
     old.prepared && epoch === 542 && output.output_index === 1 && before === old.before;
-  if (reviewedPair) {
-    writes.set(`payout/legacy-review/fiat/${output.provider}`, {
-      old_operation: old.owner, new_operation: id,
-    });
-  }
   const preferred = !old || (prepared && !old.prepared);
   const max = (a, b) => a > b ? a : b;
   const min = (a, b) => a < b ? a : b;
@@ -142,6 +137,8 @@ async function inventoryOutput(contract, writes, plan, output, planKey) {
     epoch: preferred ? epoch : old.epoch, index: preferred ? output.output_index : old.index,
     owner: preferred ? id : old.owner, prepared: prepared || old?.prepared === true,
     blocked: old?.blocked === true || collision || inconsistent || (prepared && !eligible),
+    ...(reviewedPair || old?.reviewed_successor
+      ? { reviewed_successor: reviewedPair ? id : old.reviewed_successor } : {}),
     paid_au: String(reservedPaid), gross_au: String(reservedGross), before,
     consumed_by: null,
   };

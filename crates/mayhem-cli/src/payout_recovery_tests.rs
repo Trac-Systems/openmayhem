@@ -178,7 +178,11 @@ fn attempt_fixture() -> (Value, Value, Value, Value, Value) {
 
 #[test]
 fn frozen_reservations_exclude_dust_and_keep_issue_watermarks_monotonic() {
-    let book = BookedPayout { paid: 60, dust: 9, through: 100 };
+    let book = BookedPayout {
+        paid: 60,
+        dust: 9,
+        through: 100,
+    };
     assert_eq!(book.available(79, 4).unwrap(), (10, 4, 6));
     assert_eq!(book.available(79, 25).unwrap(), (10, 10, 0));
     assert_eq!(book.available(10, 0).unwrap(), (0, 0, 0));
@@ -191,17 +195,82 @@ fn frozen_reservations_exclude_dust_and_keep_issue_watermarks_monotonic() {
 fn payout_selection_accepts_one_canonical_id_and_conflicts_with_bulk_dispatch() {
     let id = "a".repeat(64);
     for cmd in ["fiat-settlement", "tnk-settlement"] {
-        let prefix = ["mayhem","admin",cmd,"--epoch","3"];
-        let parse = |flags: &[&str]| Cli::try_parse_from(prefix.iter().copied().chain(flags.iter().copied()));
-        assert!(parse(&["--submit","--freeze-only"]).is_ok());
-        assert!(parse(&["--submit","--submit-transfer","--output-id",&id]).is_ok());
+        let prefix = ["mayhem", "admin", cmd, "--epoch", "3"];
+        let parse = |flags: &[&str]| {
+            Cli::try_parse_from(prefix.iter().copied().chain(flags.iter().copied()))
+        };
+        assert!(parse(&["--submit", "--freeze-only"]).is_ok());
+        assert!(parse(&["--submit", "--close-only"]).is_ok());
+        assert!(parse(&["--submit", "--submit-transfer", "--output-id", &id]).is_ok());
         for invalid in [
-            vec!["--freeze-only"], vec!["--output-id",&id], vec!["--submit","--freeze-only","--submit-transfer"],
-            vec!["--submit","--submit-transfer","--output-id","BAD"],
-            vec!["--submit","--submit-transfer","--output-id",&id,"--output-id",&id],
-            vec!["--submit","--submit-transfer","--output-id",&id,"--settlement-file","fixture"],
-        ] { assert!(parse(&invalid).is_err(), "{cmd} {invalid:?}"); }
+            vec!["--close-only"],
+            vec!["--submit", "--close-only", "--freeze-only"],
+            vec!["--submit", "--close-only", "--submit-transfer"],
+            vec!["--submit", "--close-only", "--sim"],
+            vec!["--submit", "--close-only", "--settlement-file", "fixture"],
+            vec!["--freeze-only"],
+            vec!["--output-id", &id],
+            vec!["--submit", "--freeze-only", "--submit-transfer"],
+            vec!["--submit", "--submit-transfer", "--output-id", "BAD"],
+            vec![
+                "--submit",
+                "--submit-transfer",
+                "--output-id",
+                &id,
+                "--output-id",
+                &id,
+            ],
+            vec![
+                "--submit",
+                "--submit-transfer",
+                "--output-id",
+                &id,
+                "--settlement-file",
+                "fixture",
+            ],
+        ] {
+            assert!(parse(&invalid).is_err(), "{cmd} {invalid:?}");
+        }
     }
+}
+
+#[test]
+fn selected_identity_and_receipt_require_original_plan_position_and_confirmed_effect() {
+    let id = "3".repeat(64);
+    let other = "4".repeat(64);
+    let output = json!({"role":"provider", "output_index":1,"economic_op_id":id,
+        "to":"testtrac1second","tnk_e18":"200"});
+    let mut plan = json!({"rail":"tnk","epoch":9,"plan_root":"a".repeat(64),"epoch_apply_hash":"b".repeat(64),
+        "outputs":[{"output_index":0,"economic_op_id":other},output]});
+    assert_eq!(selected_payout_index(&plan, &id).unwrap(), 1);
+    assert!(selected_payout_index(&plan, &"f".repeat(64)).is_err());
+    let mut duplicate = plan.clone();
+    duplicate["outputs"][0]["economic_op_id"] = json!(id);
+    assert!(selected_payout_index(&duplicate, &id).is_err());
+    let hash = "c".repeat(64);
+    let row = json!({"type":"targeted_tnk_output_settlement","rail":"tnk","epoch":9,"economic_op_id":id,
+        "value":{"op":"settle_targeted_tnk_output","rail":"tnk","epoch":9,"plan_root":plan["plan_root"],
+            "epoch_apply_hash":plan["epoch_apply_hash"],"output_index":1,"preparation_id":id,"economic_op_id":id,
+            "external_effect_id":hash,"msb_transfer":{"tx_hash":hash,"confirmed_length":15,"observed_signed_length":16,
+            "to":output["to"],"amount_e18":output["tnk_e18"]}}});
+    validate_payout_receipt(&plan, &output, &row).unwrap();
+    for (path, value) in [
+        ("/value/output_index", json!(0)),
+        ("/value/plan_root", json!("d".repeat(64))),
+        ("/value/msb_transfer/amount_e18", json!("199")),
+        ("/value/msb_transfer/tx_hash", json!("f".repeat(64))),
+        ("/value/msb_transfer/observed_signed_length", json!(14)),
+        ("/value/preparation_id", json!(other)),
+    ] {
+        let mut wrong = row.clone();
+        *wrong.pointer_mut(path).unwrap() = value;
+        assert!(
+            validate_payout_receipt(&plan, &output, &wrong).is_err(),
+            "{path}"
+        );
+    }
+    plan["outputs"][1]["output_index"] = json!(0);
+    assert!(selected_payout_index(&plan, &id).is_err());
 }
 
 #[test]

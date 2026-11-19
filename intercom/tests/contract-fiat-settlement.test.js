@@ -772,7 +772,7 @@ const overlapStart = '8028518251457218441';
 const paid508 = '1021701396860965955';
 const paid542 = '1877278632791707922';
 
-async function freezeFiatEpoch(ctx, epoch, anchor, outputs) {
+async function freezeFiatEpoch(ctx, epoch, anchor, outputs, carry = []) {
   const update = `epoch/targeted/${epoch}/apply`;
   await ctx.storage.put(`epoch/apply-anchor/${epoch}`, {
     type: 'epoch_apply_anchor', epoch, apply_hash: anchor, settlement_unix: 90_000, applied_at: update
@@ -781,7 +781,7 @@ async function freezeFiatEpoch(ctx, epoch, anchor, outputs) {
     updated_epoch: epoch, updated_at: update, last_apply_hash: anchor, last_settlement_unix: 90_000
   });
   ctx.outputs = outputs;
-  const value = await planValue(ctx, epoch, anchor);
+  const value = await planValue(ctx, epoch, anchor, carry);
   const r = await submitControl(ctx, value, 'targetedPayoutEpochFeatureKey');
   assert.equal(r.ok, true, r.message);
   return value;
@@ -1297,7 +1297,7 @@ test('FIAT carry preserves each unquoted liability and permits an independent pr
 });
 
 test('indexed overlapping 508/542 preparations still require and accept the original reviewed resolution', async () => {
-  const { ctx, old, next, frozen } = await overlapFixture();
+  const { ctx, old, next, first, frozen, earningKey, liabilityKey } = await overlapFixture();
   const before = await reviewedFeature(ctx, 'fence');
   await inventory(ctx, 'fiat');
   const group = `payout/legacy/fiat/revision/${old.provider}/${old.payout_revision}`;
@@ -1305,7 +1305,32 @@ test('indexed overlapping 508/542 preparations still require and accept the orig
   assert.match((await prepareEconomicOutput(ctx, frozen, next)).message, /Conflicting historical payout reservation/);
   const fence = await submitRecovery(ctx, before);
   assert.equal(fence.ok, true, fence.message);
-  const repaired = await submitRecovery(ctx, await reviewedFeature(ctx, 'supersede_absent'));
+  const reviewed = await reviewedFeature(ctx, 'supersede_absent');
+  const read = async key => (await ctx.storage.get(key)).value;
+  const delta = 100n * CENT_AU;
+  for (const key of [earningKey, liabilityKey]) {
+    const balance = await read(key);
+    await ctx.storage.put(key, { ...balance, total_au: String(BigInt(balance.total_au) + delta), updated_epoch: 543 });
+  }
+  const after = String(BigInt(overlapStart) + BigInt(next.paid_au));
+  const tranche = { ...next, economic_op_id: '7'.repeat(64), output_index: 0,
+    paid_cum_au_before: after, aggregate_paid_cum_au_before: after,
+    liability_au: String(delta), paid_au: String(delta), dust_au: '0', rounding_au: '0' };
+  const carry = [{ role: 'provider', provider: first.provider, payout_revision: first.payout_revision,
+    liability_au: first.dust_au, reason: 'awaiting_processor_terms' }];
+  const third = await freezeFiatEpoch(ctx, 543, 'c'.repeat(64), [tranche], carry);
+  const prep = await prepareEconomicOutput(ctx, third, tranche);
+  assert.equal(prep.ok, true, prep.message);
+  const newer = await prepareAttempt(ctx, third, tranche, 1);
+  const transfer = transferEvidence(tranche, newer.value, 'tr_disjoint_543');
+  assert.equal((await finalizeAttempt(ctx, newer.value, 'succeeded', transfer)).result.ok, true);
+  assert.equal((await settleOutput(ctx, third, tranche, newer.value, transfer)).result.ok, true);
+  assert.equal((await closeEpoch(ctx, third)).ok, true);
+  const actual = await read(earningKey);
+  await ctx.storage.put(earningKey, { ...actual, paid_cum_au: String(BigInt(actual.paid_cum_au) + 1n) });
+  assert.match((await submitRecovery(ctx, reviewed)).message, /watermark changed/);
+  await ctx.storage.put(earningKey, actual);
+  const repaired = await submitRecovery(ctx, reviewed);
   assert.equal(repaired.ok, true, repaired.message);
   assert.equal((await ctx.storage.get(group)).value.owner, next.economic_op_id);
   const attempt = await prepareAttempt(ctx, frozen, next, 1);

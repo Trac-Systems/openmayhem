@@ -5655,9 +5655,9 @@ class MayhemContract extends Contract {
     }
     if (replaces !== null && (value.rail !== 'fiat' || tail?.consumed !== false ||
         tail.economic_op_id !== replaces)) return new Error('FIAT recovery tail changed.');
-    const expectedAggregateBefore = tail?.consumed === false && replaces === null
-      ? tail.paid_cum_au_after
-      : earning.paid_cum_au;
+    const expectedAggregateBefore = replaces !== null && claim?.legacy_group
+      ? tail.paid_cum_au_before
+      : tail?.consumed === false && replaces === null ? tail.paid_cum_au_after : earning.paid_cum_au;
     if (liability.aggregate_paid_cum_au_before !== expectedAggregateBefore) {
       return new Error('Targeted payout preparation aggregate watermark mismatch.');
     }

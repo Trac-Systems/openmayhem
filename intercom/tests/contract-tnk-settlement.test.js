@@ -625,3 +625,71 @@ for (const legacy of [false, true]) {
     assert.equal((await read(`payout/booked/tnk/revision/${original.provider}/${ctx.revision}`)).pending_au, '0');
   });
 }
+
+test('a larger unprepared v30 plan cannot spend an occupied prefix or withhold its unoccupied TNK suffix', async () => {
+  const ctx = await setup();
+  const current = ctx.contract;
+  ctx.contract = new Contract30(current.protocol, {});
+  ctx.version = 30;
+  const [original, fee] = ctx.outputs;
+  const read = async key => (await ctx.storage.get(key)).value;
+  const first = await buildPlan(ctx, ctx.outputs);
+  const originalHash = '3'.repeat(64);
+  assert.equal((await prepareOutput(ctx, first, original, originalHash)).ok, true);
+  const revision = `payout/liability/tnk/${original.provider}/${original.payout_revision}`;
+  for (const key of [revision, `earn/tnk/${original.provider}`]) {
+    const row = await read(key);
+    await ctx.storage.put(key, { ...row, total_au: String(BigInt(row.total_au) + 20n), updated_epoch: 2 });
+  }
+  const hash = 'c'.repeat(64);
+  await advanceHead(ctx.storage, 2, hash);
+  const overlap = { ...original, economic_op_id: '4'.repeat(64), au: String(BigInt(original.au)+20n),
+    tnk_e18: String(BigInt(original.tnk_e18)+400n) };
+  const second = await buildPlan(ctx, [overlap, { ...fee, economic_op_id: '5'.repeat(64) }], [], { epoch: 2, hash });
+  ctx.contract = current;
+  delete ctx.version;
+  await inventory(ctx, 'tnk');
+  assert.match((await prepareOutput(ctx, second, overlap, '6'.repeat(64))).message, /Conflicting historical/);
+  const laterHash = 'd'.repeat(64);
+  await advanceHead(ctx.storage, 3, laterHash);
+  const suffix = { ...original, economic_op_id: '7'.repeat(64), au: '20', tnk_e18: '400',
+    paid_cum_au_before: original.au, aggregate_paid_cum_au_before: original.au };
+  const third = await buildPlan(ctx, [suffix], [], { epoch: 3, hash: laterHash });
+  const suffixHash = '8'.repeat(64);
+  assert.equal((await prepareOutput(ctx, third, suffix, suffixHash)).ok, true);
+  assert.equal((await settleOutput(ctx, third, suffix, suffixHash)).result.ok, true);
+  assert.equal((await closeEpoch(ctx, third)).ok, true);
+  assert.equal((await settleOutput(ctx, first, original, originalHash)).result.ok, true);
+  assert.equal((await read(revision)).paid_cum_au, overlap.au);
+  assert.match((await closeEpoch(ctx, second)).message, /unsettled/);
+});
+
+test('a TNK aggregate coverage failure for one payee leaves another frozen payee dispatchable', async () => {
+  const ctx = await setup();
+  const [provider, fee] = ctx.outputs;
+  const other = (await makeIdentity()).publicKey;
+  const different = { ...provider, provider: other, to: 'testtrac1other', economic_op_id: '4'.repeat(64) };
+  const payees = [provider, different].sort((a,b) => a.provider.localeCompare(b.provider))
+    .map((out, i) => ({ ...out, output_index: i }));
+  const read = async key => (await ctx.storage.get(key)).value;
+  for (const key of [`prov/${provider.provider}`, `earn/tnk/${provider.provider}`,
+    `payout/binding/tnk/${provider.provider}/${ctx.revision}`, `payout/liability/tnk/${provider.provider}/${ctx.revision}`]) {
+    const row = { ...await read(key), provider: other };
+    if (row.target) row.target = different.to;
+    await ctx.storage.put(key.replace(provider.provider, other), row);
+  }
+  const index = await read('payout/liability-index/tnk');
+  await ctx.storage.put('payout/liability-index/tnk', { ...index,
+    entries: payees.map(({provider,payout_revision}) => ({provider,payout_revision})) });
+  const plan = await buildPlan(ctx, [...payees, { ...fee, output_index: 2 }]);
+  const [blocked, ready] = payees;
+  const key = `earn/tnk/${blocked.provider}`;
+  const earning = await read(key);
+  await ctx.storage.put(key, { ...earning, total_au: '1' });
+  assert.match((await prepareOutput(ctx, plan, blocked, '5'.repeat(64))).message, /aggregate earnings/);
+  const readyHash = '6'.repeat(64);
+  assert.equal((await prepareOutput(ctx, plan, ready, readyHash)).ok, true);
+  assert.equal((await settleOutput(ctx, plan, ready, readyHash)).result.ok, true);
+  assert.equal((await read(key)).paid_cum_au, '0');
+  assert.match((await closeEpoch(ctx, plan)).message, /unsettled/);
+});

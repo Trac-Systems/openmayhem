@@ -1,6 +1,6 @@
 // v31 FIAT/TNK only. Paid counters count confirmed effects. Pending counters
 // count immutable, unreceipted outputs, including ones not yet dispatched.
-const zero = { pending_au: '0', pending_dust_au: '0', allocated_through_au: '0' };
+const zero = { pending_au: '0', pending_dust_au: '0', allocated_through_au: '0', confirmed_au: '0' };
 
 export const claimKey = (rail, id) => `payout/claim/${rail}/${id}`;
 export const balanceKey = (rail, scope) => `payout/booked/${rail}/${scope}`;
@@ -61,7 +61,7 @@ export async function planClaimWrites(contract, plan) {
       const before = scope.startsWith('revision/') ? output.paid_cum_au_before : output.aggregate_paid_cum_au_before;
       const end = before === undefined ? balance.allocated_through_au : contract.safeAddAu(before, paid);
       if (end instanceof Error) return end;
-      balances.set(scope, { pending_au: pending, pending_dust_au: pendingDust, allocated_through_au: end });
+      balances.set(scope, { ...balance, pending_au: pending, pending_dust_au: pendingDust, allocated_through_au: end });
     }
     claims.push([key, { rail: plan.rail, epoch: plan.epoch, plan_root: plan.plan_root,
       economic_op_id: output.economic_op_id, output_index: output.output_index,
@@ -84,13 +84,6 @@ export async function openClaim(contract, rail, plan, output, replaces = null) {
   if (claim.rail !== rail || claim.epoch !== plan.epoch || claim.plan_root !== plan.plan_root ||
       claim.output_index !== output.output_index || claim.economic_op_id !== output.economic_op_id ||
       claim.consumed_by !== null) return new Error('Payout claim conflicts with frozen output.');
-  if (rail === 'fiat' && output.role === 'provider') {
-    const review = await contract.get(`payout/legacy-review/fiat/${output.provider}`);
-    if (review && ![review.old_operation, review.new_operation].includes(output.economic_op_id) &&
-        !await contract.get(`payout/recovery/fiat/${review.old_operation}/resolution`)) {
-      return new Error('Historical FIAT review binds this provider’s unchanged paid watermarks.');
-    }
-  }
   if (claim.legacy_group) {
     const group = await contract.get(claim.legacy_group);
     if (!group || group.consumed_by !== null || group.blocked ||
@@ -111,9 +104,35 @@ export async function consumeClaimWrites(contract, claim, receiptKey) {
     if (balance instanceof Error) return balance;
     const pending = contract.safeSubAu(balance.pending_au, reservedPaid);
     const dust = contract.safeSubAu(balance.pending_dust_au, reservedDust);
-    if (pending instanceof Error || dust instanceof Error) return new Error('Payout claim exceeds booked balance.');
-    writes.push([balanceKey(claim.rail, scope), { ...balance, pending_au: pending, pending_dust_au: dust }]);
+    const confirmed = contract.safeAddAu(balance.confirmed_au, claim.paid_au);
+    if (pending instanceof Error || dust instanceof Error || confirmed instanceof Error) {
+      return new Error('Payout claim exceeds booked balance.');
+    }
+    writes.push([balanceKey(claim.rail, scope), {
+      ...balance, pending_au: pending, pending_dust_au: dust, confirmed_au: confirmed,
+    }]);
   }
   writes.push([claimKey(claim.rail, claim.economic_op_id), { ...claim, consumed_by: receiptKey }]);
   return writes;
+}
+
+
+// The existing reviewed replacement signs the original paid prefix on each
+// ledger. An indexed group reserves both candidate envelopes. An unconsumed
+// owner proves that every post-inventory receipt for these scopes paid an
+// independent claim. Check the entire difference on both ledgers exactly.
+export async function reviewedPayoutCountersMatch(contract, old, replacement, liability, earning) {
+  if (old.paid_cum_au_before === liability?.paid_cum_au &&
+      old.aggregate_paid_cum_au_before === earning?.paid_cum_au) return true;
+  const group = await contract.get(`payout/legacy/fiat/${revisionScope(old)}`);
+  if (!group || !group.prepared || group.blocked || group.consumed_by !== null ||
+      group.owner !== old.economic_op_id || group.reviewed_successor !== replacement.economic_op_id ||
+      group.before !== old.paid_cum_au_before ||
+      contract.compareAu(group.gross_au, replacement.liability_au) < 0 ||
+      contract.compareAu(group.paid_au, replacement.paid_au) < 0) return false;
+  const revision = await bookedBalance(contract, 'fiat', revisionScope(old));
+  const aggregate = await bookedBalance(contract, 'fiat', providerScope(old));
+  if (revision instanceof Error || aggregate instanceof Error) return false;
+  return contract.safeAddAu(old.paid_cum_au_before, revision.confirmed_au) === liability?.paid_cum_au &&
+    contract.safeAddAu(old.aggregate_paid_cum_au_before, aggregate.confirmed_au) === earning?.paid_cum_au;
 }

@@ -1,3 +1,5 @@
+import { reviewedPayoutCountersMatch } from './payout-reservations.js';
+
 // This transition addresses the overlapping frozen provider outputs in 508/542.
 // All reads and signatures are deterministic. External observations are the
 // canonical admin's attestations, never inferred from the absence of a ledger row.
@@ -204,8 +206,7 @@ export async function observeFiatOverlap(contract, version = 31) {
     tail?.economic_op_id !== id || tail.consumed !== false ||
     tail.paid_cum_au_before !== old.aggregate_paid_cum_au_before ||
     tail.paid_cum_au_after !== contract.safeAddAu(old.aggregate_paid_cum_au_before, old.paid_au) ||
-    earning?.paid_cum_au !== old.aggregate_paid_cum_au_before ||
-    liability?.paid_cum_au !== old.paid_cum_au_before)
+    !await reviewedPayoutCountersMatch(contract, old, replacement, liability, earning))
     return fail('reservation or paid watermark changed');
 
   const fence = await contract.get(fiatFenceKey(id));
@@ -224,7 +225,7 @@ export async function observeFiatOverlap(contract, version = 31) {
   const observation = {
     old_plan_root: prior.plan_root, new_plan_root: next.plan_root,
     old_operation: id, new_operation: nextId, old_preparation: prep, lock, tail,
-    paid_sibling: sibling, retained_fee: fee, revision_paid: liability.paid_cum_au, aggregate_paid: earning.paid_cum_au, latest, attempt, fence,
+    paid_sibling: sibling, retained_fee: fee, revision_paid: old.paid_cum_au_before, aggregate_paid: old.aggregate_paid_cum_au_before, latest, attempt, fence,
   };
   // Undo only the status tag written by the fence and require the full
   // original observation to match. A fresh approval cannot bless a missing
