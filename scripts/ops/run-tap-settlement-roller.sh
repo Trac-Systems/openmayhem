@@ -69,6 +69,30 @@ verify_sweep() {
     "$bundle" "$1" "$peer_rpc" "$rate_lock" "$2"
 }
 
+wait_for_pending_root() {
+  # The timer is the wrapper's only background job. A PID-only stop must
+  # interrupt wait immediately, and the timer must never retain the spool lock.
+  trap 'kill %+ 2>/dev/null || :; exit 0' TERM INT HUP
+  python3 - "$1" "$interval" "$$" 8>&- <<'PY' &
+import os, sys, time
+execute_after, interval, roller_pid = map(int, sys.argv[1:])
+now = time.time()
+if now < execute_after <= now + 3600:
+    remaining = execute_after - now
+    end = time.monotonic() + remaining
+    while remaining > 0 and os.getppid() == roller_pid:
+        # Notice forward clock steps locally. A backward step cannot extend
+        # this wait beyond the originally observed governance window.
+        time.sleep(min(remaining, 30))
+        remaining = min(execute_after - time.time(), end - time.monotonic())
+else:
+    # Stale block time, clock skew or implausible target: retry without spinning.
+    time.sleep(min(interval, 30))
+PY
+  wait "$!"
+  trap - TERM INT HUP
+}
+
 while true; do
   bundle="$(find "$working" -maxdepth 1 -type f -name 'epoch-*.receipts.json' -print | sort -V | head -n 1)"
   if [[ -z "$bundle" ]]; then
@@ -270,7 +294,9 @@ PY
     sleep "$interval"
     continue
   fi
-  if ! python3 - "$bundle" "$raw_report" "$bound_report" <<'PY'
+  # Only the freshly bound pending report emits a scheduling hint. Restart
+  # and wake both return to the full dry-run and confirmation path.
+  if ! pending_execute_after="$(python3 - "$bundle" "$raw_report" "$bound_report" <<'PY'
 import hashlib, json, re, sys
 bundle_path, report_path, target = sys.argv[1:]
 bundle_raw = open(bundle_path, "rb").read()
@@ -310,12 +336,13 @@ if report.get("awaiting_governance_delay") is True:
         or not isinstance(spent, str)
         or not re.fullmatch(r"(0|[1-9][0-9]*)", spent)
         or pending.get("cumulative_spent_wei") != spent
-        or not isinstance(execute_after, int)
-        or isinstance(execute_after, bool)
+        or type(execute_after) is not int
         or execute_after < 1
+        or type(pending.get("execute_after")) is not int
         or pending.get("execute_after") != execute_after
     ):
         raise SystemExit("TAP settlement pending root evidence does not match the prepared payout")
+    print(execute_after)
 else:
     tx = report.get("execution_tx") or report.get("proposal_tx")
     if report.get("root_already_posted") is not True and (
@@ -342,21 +369,16 @@ with open(target, "w") as out:
     json.dump(report, out, indent=2)
     out.write("\n")
 PY
-  then
+  )"; then
     echo "TAP settlement report binding failed for $name" >&2
     sleep "$interval"
     continue
   fi
   mv "$bound_report" "$final_report"
   rm -f "$raw_report"
-  if jq -e '
-    .blocked != true and
-    .root_pending == true and
-    .awaiting_governance_delay == true and
-    (.execute_after | type == "number")
-  ' "$final_report" >/dev/null; then
+  if [[ -n "$pending_execute_after" ]]; then
     echo "TAP settlement root for $name is cross-signed and waiting for its governance delay." >&2
-    sleep "$interval"
+    wait_for_pending_root "$pending_execute_after"
     continue
   fi
   if ! jq -e '
