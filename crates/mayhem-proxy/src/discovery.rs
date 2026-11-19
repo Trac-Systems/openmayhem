@@ -61,6 +61,14 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// The one supported on-disk projection transition. Wire identities stay exact.
+    pub(crate) fn v30_predecessor(&self) -> Option<Self> {
+        (self.contract_version == 31).then(|| Self {
+            contract_version: 30,
+            ..self.clone()
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         require(
             !self.network_id.is_empty()

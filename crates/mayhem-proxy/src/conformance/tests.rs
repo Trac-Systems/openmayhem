@@ -93,7 +93,7 @@ pub(super) fn body(store: &Store) -> Body {
     let now = store.now_ms();
     Body {
         schema_version: 1,
-        network: network(),
+        network: store.network().clone(),
         tester: store.config.tester.clone(),
         provenance: Provenance::GatewayObservation,
         boot: store.boot.clone(),
@@ -435,4 +435,98 @@ fn delayed_recording_cannot_replace_a_newer_observation() {
         panic!("newer observation must survive delayed recording")
     };
     assert_eq!(retained.digest().unwrap(), newer.digest().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn fiat31_conformance_upgrade() {
+    let dir = directory();
+    let path = dir.path().join("records");
+    let old = discovery::Identity {
+        contract_version: 30,
+        ..network()
+    };
+    let next = discovery::Identity {
+        contract_version: 31,
+        ..old.clone()
+    };
+    let store = Store::open(&path, old.clone(), config()).unwrap();
+    let b = body(&store);
+    let signed = signer().conformance(b.clone()).unwrap();
+    store.retain(signed.clone()).unwrap();
+    let mut other = b.clone();
+    other.subject.offer_digest = d(99);
+    other.session = d(25);
+    store.retain(signer().conformance(other).unwrap()).unwrap();
+    assert!(matches!(
+        store.lookup(&b.subject, &b.class).unwrap(),
+        Lookup::Present(_)
+    ));
+    drop(store);
+
+    let mut small = config();
+    small.maximum_records = 1;
+    assert!(Store::open(&path, next.clone(), small).is_err());
+    let original = Store::open(&path, old.clone(), config()).unwrap();
+    assert!(matches!(
+        original.lookup(&b.subject, &b.class).unwrap(),
+        Lookup::Restarted
+    ));
+    drop(original);
+
+    let mut wrong_tester = config();
+    wrong_tester.tester = d(99);
+    assert!(Store::open(&path, next.clone(), wrong_tester).is_err());
+    for other in [
+        discovery::Identity {
+            network_id: "other".into(),
+            ..next.clone()
+        },
+        discovery::Identity {
+            msb_bootstrap: d(99).as_str().into(),
+            ..next.clone()
+        },
+        discovery::Identity {
+            subnet_bootstrap: d(99).as_str().into(),
+            ..next.clone()
+        },
+        discovery::Identity {
+            contract_version: 32,
+            ..next.clone()
+        },
+    ] {
+        assert!(Store::open(&path, other, config()).is_err());
+    }
+    let store = Store::open(&path, next.clone(), config()).unwrap();
+    assert!(store.lookup(&b.subject, &b.class).is_err());
+    assert!(store.retain(signed.clone()).is_err());
+    let mut retagged = signed.clone();
+    retagged.body.network = next.clone();
+    assert!(retagged.verify().is_err());
+    drop(store);
+    {
+        use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+        let db = Database::open(&path).unwrap();
+        let read = db.begin_read().unwrap();
+        let records = read
+            .open_table(TableDefinition::<&str, &[u8]>::new(
+                "conformance_records_v1",
+            ))
+            .unwrap();
+        let expected = serde_json::to_vec(&signed).unwrap();
+        assert!(records
+            .iter()
+            .unwrap()
+            .any(|row| row.unwrap().1.value() == expected));
+    }
+    assert!(Store::open(&path, old, config()).is_err());
+    let store = Store::open(&path, next, config()).unwrap();
+    let mut fresh = body(&store);
+    fresh.session = d(24);
+    let replacement = signer().conformance(fresh).unwrap();
+    store.retain(replacement.clone()).unwrap();
+    let Lookup::Present(current) = store.lookup(&b.subject, &b.class).unwrap() else {
+        panic!("fresh v31 observation missing");
+    };
+    assert_eq!(current.digest().unwrap(), replacement.digest().unwrap());
 }

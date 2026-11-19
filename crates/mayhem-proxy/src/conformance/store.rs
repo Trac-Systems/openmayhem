@@ -2,6 +2,7 @@ use super::*;
 use crate::db;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle,
 };
 use std::{path::Path, sync::Mutex, time::Instant};
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("conformance_identity_v1");
@@ -58,14 +59,41 @@ impl Store {
         let tx = db(database.begin_write())?;
         {
             let mut m = db(tx.open_table(META))?;
-            let expected = serde_json::to_vec(&(network.clone(), config.tester.clone()))?;
-            let prior = db(m.get("identity"))?.map(|v| v.value().to_vec());
-            require(
-                prior.as_ref().is_none_or(|v| v == &expected),
-                "conformance store identity differs",
-            )?;
-            if prior.is_none() {
+            let expected = serde_json::to_vec(&(&network, &config.tester))?;
+            let prior = db(m.get("identity"))?;
+            let initialize = prior.is_none();
+            let identity_changed = prior.as_ref().is_none_or(|v| v.value() != expected);
+            if let Some(prior) = &prior {
+                if identity_changed {
+                    let previous = network
+                        .v30_predecessor()
+                        .ok_or_else(|| crate::invalid("conformance store identity differs"))?;
+                    require(
+                        prior.value() == serde_json::to_vec(&(previous, &config.tester))?,
+                        "conformance store identity differs",
+                    )?;
+                }
+                require(
+                    db(tx.list_tables())?.any(|t| t.name() == RECORDS.name())
+                        && db(tx.list_tables())?.any(|t| t.name() == EXPIRY.name()),
+                    "conformance tables are missing",
+                )?;
+            } else {
+                require(
+                    db(m.is_empty())?
+                        && db(tx.list_tables())?.all(|t| t.name() == META.name())
+                        && db(tx.list_multimap_tables())?.next().is_none(),
+                    "unrecognized conformance database",
+                )?;
+            }
+            drop(prior);
+            // The header moves forward. Old observations keep their original
+            // signatures, expiry entries and quota charges. lookup/evaluate
+            // require the exact current contract before returning evidence.
+            if identity_changed {
                 db(m.insert("identity", expected.as_slice()))?;
+            }
+            if initialize {
                 db(m.insert("bytes", &0u64.to_le_bytes()[..]))?;
             }
             require(

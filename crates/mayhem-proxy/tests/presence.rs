@@ -31,13 +31,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::on_version(mayhem_proto::CONTRACT_VERSION)
+    }
+    fn on_version(contract_version: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let network = Identity {
             network_id: "918".into(),
             msb_bootstrap: d(1).as_str().into(),
             subnet_bootstrap: d(2).as_str().into(),
-            contract_version: mayhem_proto::CONTRACT_VERSION,
+            contract_version,
         };
         let key = SigningKey::from_bytes(&[42; 32]);
         let pk = hex(&key.verifying_key().to_bytes());
@@ -574,4 +577,76 @@ fn storage_quota_rejects_new_routes_without_forgetting_withdrawal_watermarks() {
         table.status(&f.registered(11000), 11000, None).unwrap(),
         Eligibility::Draining
     );
+}
+
+#[test]
+fn fiat31_presence_upgrade() {
+    let f = Fixture::on_version(30);
+    let path = f.dir.path().join("presence.redb");
+    let table = f.table(8);
+    let mut old_body = f.body();
+    old_body.fence = 7;
+    old_body.sequence = 9;
+    let old = f.sign(old_body.clone());
+    let old_registration = f.registered(10000);
+    table
+        .receive(old.clone(), &old_registration, 10000)
+        .unwrap();
+    drop(table);
+
+    let v31 = Fixture::on_version(31);
+    for other in [
+        Identity {
+            network_id: "other".into(),
+            ..v31.network.clone()
+        },
+        Identity {
+            msb_bootstrap: d(99).as_str().into(),
+            ..v31.network.clone()
+        },
+        Identity {
+            subnet_bootstrap: d(99).as_str().into(),
+            ..v31.network.clone()
+        },
+        Identity {
+            contract_version: 32,
+            ..v31.network.clone()
+        },
+    ] {
+        assert!(Table::open(&path, other, 8).is_err());
+    }
+    let registered = v31.registered(10000);
+    let table = Table::open(&path, v31.network.clone(), 8).unwrap();
+    assert_eq!(
+        table.status(&registered, 10001, None).unwrap(),
+        Eligibility::HeartbeatMissing
+    );
+    assert!(table.receive(old.clone(), &registered, 10001).is_err());
+    let mut retagged = old;
+    retagged.body.network = v31.network.clone();
+    assert!(retagged.verify(&v31.network, 10001).is_err());
+    let mut next = retagged.body;
+    assert!(table
+        .receive(f.sign(next.clone()), &registered, 10001)
+        .is_err());
+    next.fence -= 1;
+    next.sequence += 1;
+    assert!(table
+        .receive(f.sign(next.clone()), &registered, 10001)
+        .is_err());
+    next.fence += 1;
+    assert!(table
+        .receive(f.sign(next.clone()), &old_registration, 10001)
+        .is_err());
+    table
+        .receive(f.sign(next.clone()), &registered, 10001)
+        .unwrap();
+    assert_eq!(
+        table.status(&registered, 10001, None).unwrap(),
+        Eligibility::Available
+    );
+    drop(table);
+    assert!(Table::open(&path, f.network.clone(), 8).is_err());
+    let table = Table::open(&path, v31.network.clone(), 8).unwrap();
+    assert!(table.receive(f.sign(next), &registered, 10002).is_err());
 }

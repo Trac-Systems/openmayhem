@@ -107,3 +107,13 @@ holds the overlapping batch before entering the Stripe sender.
 4. Verify a fresh quote and reservation with v31 terms and reconciliation of a
    previously accepted v30 request with its original signed terms. Preserve
    all three payment rails, prior receipt commitments and account watermarks.
+
+The gateway opens each projection database under its existing lock. For the
+same network and bootstrap keys, it archives the v30 catalog tables in place
+and builds the v31 catalog from fresh signed pages. Allow disk space for both
+snapshots. Presence keeps its replay watermarks and needs a new signed
+heartbeat. Conformance keeps its original signed rows and requires current
+evidence for routing. If startup stops between database files, restart with
+v31. Restoring an old file after admitting traffic could rewind replay
+protection. Verify the new heartbeat, conformance (where configured) and an
+actual routed request before announcing availability.

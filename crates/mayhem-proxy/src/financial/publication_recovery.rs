@@ -84,6 +84,9 @@ impl Fixture {
         let case = &source["cases"][0];
         let mut terms: mayhem_proto::proxy::finance::ProxySpendTerms =
             serde_json::from_value(case["terms"].clone()).unwrap();
+        // The golden file also verifies historical signatures. These tests
+        // sign a fresh reservation for the active contract before publishing.
+        terms.contract_version = mayhem_proto::CONTRACT_VERSION;
         let buyer = SigningKey::from_bytes(&[17; 32]);
         let provider = SigningKey::from_bytes(&[29; 32]);
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();

@@ -316,7 +316,7 @@ fn wrong_identity_corruption_and_second_writer_do_not_reset_the_cache() {
     assert!(Catalog::open(&path, identity()).is_err());
     drop(catalog);
     let mut wrong = identity();
-    wrong.contract_version += 1;
+    wrong.contract_version = 32;
     assert!(matches!(Catalog::open(&path, wrong), Err(Error::Identity)));
     assert!(get(&open(&path), 1).is_some());
     let corrupt = dir.path().join("corrupt");
@@ -422,4 +422,132 @@ fn restart_after_abrupt_process_exit_resumes_the_durable_page() {
     apply(&catalog, &page(10, vec![row(2)], None, None));
     assert!(get(&catalog, 1).is_some());
     assert!(get(&catalog, 2).is_some());
+}
+
+#[test]
+fn fiat31_catalog_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.redb");
+    let next = Identity {
+        contract_version: 31,
+        ..identity()
+    };
+    let catalog = open(&path);
+    apply(&catalog, &page(10, vec![row(1)], None, None));
+    apply(&catalog, &page(11, vec![row(2)], Some(proof(10)), Some(2)));
+    let prior = catalog.read().unwrap().status();
+    let old_ticket = catalog.refresh_ticket().unwrap();
+    drop(catalog);
+
+    for other in [
+        Identity {
+            network_id: "other".into(),
+            ..next.clone()
+        },
+        Identity {
+            msb_bootstrap: "f".repeat(64),
+            ..next.clone()
+        },
+        Identity {
+            subnet_bootstrap: "f".repeat(64),
+            ..next.clone()
+        },
+    ] {
+        assert!(matches!(Catalog::open(&path, other), Err(Error::Identity)));
+    }
+    let catalog = Catalog::open(&path, next.clone()).unwrap();
+    let status = catalog.read().unwrap().status();
+    assert!(status.invalidated && status.committed.is_none() && !status.refresh_in_progress);
+    assert_ne!(status.content_snapshot, prior.content_snapshot);
+    assert!(status.generation > prior.generation);
+    assert_eq!(catalog.refresh_ticket().unwrap().query(), &Query::catalog());
+    assert!(get(&catalog, 1).is_none() && get(&catalog, 2).is_none());
+
+    let mut first = page(12, vec![row(3)], None, Some(3));
+    let initial = catalog.refresh_ticket().unwrap();
+    assert!(matches!(
+        catalog.apply(&initial, &first, 10001),
+        Err(Error::Identity)
+    ));
+    first.context.contract_version = 31;
+    assert!(matches!(
+        catalog.apply(&old_ticket, &first, 10001),
+        Err(Error::StaleRefresh)
+    ));
+    apply(&catalog, &first);
+    drop(catalog);
+    assert!(matches!(
+        Catalog::open(&path, identity()),
+        Err(Error::Identity)
+    ));
+    let catalog = Catalog::open(&path, next).unwrap();
+    assert_eq!(
+        catalog.refresh_ticket().unwrap().query().cursor,
+        Some(token(3))
+    );
+    assert!(get(&catalog, 3).is_none());
+    let mut last = page(12, vec![row(4)], None, None);
+    last.context.contract_version = 31;
+    apply(&catalog, &last);
+    assert_eq!(get(&catalog, 3), Some(row(3).value));
+    assert_eq!(get(&catalog, 4), Some(row(4).value));
+    assert!(get(&catalog, 1).is_none() && get(&catalog, 2).is_none());
+    drop(catalog);
+
+    use redb::{Database, ReadableDatabase, TableDefinition};
+    let db = Database::open(&path).unwrap();
+    let read = db.begin_read().unwrap();
+    for (table, key, expected) in [
+        ("v30_proxy_catalog_current_v1", row(1).key, row(1).value),
+        ("v30_proxy_catalog_staged_v1", row(2).key, row(2).value),
+    ] {
+        let table = read
+            .open_table(TableDefinition::<&str, &[u8]>::new(table))
+            .unwrap();
+        assert_eq!(
+            table.get(key.as_str()).unwrap().unwrap().value(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+    }
+    let meta = read
+        .open_table(TableDefinition::<&str, &[u8]>::new(
+            "v30_proxy_catalog_metadata_v1",
+        ))
+        .unwrap();
+    let old: Value = serde_json::from_slice(meta.get("state").unwrap().unwrap().value()).unwrap();
+    assert_eq!(old["committed"]["checkpoint"], token(1010));
+    assert_eq!(old["pending"]["next_cursor"], token(2));
+}
+
+#[test]
+fn fiat31_archive_collision_preserves_v30_snapshot_checkpoint() {
+    use redb::{Database, TableDefinition};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.redb");
+    let catalog = open(&path);
+    apply(&catalog, &page(10, vec![row(1)], None, Some(2)));
+    let ticket = catalog.refresh_ticket().unwrap();
+    drop(catalog);
+
+    // Fail the last root rename, after metadata, current, index and staging.
+    let db = Database::open(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    tx.open_table(TableDefinition::<&str, &str>::new(
+        "v30_proxy_match_staged_v1",
+    ))
+    .unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let next = Identity {
+        contract_version: 31,
+        ..identity()
+    };
+    assert!(matches!(
+        Catalog::open(&path, next),
+        Err(Error::Database(_))
+    ));
+    let catalog = open(&path);
+    assert_eq!(catalog.refresh_ticket().unwrap(), ticket);
+    apply(&catalog, &page(10, vec![row(2)], None, None));
+    assert_eq!(get(&catalog, 1), Some(row(1).value));
 }

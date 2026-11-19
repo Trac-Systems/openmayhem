@@ -6,7 +6,7 @@ use std::{path::Path, sync::Arc};
 
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
-    TableDefinition,
+    TableDefinition, TableHandle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -156,6 +156,18 @@ fn decode_state(bytes: &[u8], identity: &Identity) -> Result<State> {
     Ok(state)
 }
 
+// redb 3.1.3 renames a table root in the directory. Deleting a populated table
+// would visit every page. Keep the old roots (including the checkpoint and any
+// partial traversal) for inspection without exposing them through v31 reads.
+fn archive_v30<V: redb::Value + 'static>(
+    tx: &redb::WriteTransaction,
+    table: TableDefinition<&str, V>,
+) -> Result<()> {
+    let archived = format!("v30_{}", table.name());
+    let source = db(tx.open_table(table))?;
+    db(tx.rename_table(source, TableDefinition::<&str, V>::new(&archived)))
+}
+
 fn save_state(tx: &redb::WriteTransaction, state: &State) -> Result<()> {
     let bytes = serde_json::to_vec(state)?;
     require(
@@ -235,14 +247,20 @@ impl Catalog {
             let meta = db(tx.open_table(META))?;
             let value = db(meta.get(STATE_KEY))?;
             value
-                .map(|v| decode_state(v.value(), &identity))
+                .map(|v| match decode_state(v.value(), &identity) {
+                    Err(Error::Identity) => {
+                        let prior = identity.v30_predecessor().ok_or(Error::Identity)?;
+                        decode_state(v.value(), &prior)
+                    }
+                    result => result,
+                })
                 .transpose()?
         };
+        let mut initial_generation = None;
         if let Some(mut state) = existing {
             // Check the bounded metadata/table boundary, without reading every
             // catalog record during startup. Missing tables are corruption.
             let tables = db(tx.list_tables())?.collect::<Vec<_>>();
-            use redb::TableHandle;
             require(
                 tables.iter().any(|t| t.name() == CURRENT.name()),
                 "catalog table is missing",
@@ -261,24 +279,37 @@ impl Catalog {
                     "catalog staged boundary is inconsistent",
                 )?;
             }
-            if state.index_version < INDEX_VERSION {
-                // Rebuild derived indexes through bounded background hydration,
-                // never a startup scan of the entire old cache or ledger.
-                let has_index = tables.iter().any(|t| t.name() == INDEX.name());
-                let has_staged_index = tables.iter().any(|t| t.name() == STAGED_INDEX.name());
-                require(
-                    has_index == (state.index_version > 0),
-                    "invalid prior catalog index",
-                )?;
-                require(
-                    has_staged_index
-                        == (state.index_version > 0
-                            && state
-                                .pending
-                                .as_ref()
-                                .is_some_and(|p| p.mode == Mode::Snapshot)),
-                    "invalid prior staged catalog index",
-                )?;
+            let has_index = tables.iter().any(|t| t.name() == INDEX.name());
+            let has_staged_index = tables.iter().any(|t| t.name() == STAGED_INDEX.name());
+            require(
+                has_index == (state.index_version > 0),
+                "invalid catalog index",
+            )?;
+            require(
+                has_staged_index
+                    == (has_index
+                        && state
+                            .pending
+                            .as_ref()
+                            .is_some_and(|p| p.mode == Mode::Snapshot)),
+                "invalid staged catalog index",
+            )?;
+            if state.identity != identity {
+                archive_v30(&tx, META)?;
+                archive_v30(&tx, CURRENT)?;
+                if has_index {
+                    archive_v30(&tx, INDEX)?;
+                }
+                if has_staged {
+                    archive_v30(&tx, STAGED)?;
+                }
+                if has_staged_index {
+                    archive_v30(&tx, STAGED_INDEX)?;
+                }
+                state.advance()?;
+                initial_generation = Some(state.generation);
+            } else if state.index_version < INDEX_VERSION {
+                // Rebuild derived indexes through bounded background hydration.
                 db(tx.delete_table(STAGED))?;
                 db(tx.delete_table(STAGED_INDEX))?;
                 db(tx.delete_table(INDEX))?;
@@ -290,27 +321,18 @@ impl Catalog {
                 state.index_version = INDEX_VERSION;
                 state.advance()?;
                 save_state(&tx, &state)?;
-            } else {
-                require(
-                    tables.iter().any(|t| t.name() == INDEX.name()),
-                    "catalog match index is missing",
-                )?;
-                require(
-                    tables.iter().any(|t| t.name() == STAGED_INDEX.name())
-                        == state
-                            .pending
-                            .as_ref()
-                            .is_some_and(|p| p.mode == Mode::Snapshot),
-                    "catalog staged index is inconsistent",
-                )?;
             }
         } else {
             // Only a new, empty DB can be initialized. Never adopt unrelated data.
-            use redb::TableHandle;
             require(
-                db(tx.list_tables())?.all(|t| t.name() == META.name()),
+                db(db(tx.open_table(META))?.is_empty())?
+                    && db(tx.list_tables())?.all(|t| t.name() == META.name())
+                    && db(tx.list_multimap_tables())?.next().is_none(),
                 "unrecognized catalog database",
             )?;
+            initial_generation = Some(0);
+        }
+        if let Some(generation) = initial_generation {
             db(tx.open_table(CURRENT))?;
             db(tx.open_table(INDEX))?;
             save_state(
@@ -319,7 +341,7 @@ impl Catalog {
                     schema_version: 1,
                     index_version: INDEX_VERSION,
                     identity: identity.clone(),
-                    generation: 0,
+                    generation,
                     incarnation: new_incarnation()?,
                     content_revision: 0,
                     invalidated: true,

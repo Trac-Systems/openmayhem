@@ -5,6 +5,7 @@ use super::*;
 use crate::db;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle,
 };
 use std::{collections::BTreeMap, path::Path, sync::Mutex};
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("proxy_presence_identity_v1");
@@ -47,12 +48,25 @@ impl Table {
             let stored = db(meta.get("network"))?
                 .map(|v| serde_json::from_slice::<discovery::Identity>(v.value()))
                 .transpose()?;
-            if let Some(value) = stored {
+            if let Some(value) = &stored {
                 require(
-                    value == network,
+                    *value == network || network.v30_predecessor().as_ref() == Some(value),
                     "presence store belongs to another network",
                 )?;
+                // Opening a missing HIGH for write would silently reset every fence.
+                require(
+                    db(tx.list_tables())?.any(|t| t.name() == HIGH.name()),
+                    "presence watermark table is missing",
+                )?;
             } else {
+                require(
+                    db(meta.is_empty())?
+                        && db(tx.list_tables())?.all(|t| t.name() == META.name())
+                        && db(tx.list_multimap_tables())?.next().is_none(),
+                    "unrecognized presence database",
+                )?;
+            }
+            if stored.as_ref() != Some(&network) {
                 db(meta.insert("network", serde_json::to_vec(&network)?.as_slice()))?;
             }
             require(
