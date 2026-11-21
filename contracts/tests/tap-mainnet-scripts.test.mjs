@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import Ganache from 'ganache';
+import Ganache from '../test-chain/index.mjs';
 import { ethers } from 'ethers';
 
 import { compileAll } from '../scripts/compile.mjs';

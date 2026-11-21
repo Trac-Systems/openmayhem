@@ -1,0 +1,10 @@
+{
+  "name": "mayhem-contracts-test-chain",
+  "private": true,
+  "type": "module",
+  "description": "Local EVM test chain (Ganache) for the contract tests only. Kept out of the contracts package so no install of it, with or without dev dependencies, contains Ganache: 7.9.2 is its last release and bundles elliptic 6.5.4 (GHSA-vjh7-7g9h-fjfh).",
+  "main": "index.mjs",
+  "dependencies": {
+    "ganache": "7.9.2"
+  }
+}

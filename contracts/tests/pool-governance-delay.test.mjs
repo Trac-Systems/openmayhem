@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import Ganache from 'ganache';
+import Ganache from '../test-chain/index.mjs';
 import { ethers } from 'ethers';
 
 import { compileAll } from '../scripts/compile.mjs';

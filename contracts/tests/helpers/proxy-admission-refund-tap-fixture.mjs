@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import {generateKeyPairSync,createPrivateKey,randomBytes} from 'node:crypto';
-import Ganache from 'ganache';
+import Ganache from '../../test-chain/index.mjs';
 import solc from 'solc';
 import {ethers} from 'ethers';
 import {tapRefundSigner} from '../../../intercom/scripts/proxy-admission-refund-tap-transaction.mjs';

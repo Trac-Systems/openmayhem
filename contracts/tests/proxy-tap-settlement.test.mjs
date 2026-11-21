@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import Ganache from 'ganache';
+import Ganache from '../test-chain/index.mjs';
 import { ethers } from 'ethers';
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { pricingFixture } from './helpers/tap-pricing.mjs';

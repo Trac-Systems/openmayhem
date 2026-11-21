@@ -541,7 +541,7 @@ test('reservation rehearsal rejects a changed second liability before reserving 
 // Install the constructor's bytecode and storage at the two addresses that the
 // production selector authenticates. All RPC calls go to an in-process Ganache.
 async function canonicalPoolFixture(t) {
-  const { default: Ganache } = await import('ganache');
+  const { default: Ganache } = await import('../test-chain/index.mjs');
   const { compileAll } = await import('../scripts/compile.mjs');
   const { deployPoolWithToken } = await import('../scripts/deploy-local.mjs');
   const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1, time: new Date(10000000) }, miner: { timestampIncrement: 0 } });
