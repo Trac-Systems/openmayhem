@@ -8,7 +8,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import Ganache from 'ganache';
+import Ganache from '../test-chain/index.mjs';
 import { ethers } from 'ethers';
 import b4a from '../../intercom/node_modules/b4a/index.js';
 import PeerWallet from '../../intercom/node_modules/trac-wallet/index.js';

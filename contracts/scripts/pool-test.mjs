@@ -1,7 +1,7 @@
 // MayhemInferencePool test suite (I2-B1) - deploy MockTTAP + MayhemInferencePool on in-process
 // ganache; exercise deposit -> governed root -> O(1) cumulative claim -> operator 15% cap -> conservation ->
 // non-custodial property -> all the revert guards. Exit 0 = green. No external network.
-import Ganache from 'ganache';
+import Ganache from '../test-chain/index.mjs';
 import { ethers } from 'ethers';
 import { compileAll } from './compile.mjs';
 import { distribution } from './merkle.mjs';

@@ -5,7 +5,7 @@
 // operator - burned), 15% OPERATOR CAP, residual burn allocation, claimed[acct] never exceeds rooted cumulative. Attacks:
 // double-claim, claim-beyond-owed (forged amount), wrong-account proof, and over-cap withdraw all
 // REVERT. Uses the SAME merkle builder the engine settlement roller posts. Run: `npm run pool:property`.
-import Ganache from 'ganache';
+import Ganache from '../test-chain/index.mjs';
 import { ethers } from 'ethers';
 import { deployPool } from './deploy-local.mjs';
 import { distribution } from './merkle.mjs';

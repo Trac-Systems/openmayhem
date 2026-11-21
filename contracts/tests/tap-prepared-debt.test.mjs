@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import ganache from 'ganache';
+import ganache from '../test-chain/index.mjs';
 import { BrowserProvider, Contract, ContractFactory, Wallet, toBeHex } from 'ethers';
 import { compileAll } from '../scripts/compile.mjs';
 import { signRootProposal } from '../scripts/pool-governance.mjs';
